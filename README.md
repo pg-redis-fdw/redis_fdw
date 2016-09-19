@@ -72,29 +72,16 @@ Usage
 
 The following parameters can be set on a Redis foreign server:
 
-address:	The address or hostname of the Redis server.
-	 	Default: 127.0.0.1
-
-port:		The port number on which the Redis server is listening.
-     		Default: 6379
+- `address`: The address or hostname of the Redis server. (Default: 127.0.0.1)
+- `port`: The port number on which the Redis server is listening. (Default: 6379)
 
 The following parameters can be set on a Redis foreign table:
 
-database:	The numeric ID of the Redis database to query.
-	  	Default: 0
-
-(9.2 and later) tabletype: can be 'hash', 'list', 'set' or 'zset'
-	    Default: none, meaning only look at scalar values.
-
-(9.2 and later) tablekeyprefix: only get items whose names start with the prefix
-        Default: none
-
-(9.2 and later) tablekeyset: fetch item names from the named set
-        Default: none
-
-(9.2 and later) singleton_key: get all the values in the table from a single
-named object.
-	    Default: none, meaning don't just use a single object.
+- `database`: The numeric ID of the Redis database to query. (Default: 0)
+- `tabletype`: (9.2 and later) can be 'hash', 'list', 'set' or 'zset' (Default: none, meaning only look at scalar values.)
+- `tablekeyprefix`: (9.2 and later) only get items whose names start with the prefix (Default: none)
+- `tablekeyset`: (9.2 and later) fetch item names from the named set (Default: none)
+- `singleton_key`: (9.2 and later)  get all the values in the table from a single named object. (Default: none, meaning don't just use a single object.)
 
 You can only have one of tablekeyset and tablekeyprefix, and if you use
 singleton_key you can't have either.
@@ -111,8 +98,7 @@ column for zsets.
 The following parameter can be set on a user mapping for a Redis
 foreign server:
 
-password:	The password to authenticate to the Redis server with.
-     Default: <none>
+- `password`: The password to authenticate to the Redis server with. (Default: <none>)
 
 Insert, Update and Delete
 -------------------------
@@ -130,26 +116,27 @@ PostgreSQL releases. There are a few restriction on this:
 Example
 -------
 
-	CREATE EXTENSION redis_fdw;
+```sql
+    CREATE EXTENSION redis_fdw;
 
-	CREATE SERVER redis_server
-		FOREIGN DATA WRAPPER redis_fdw
-		OPTIONS (address '127.0.0.1', port '6379');
+    CREATE SERVER redis_server
+        FOREIGN DATA WRAPPER redis_fdw
+        OPTIONS (address '127.0.0.1', port '6379');
 
-	CREATE FOREIGN TABLE redis_db0 (key text, val text)
-		SERVER redis_server
-		OPTIONS (database '0');
+    CREATE FOREIGN TABLE redis_db0 (key text, val text)
+        SERVER redis_server
+        OPTIONS (database '0');
 
-	CREATE USER MAPPING FOR PUBLIC
-		SERVER redis_server
-		OPTIONS (password 'secret');
+    CREATE USER MAPPING FOR PUBLIC
+        SERVER redis_server
+        OPTIONS (password 'secret');
 
-	CREATE FOREIGN TABLE myredishash (key text, val text[])
-		SERVER redis_server
-		OPTIONS (database '0', tabletype 'hash', tablekeyprefix 'mytable:');
+    CREATE FOREIGN TABLE myredishash (key text, val text[])
+        SERVER redis_server
+        OPTIONS (database '0', tabletype 'hash', tablekeyprefix 'mytable:');
 
     INSERT INTO myredishash (key, val)
-       VALUES ('mytable:r1,'{prop1,val1,prop2,val2}');
+       VALUES ('mytable:r1', '{prop1,val1,prop2,val2}');
 
     UPDATE myredishash
         SET val = '{prop3,val3,prop4,val4}'
@@ -158,9 +145,9 @@ Example
     DELETE from myredishash
         WHERE key = 'mytable:r1';
 
-	CREATE FOREIGN TABLE myredis_s_hash (key text, val text)
-		SERVER redis_server
-		OPTIONS (database '0', tabletype 'hash',  singleton_key 'mytable');
+    CREATE FOREIGN TABLE myredis_s_hash (key text, val text)
+        SERVER redis_server
+        OPTIONS (database '0', tabletype 'hash',  singleton_key 'mytable');
 
     INSERT INTO myredis_s_hash (key, val)
        VALUES ('prop1','val1'),('prop2','val2');
@@ -171,6 +158,7 @@ Example
 
     DELETE from myredis_s_hash
         WHERE key = 'prop2';
+```
 
 Testing
 -------
@@ -185,8 +173,5 @@ populate it, and it cleans up afterwards.
 Authors
 -------
 
-Dave Page
-dpage@pgadmin.org
-
-Andrew Dunstan
-andrew@dunslane.net
+- Dave Page (dpage@pgadmin.org)
+- Andrew Dunstan (andrew@dunslane.net)

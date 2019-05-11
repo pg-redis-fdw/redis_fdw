@@ -1621,22 +1621,20 @@ redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *push
 
 		if (IsA(right, Const))
 		{
-			StringInfoData buf;
+			if (((Const *) right)->consttype == TEXTOID) {
+				/* And get the column and value... */
+				*key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
+				*value = TextDatumGetCString(((Const *) right)->constvalue);
 
-			initStringInfo(&buf);
+				/*
+				 * We can push down this qual if: - The operatory is TEXTEQ - The
+				 * qual is on the key column
+				 */
+				if (op->opfuncid == PROCID_TEXTEQ && strcmp(*key, "key") == 0)
+					*pushdown = true;
 
-			/* And get the column and value... */
-			*key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
-			*value = TextDatumGetCString(((Const *) right)->constvalue);
-
-			/*
-			 * We can push down this qual if: - The operatory is TEXTEQ - The
-			 * qual is on the key column
-			 */
-			if (op->opfuncid == PROCID_TEXTEQ && strcmp(*key, "key") == 0)
-				*pushdown = true;
-
-			return;
+				return;
+			}
 		}
 	}
 

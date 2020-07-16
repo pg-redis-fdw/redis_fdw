@@ -72,7 +72,7 @@ Usage
 
 The following parameters can be set on a Redis foreign server:
 
-address:	The address or hostname of the Redis server.
+host:	        The address or hostname of the Redis server.
 	 	Default: 127.0.0.1
 
 port:		The port number on which the Redis server is listening.
@@ -130,13 +130,20 @@ PostgreSQL releases. There are a few restriction on this:
 Example
 -------
 
+Please note, that column names `key` and `value` are hardcoded, you can not use 
+different names. If you do, expect to see errors like:
+
+```
+ERROR:  unrecognized/invalid column "k" for foreign table "tablename"
+```
+
 	CREATE EXTENSION redis_fdw;
 
 	CREATE SERVER redis_server
 		FOREIGN DATA WRAPPER redis_fdw
 		OPTIONS (address '127.0.0.1', port '6379');
 
-	CREATE FOREIGN TABLE redis_db0 (key text, val text)
+	CREATE FOREIGN TABLE redis_db0 (key text, value text)
 		SERVER redis_server
 		OPTIONS (database '0');
 
@@ -144,29 +151,29 @@ Example
 		SERVER redis_server
 		OPTIONS (password 'secret');
 
-	CREATE FOREIGN TABLE myredishash (key text, val text[])
+	CREATE FOREIGN TABLE myredishash (key text, value text[])
 		SERVER redis_server
 		OPTIONS (database '0', tabletype 'hash', tablekeyprefix 'mytable:');
 
-    INSERT INTO myredishash (key, val)
+    INSERT INTO myredishash (key, value)
        VALUES ('mytable:r1,'{prop1,val1,prop2,val2}');
 
     UPDATE myredishash
-        SET val = '{prop3,val3,prop4,val4}'
+        SET value = '{prop3,val3,prop4,val4}'
         WHERE key = 'mytable:r1';
 
     DELETE from myredishash
         WHERE key = 'mytable:r1';
 
-	CREATE FOREIGN TABLE myredis_s_hash (key text, val text)
+	CREATE FOREIGN TABLE myredis_s_hash (key text, value text)
 		SERVER redis_server
 		OPTIONS (database '0', tabletype 'hash',  singleton_key 'mytable');
 
-    INSERT INTO myredis_s_hash (key, val)
+    INSERT INTO myredis_s_hash (key, value)
        VALUES ('prop1','val1'),('prop2','val2');
 
     UPDATE myredis_s_hash
-        SET val = 'val23'
+        SET value = 'val23'
         WHERE key = 'prop1';
 
     DELETE from myredis_s_hash

@@ -127,15 +127,16 @@ PostgreSQL releases. There are a few restriction on this:
   priority column
 - non-singleton non-scalar tables must have an array type for the second column
 
-Example
--------
+Examples
+--------
 
 Please note, that column names `key` and `value` are hardcoded, you can not use 
-different names. If you do, expect to see errors like:
+other names. If you do, expect to see errors like:
 
 ```
 ERROR:  unrecognized/invalid column "k" for foreign table "tablename"
 ```
+---------------------------------------
 
 	CREATE EXTENSION redis_fdw;
 

@@ -1349,7 +1349,7 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 					break;
 				case PG_REDIS_ZSET_TABLE:
 					reply = redisCommand(festate->context,
-										 "ZRANGE %s 0 -1", key);
+										 "ZRANGE %s 0 -1 WITHSCORES", key);
 					break;
 				case PG_REDIS_SCALAR_TABLE:
 				default:
@@ -1415,6 +1415,8 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 		values[1] = data;
 		tuple = BuildTupleFromCStrings(festate->attinmeta, values);
 		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+	} else if (festate->cursor_id != NULL) {
+		redisIterateForeignScanMulti(node);
 	}
 
 	/* Cleanup */

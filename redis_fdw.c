@@ -1798,9 +1798,8 @@ redisPlanForeignModify(PlannerInfo *root,
 
 		/* code borrowed from mysql fdw */
 
-		/* modifiedCols in pg < 9.5 */
-		/* updatedCols in pg < 16 */
-		Bitmapset  *tmpset = bms_copy(rte->extraUpdatedCols);
+		RelOptInfo *rrel = find_base_rel(root, resultRelation);
+		Bitmapset  *tmpset = get_rel_all_updated_cols(root, rrel);
 		AttrNumber	col;
 
 		while ((col = bms_first_member(tmpset)) >= 0)

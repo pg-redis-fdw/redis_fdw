@@ -51,6 +51,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "optimizer/appendinfo.h"
+#include "optimizer/inherit.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"

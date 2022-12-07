@@ -1650,11 +1650,10 @@ static char *
 process_redis_array(redisReply *reply, redis_table_type type)
 {
 	StringInfo	res = makeStringInfo();
-	int			i;
 	bool		need_sep = false;
 
 	appendStringInfoChar(res, '{');
-	for (i = 0; i < reply->elements; i++)
+	for (int i = 0; i < reply->elements; i++)
 	{
 		redisReply *ir = reply->element[i];
 
@@ -1672,17 +1671,16 @@ process_redis_array(redisReply *reply, redis_table_type type)
 				{
 					char	   *buff;
 					char	   *crs;
-					int			i;
 
 					pg_verifymbstr(ir->str, ir->len, false);
 					buff = palloc(ir->len * 2 + 3);
 					crs = buff;
 					*crs++ = '"';
-					for (i = 0; i < ir->len; i++)
+					for (int j = 0; j < ir->len; j++)
 					{
-						if (ir->str[i] == '"' || ir->str[i] == '\\')
+						if (ir->str[j] == '"' || ir->str[j] == '\\')
 							*crs++ = '\\';
-						*crs++ = ir->str[i];
+						*crs++ = ir->str[j];
 					}
 					*crs++ = '"';
 					*crs = '\0';

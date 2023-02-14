@@ -7,8 +7,8 @@ to [Redis](http://redis.io/) key/value database. This FDW works with PostgreSQL 
 <img src="https://upload.wikimedia.org/wikipedia/commons/2/29/Postgresql_elephant.svg" align="center" height="100" alt="PostgreSQL"/>	+	<img src="https://avatars.githubusercontent.com/u/1529926" align="center" height="100" alt="Redis"/>
 
 This code was originally experimental, and largely intended as a pet project
-for Dave to experiment with and learn about FDWs in PostgreSQL. It has now been
-extended for production use by Andrew.
+for [Dave](#license-and-authors) to experiment with and learn about FDWs in PostgreSQL. It has now been
+extended for production use by [Andrew](#license-and-authors).
 
 **By all means use it, but do so entirely at your own risk!** You have been
 warned!
@@ -69,7 +69,7 @@ No deb or rpm packages are avalillable.
 
 #### Prerequisites:
 - A Redis database accesable from PostgreSQL server.
-- Especially local Redis *only* if you need `redis_fdw` testing.
+- Local Redis *only* if you need `redis_fdw` testing.
 - [Hiredis C interface](https://github.com/redis/hiredis) installed
 on your system. You can checkout the `hiredis` from github or it might be available in [rpm or deb packages for your OS](https://pkgs.org/search/?q=hiredis).
 
@@ -150,7 +150,7 @@ column for zsets.
 
 ## IMPORT FOREIGN SCHEMA options
 
-`redis_fdw` **doesn's support** [IMPORT FOREIGN SCHEMA](https://www.postgresql.org/docs/current/sql-importforeignschema.html)(PostgreSQL 9.5+) and accepts no custom options for this command. There is no formal storing schema in Redis in oppose to RDBMS.
+`redis_fdw` **doesn's support** [IMPORT FOREIGN SCHEMA](https://www.postgresql.org/docs/current/sql-importforeignschema.html) and accepts no custom options for this command. There is no formal storing schema in Redis in oppose to RDBMS.
 
 ## TRUNCATE support
 

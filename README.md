@@ -56,7 +56,7 @@ Supported platforms
 
 `redis_fdw` was developed on Linux and Mac OS X and should run on any
 reasonably POSIX-compliant system.
-Dave has tested the original on Mac OS X 10.6 only, and Andrew on Fedora and
+[Dave](#license-and-authors) has tested the original on Mac OS X 10.6 only, and [Andrew](#license-and-authors) on Fedora and
 Suse. Other *nix's should also work.
 Neither of us have tested on Windows, but the code should be good on MinGW.
 
@@ -71,7 +71,7 @@ No deb or rpm packages are avalillable.
 - A Redis database accesable from PostgreSQL server.
 - Especially local Redis *only* if you need `redis_fdw` testing.
 - [Hiredis C interface](https://github.com/redis/hiredis) installed
-on your system. You can checkout the `hiredis` from github or it might be available in rpm or deb packages for your OS as it is for Fedora, for example.
+on your system. You can checkout the `hiredis` from github or it might be available in [rpm or deb packages for your OS](https://pkgs.org/search/?q=hiredis).
 
 #### Build and install on OS
 
@@ -351,8 +351,18 @@ Opening issues and pull requests on GitHub are welcome.
 Useful links
 ------------
 
-### Source
+### Redis selected documentation
+
+- https://redis.io/commands/
+- https://redis.io/docs/
+- https://redis.io/docs/data-types/
+- https://github.com/redis/hiredis/blob/master/README.md
+
+### Source code
  
+- https://github.com/redis/hiredis
+- https://github.com/redis/redis
+
  Reference FDW realisation, `postgres_fdw`
  - https://git.postgresql.org/gitweb/?p=postgresql.git;a=tree;f=contrib/postgres_fdw;hb=HEAD 
 

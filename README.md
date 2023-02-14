@@ -304,30 +304,26 @@ Limitations
 - `RETURNING` is not supported.
 
 ### Other
-- There's no such thing as a cursor in Redis in the SQL sense,
-  nor MVCC, which leaves us
+- There's no such thing as a cursor in Redis 2.8- in the SQL sense,
+  nor [MVCC](https://en.wikipedia.org/wiki/Multiversion_concurrency_control), which leaves us
   with no way to atomically query the database for the available keys
   and then fetch each value. So, we get a list of keys to begin with,
   and then fetch whatever records still exist as we build the tuples.
-
-- We can only push down a single qual to Redis, which must use the
-  TEXTEQ operator, and must be on the 'key' column.
-
-- There is no support for non-scalar datatypes in Redis
-  such as lists, for PostgreSQL 9.1. There is such support for later releases.
-
 - Redis has acquired cursors as of Release 2.8. This is used in all the
   mainline branches from REL9_2_STABLE on, for operations which would otherwise
   either scan the entire Redis database in a single sweep, or scan a single,
   possible large, keyset in a single sweep. Redis Releases prior to 2.8 are
-  maintained on the REL9_x_STABLE_pre2.8 branches.
+  maintained on the REL9_x_STABLE_pre2.8 branches.  
+
+- We can only push down a single qual to Redis, which must use the
+  `TEXTEQ` operator, and must be on the `key` column.
 
 - Redis cursors have some significant limitations. The Redis docs say:
 
-    A given element may be returned multiple times. It is up to the
+    *A given element may be returned multiple times. It is up to the
     application to handle the case of duplicated elements, for example only
     using the returned elements in order to perform operations that are safe
-    when re-applied multiple times.
+    when re-applied multiple times*.
 
   The FDW makes no attempt to detect this situation. Users should be aware of
   the possibility.

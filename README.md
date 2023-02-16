@@ -356,8 +356,9 @@ Useful links
 
 ### Source code
  
-- https://github.com/redis/hiredis
-- https://github.com/redis/redis
+- https://github.com/redis/hiredis - hiredis C client library
+- https://github.com/redis/redis - redis DB
+- https://bitbucket.org/adunstan/redis_wrapper/src/master/ - PostgreSQL extension (not FDW) for Redis (also written by Andrew Dunstan)
 
  Reference FDW realisation, `postgres_fdw`
  - https://git.postgresql.org/gitweb/?p=postgresql.git;a=tree;f=contrib/postgres_fdw;hb=HEAD 

@@ -161,9 +161,7 @@ Functions
 ---------
 
 As well as the standard `redis_fdw_handler()` and `redis_fdw_validator()`
-functions, `redis_fdw` provides the following user-callable utility functions:
-
-**yet not described**
+functions, `redis_fdw` provides no user-callable utility functions.
 
 Identifier case handling
 ------------------------

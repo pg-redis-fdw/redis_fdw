@@ -2,7 +2,7 @@ Redis Foreign Data Wrapper for PostgreSQL
 ==========================================
 
 This is a foreign data wrapper (FDW) to connect [PostgreSQL](https://www.postgresql.org/)
-to [Redis](http://redis.io/) key/value database. This FDW works with PostgreSQL 10+ and confirmed with some Redis versions.
+to [Redis](http://redis.io/) key/value database. This FDW works with PostgreSQL 10+ and confirmed with some Redis versions near 6.0.
 
 <img src="https://upload.wikimedia.org/wikipedia/commons/2/29/Postgresql_elephant.svg" align="center" height="100" alt="PostgreSQL"/>	+	<img src="https://avatars.githubusercontent.com/u/1529926" align="center" height="100" alt="Redis"/>
 
@@ -304,16 +304,15 @@ Limitations
 - `RETURNING` is not supported.
 
 ### Other
-- There's no such thing as a cursor in Redis 2.8- in the SQL sense,
-  nor [MVCC](https://en.wikipedia.org/wiki/Multiversion_concurrency_control), which leaves us
+- Redis has acquired cursors in 2.8+. This is used in all the
+  mainline branches from REL9_2_STABLE on, for operations which would otherwise
+  either scan the entire Redis database in a single sweep, or scan a single,
+  possible large, keyset in a single sweep. 
+  
+- There is no [MVCC](https://en.wikipedia.org/wiki/Multiversion_concurrency_control), which leaves us
   with no way to atomically query the database for the available keys
   and then fetch each value. So, we get a list of keys to begin with,
   and then fetch whatever records still exist as we build the tuples.
-- Redis has acquired cursors as of Release 2.8. This is used in all the
-  mainline branches from REL9_2_STABLE on, for operations which would otherwise
-  either scan the entire Redis database in a single sweep, or scan a single,
-  possible large, keyset in a single sweep. Redis Releases prior to 2.8 are
-  maintained on the REL9_x_STABLE_pre2.8 branches.  
 
 - We can only push down a single qual to Redis, which must use the
   `TEXTEQ` operator, and must be on the `key` column.
@@ -327,6 +326,9 @@ Limitations
 
   The FDW makes no attempt to detect this situation. Users should be aware of
   the possibility.
+
+- There was no such thing as a cursor in Redis 2.8- in the SQL sense. Redis Releases
+  prior to 2.8 are maintained on the REL9_x_STABLE_pre2.8 branches.
 
 Tests
 -----

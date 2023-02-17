@@ -331,10 +331,10 @@ Limitations
 Tests
 -----
 
-The tests for PostgreSQL assume that you have access to a redis server
-on the localmachine with no password, and uses database 15, which must be empty,
-and that the redis-cli program is in the `PATH` envireonment variable when it is run.
-The test script checks that the database is empty before it tries to
+The tests for PostgreSQL assume that you have access to a Redis server
+on the local machine with no password, and uses PostgreSQL 15 server with *english* locale. This database must be empty,
+and that the `redis-cli` program is in the `PATH` envireonment variable when tests is run.
+The [test](test) script checks that the database is empty before it tries to
 populate it, and it cleans up afterwards.
 
 Some tests as `psql` expected outputs can be found in [expected](expected) directory.

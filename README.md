@@ -262,7 +262,7 @@ All `CREATE FOREIGN TABLE` SQL commands can be executed as a normal PostgreSQL u
 	);
 
     INSERT INTO myredishash (key, val)
-       VALUES ('mytable:r1','{prop1,val1,prop2,val2}');
+    VALUES ('mytable:r1','{prop1,val1,prop2,val2}');
 
     UPDATE myredishash
        SET val = '{prop3,val3,prop4,val4}'
@@ -285,7 +285,7 @@ All `CREATE FOREIGN TABLE` SQL commands can be executed as a normal PostgreSQL u
 	);
 
     INSERT INTO myredis_s_hash (key, val)
-       VALUES ('prop1','val1'),('prop2','val2');
+    VALUES ('prop1','val1'),('prop2','val2');
 
     UPDATE myredis_s_hash
        SET val = 'val23'

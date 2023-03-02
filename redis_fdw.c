@@ -1801,9 +1801,9 @@ redisPlanForeignModify(PlannerInfo *root,
 
 		RelOptInfo *rrel = find_base_rel(root, resultRelation);
 		Bitmapset  *tmpset = get_rel_all_updated_cols(root, rrel);
-		AttrNumber	col;
+		AttrNumber	col = -1;
 
-		while ((col = bms_first_member(tmpset)) >= 0)
+		while ((col = bms_next_member(tmpset, col)) >= 0)
 		{
 			col += FirstLowInvalidHeapAttributeNumber;
 			if (col <= InvalidAttrNumber)		/* shouldn't happen */

@@ -132,7 +132,7 @@ command:
 
 - **tablekeyset** as *string*, optional, no default
 
-  Fetch item names from the named set.
+  Fetch item names from the named set. In a Redis database with many keys, searching even using "tablekeyprefix" might still be expensive. In that case, you can keep a list of specific keys in a separate set and define it using "tablekeyset". This way the global keyspace isn't searched at all. Only the keys in the "tablekeyset" will be mapped in the foreign table.
 
 - **singleton_key** as *string*, optional, no default
 

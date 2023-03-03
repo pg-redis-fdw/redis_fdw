@@ -1801,11 +1801,11 @@ redisPlanForeignModify(PlannerInfo *root,
 
 		RelOptInfo *rrel = find_base_rel(root, resultRelation);
 		Bitmapset  *tmpset = get_rel_all_updated_cols(root, rrel);
-		AttrNumber	col = -1;
+		int	colidx = -1;
 
-		while ((col = bms_next_member(tmpset, col)) >= 0)
+		while ((colidx = bms_next_member(tmpset, colidx)) >= 0)
 		{
-			col += FirstLowInvalidHeapAttributeNumber;
+			AttrNumber col = colidx + FirstLowInvalidHeapAttributeNumber;
 			if (col <= InvalidAttrNumber)		/* shouldn't happen */
 				elog(ERROR, "system-column update is not supported");
 

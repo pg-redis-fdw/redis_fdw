@@ -74,12 +74,17 @@ No deb or rpm packages are avalillable.
 - Local Redis *only* if you need `redis_fdw` testing.
 - [Hiredis C interface](https://github.com/redis/hiredis) installed
 on your system. You can checkout the `hiredis` from github or it might be available in [rpm or deb packages for your OS](https://pkgs.org/search/?q=hiredis).
+- PostgreSQL development package. For Debian or Ubuntu: `apt-get install postgresql-server-dev-XX`, where `XX` matches your postgres version, i.e. `apt-get install postgresql-server-dev-15`
 
 #### Build and install on OS
 
 Add a directory of `pg_config` to PATH and build and install `regis_fdw`.
+Use release you need instead `{REL}`, for ex. `REL_15_STABLE`, `REL_16_STABLE`.
 
 ```sh
+git clone https://github.com/pg-redis-fdw/redis_fdw.git -b {REL}
+
+
 make USE_PGXS=1
 sudo make install USE_PGXS=1
 ```

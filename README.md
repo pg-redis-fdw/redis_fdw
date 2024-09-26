@@ -89,7 +89,7 @@ database:	The numeric ID of the Redis database to query.
 (9.2 and later) tablekeyprefix: only get items whose names start with the prefix
         Default: none
 
-(9.2 and later) tablekeyset: fetch item names from the named set
+(9.2 and later) tablekeyset: in a Redis database with  many keys, searching even using "tablekeyprefix" might still be expensive. In that case, you can keep a list of specific keys in a separate set and define it using "tablekeyset". This way the global keyspace isn't searched at all. Only the keys in the "tablekeyset" will be mapped in the foreign table.
         Default: none
 
 (9.2 and later) singleton_key: get all the values in the table from a single

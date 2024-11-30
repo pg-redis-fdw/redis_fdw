@@ -85,10 +85,10 @@ static struct RedisFdwOption valid_options[] =
 	/* Connection options */
 	{"address", ForeignServerRelationId},
 	{"port", ForeignServerRelationId},
-	{"password", UserMappingRelationId},	
+	{"password", UserMappingRelationId},
+	{"database", ForeignTableRelationId},
 
 	/* table options */
-	{"database", ForeignTableRelationId},
 	{"singleton_key", ForeignTableRelationId},
 	{"tablekeyprefix", ForeignTableRelationId},
 	{"tablekeyset", ForeignTableRelationId},

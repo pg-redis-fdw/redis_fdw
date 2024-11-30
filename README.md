@@ -78,8 +78,9 @@ on your system. You can checkout the `hiredis` from github or it might be availa
 
 #### Build and install on OS
 
-Add a directory of `pg_config` to PATH and build and install `regis_fdw`.
-Use release you need instead `{REL}`, for ex. `REL_15_STABLE`, `REL_16_STABLE`.
+Ensure `pg_config` is callable without full path, build and install `regis_fdw`
+with commands below. Use release you need instead of `{REL}`, for ex.
+`REL_15_STABLE`, `REL_16_STABLE`.
 
 ```sh
 git clone https://github.com/pg-redis-fdw/redis_fdw.git -b {REL}
@@ -157,11 +158,11 @@ column for zsets.
 
 ## IMPORT FOREIGN SCHEMA options
 
-`redis_fdw` **doesn's support** [IMPORT FOREIGN SCHEMA](https://www.postgresql.org/docs/current/sql-importforeignschema.html) and accepts no custom options for this command. There is no formal storing schema in Redis in oppose to RDBMS.
+`redis_fdw` **don't support** [IMPORT FOREIGN SCHEMA](https://www.postgresql.org/docs/current/sql-importforeignschema.html) and accepts no custom options for this command. There is no formal storing schema in Redis in oppose to RDBMS.
 
 ## TRUNCATE support
 
-`redis_fdw` don't implements the foreign data wrapper `TRUNCATE` API, available
+`redis_fdw` doesn't implements the foreign data wrapper `TRUNCATE` API, available
 from PostgreSQL 14.
 
 Functions
@@ -179,7 +180,7 @@ to be aware of potential issues with table and column names. If there will no pr
 Generated columns
 -----------------
 
-Redis doens't provides support for generated columns.
+Redis doesn't provide support for generated columns.
 
 For more details on generated columns see:
 
@@ -189,8 +190,10 @@ For more details on generated columns see:
 Character set handling
 ----------------------
 
-All strings from Redis are interpreted acording the PostgreSQL database's server encoding. Redis supports UTF-8 only data.
-It's not a problem if PostgreSQL server encoding is UTF-8. Behaviour with UTF-16 or UTF-32 PostgreSQL server **yet not described**. All PostgreSQL databases with a non-Unicode encoding is strongly not recommended to interact with `redis_fdw`.
+All strings from Redis are interpreted acording to the PostgreSQL database's server encoding.
+Redis supports UTF-8 only data. It's not a problem only if PostgreSQL server encoding is UTF-8.
+Behaviour with non-UTF PostgreSQL servers **yet not described** and not tested.
+This serevers is strongly not recommended to interact with `redis_fdw`.
 
 Examples
 --------
@@ -234,7 +237,7 @@ Where `pguser` is a sample user for works with foreign server (and foreign table
 	  password 'secret'
 	);
 ```
-Where `pguser` is a sample user for works with foreign server (and foreign tables).		
+Where `pguser` is a sample user for works with foreign server (and foreign tables).
 
 ### Create foreign table
 All `CREATE FOREIGN TABLE` SQL commands can be executed as a normal PostgreSQL user if there were correct `GRANT USAGE ON FOREIGN SERVER`. No need PostgreSQL supersuer for secirity reasons but also works with PostgreSQL supersuer.
@@ -314,9 +317,9 @@ Limitations
   either scan the entire Redis database in a single sweep, or scan a single,
   possible large, keyset in a single sweep. 
   
-- There is no [MVCC](https://en.wikipedia.org/wiki/Multiversion_concurrency_control), which leaves us
-  with no way to atomically query the database for the available keys
-  and then fetch each value. So, we get a list of keys to begin with,
+- There is no [MVCC](https://en.wikipedia.org/wiki/Multiversion_concurrency_control),
+  which leaves us with no way to atomically query the database for the available
+  keys and then fetch each value. So, we get a list of keys to begin with,
   and then fetch whatever records still exist as we build the tuples.
 
 - We can only push down a single qual to Redis, which must use the
@@ -332,19 +335,20 @@ Limitations
   The FDW makes no attempt to detect this situation. Users should be aware of
   the possibility.
 
-- There was no such thing as a cursor in Redis 2.8- in the SQL sense. Redis Releases
-  prior to 2.8 are maintained on the REL9_x_STABLE_pre2.8 branches.
+- There was no such thing as a cursor in Redis 2.8- in the SQL sense. Redis
+  releases prior to 2.8 are maintained on the REL9_x_STABLE_pre2.8 branches.
 
 Tests
 -----
 
 The tests for PostgreSQL assume that you have access to a Redis server
-on the local machine with no password, and uses PostgreSQL 15 server with *english* locale. This database must be empty,
-and that the `redis-cli` program is in the `PATH` envireonment variable when tests is run.
+on the local machine with no password, and uses PostgreSQL 15 server with
+*english* locale. This database must be empty, and that the `redis-cli` program
+is in the `PATH` envireonment variable when tests is run.
 The [test](test) script checks that the database is empty before it tries to
 populate it, and it cleans up afterwards.
 
-Some tests as `psql` expected outputs can be found in [expected](expected) directory.
+Some tests as `psql` expected outputs can be found in [test/expected](test/expected) directory.
  
 Contributing
 ------------
@@ -368,7 +372,7 @@ Useful links
 - https://bitbucket.org/adunstan/redis_wrapper/src/master/ - PostgreSQL extension (not FDW) for Redis (also written by Andrew Dunstan)
 - https://github.com/jeffreydwalter/redis_cluster_fdw - Other FDW for Redis
 
- Reference FDW realisation, `postgres_fdw`
+ Reference FDW implementation, `postgres_fdw`
  - https://git.postgresql.org/gitweb/?p=postgresql.git;a=tree;f=contrib/postgres_fdw;hb=HEAD 
 
 ### General FDW Documentation
@@ -390,4 +394,4 @@ License and authors
 * Dave Page dpage@pgadmin.org
 * Andrew Dunstan andrew@dunslane.net
 
-See the [`License`](License) file for full details.
+There is no licese file here.

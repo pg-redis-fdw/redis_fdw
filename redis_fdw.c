@@ -82,6 +82,7 @@ struct RedisFdwOption
  */
 static struct RedisFdwOption valid_options[] =
 {
+
 	/* Connection options */
 	{"address", ForeignServerRelationId},
 	{"port", ForeignServerRelationId},

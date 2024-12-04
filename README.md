@@ -4,7 +4,7 @@ Redis Foreign Data Wrapper for PostgreSQL
 This is a foreign data wrapper (FDW) to connect [PostgreSQL](https://www.postgresql.org/)
 to [Redis](http://redis.io/) key/value database. This FDW works with PostgreSQL 10+ and confirmed with some Redis versions near 6.0.
 
-<img src="https://upload.wikimedia.org/wikipedia/commons/2/29/Postgresql_elephant.svg" align="center" height="100" alt="PostgreSQL"/>	+	<img src="https://avatars.githubusercontent.com/u/1529926" align="center" height="100" alt="Redis"/>
+<img src="Postgres.svg" align="center" height="100" alt="PostgreSQL"/>	+	<img src="Redis.png" align="center" height="100" alt="Redis"/>
 
 This code was originally experimental, and largely intended as a pet project
 for [Dave](#license-and-authors) to experiment with and learn about FDWs in PostgreSQL. It has now been
@@ -393,5 +393,3 @@ License and authors
 -------
 * Dave Page dpage@pgadmin.org
 * Andrew Dunstan andrew@dunslane.net
-
-There is no licese file here.

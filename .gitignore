@@ -30,3 +30,8 @@ lib*.pc
 /Debug/
 /Release/
 /tmp_install/
+
+# Test artefacts
+/test/results/
+/test/regression.diffs
+/test/regression.out

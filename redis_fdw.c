@@ -87,9 +87,9 @@ static struct RedisFdwOption valid_options[] =
 	{"address", ForeignServerRelationId},
 	{"port", ForeignServerRelationId},
 	{"password", UserMappingRelationId},
-	{"database", ForeignTableRelationId},
 
 	/* table options */
+	{"database", ForeignTableRelationId},
 	{"singleton_key", ForeignTableRelationId},
 	{"tablekeyprefix", ForeignTableRelationId},
 	{"tablekeyset", ForeignTableRelationId},
@@ -119,8 +119,6 @@ typedef struct redisTableOptions
 	char	   *singleton_key;
 	redis_table_type table_type;
 } redisTableOptions;
-
-
 
 typedef struct
 {
@@ -263,8 +261,9 @@ static void check_reply(redisReply *reply, redisContext *context,
 #define REDISMODKEYNAME "__redis_mod_key_name"
 
 /*
- * Foreign-data wrapper handler function: return a struct with pointers
- * to my callback routines.
+ * redis_fdw_handler
+ *		Foreign-data wrapper handler function: return a struct with pointers
+ *		to my callback routines.
  */
 Datum
 redis_fdw_handler(PG_FUNCTION_ARGS)
@@ -299,10 +298,11 @@ redis_fdw_handler(PG_FUNCTION_ARGS)
 }
 
 /*
- * Validate the generic options given to a FOREIGN DATA WRAPPER, SERVER,
- * USER MAPPING or FOREIGN TABLE that uses file_fdw.
+ * redis_fdw_validator
+ *		Validate the generic options given to a FOREIGN DATA WRAPPER, SERVER,
+ *		USER MAPPING or FOREIGN TABLE that uses file_fdw.
  *
- * Raise an ERROR if the option or its value is considered invalid.
+ *		Raise an ERROR if the option or its value is considered invalid.
  */
 Datum
 redis_fdw_validator(PG_FUNCTION_ARGS)
@@ -500,10 +500,10 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-
 /*
- * Check if the provided option is one of the valid options.
- * context is the Oid of the catalog holding the object the option is for.
+ * redisIsValidOption
+ *		Check if the provided option is one of the valid options.
+ *		context is the Oid of the catalog holding the object the option is for.
  */
 static bool
 redisIsValidOption(const char *option, Oid context)
@@ -523,7 +523,8 @@ redisIsValidOption(const char *option, Oid context)
 }
 
 /*
- * Fetch the options for a redis_fdw foreign table.
+ * redisGetOptions
+ *		Fetch the options for a redis_fdw foreign table.
  */
 static void
 redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
@@ -538,10 +539,19 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 	elog(NOTICE, "redisGetOptions");
 #endif
 
+	/* Set void values */
+	table_options->address = NULL;
+	table_options->port = 0;
+	table_options->password = NULL;
+	table_options->database = 0;
+	table_options->keyprefix = NULL;
+	table_options->keyset = NULL;
+	table_options->singleton_key = NULL;
+	table_options->table_type = PG_REDIS_SCALAR_TABLE;
+
 	/*
 	 * Extract options from FDW objects. We only need to worry about server
 	 * options for Redis
-	 *
 	 */
 	table = GetForeignTable(foreigntableid);
 	server = GetForeignServer(table->serverid);
@@ -590,7 +600,10 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 				table_options->table_type = PG_REDIS_SET_TABLE;
 			else if (strcmp(typeval, "zset") == 0)
 				table_options->table_type = PG_REDIS_ZSET_TABLE;
-			/* XXX detect error here */
+			ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("invalid tabletype (%s) - must be hash, "
+						"list, set or zset", typeval)));
 		}
 	}
 
@@ -605,7 +618,12 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 		table_options->database = 0;
 }
 
-
+/*
+ * redisGetForeignRelSize
+ *		Gets size of a foreign realtion as value from
+ *		HLEN, LLEN, SCARD, ZCARD or DBSIZE Redis command
+ *		returns baserel->rows
+ */
 static void
 redisGetForeignRelSize(PlannerInfo *root,
 					   RelOptInfo *baserel,
@@ -629,15 +647,6 @@ redisGetForeignRelSize(PlannerInfo *root,
 	fdw_private = (RedisFdwPlanState *) palloc(sizeof(RedisFdwPlanState));
 	baserel->fdw_private = (void *) fdw_private;
 
-	table_options.address = NULL;
-	table_options.port = 0;
-	table_options.password = NULL;
-	table_options.database = 0;
-	table_options.keyprefix = NULL;
-	table_options.keyset = NULL;
-	table_options.singleton_key = NULL;
-	table_options.table_type = PG_REDIS_SCALAR_TABLE;
-
 	redisGetOptions(foreigntableid, &table_options);
 	fdw_private->svr_address = table_options.address;
 	fdw_private->svr_password = table_options.password;
@@ -647,7 +656,6 @@ redisGetForeignRelSize(PlannerInfo *root,
 	/* Connect to the database */
 	context = redisConnectWithTimeout(table_options.address, table_options.port,
 									  timeout);
-
 	if (context->err)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
@@ -688,7 +696,7 @@ redisGetForeignRelSize(PlannerInfo *root,
 #if 0
 
 	/*
-	 * KEYS is potentiallyexpensive, so this test is disabled and we use a
+	 * KEYS is potentially expensive, so this test is disabled and we use a
 	 * fairly dubious heuristic instead.
 	 */
 	if (table_options.keyprefix)
@@ -755,8 +763,6 @@ redisGetForeignRelSize(PlannerInfo *root,
 
 	freeReplyObject(reply);
 	redisFree(context);
-
-
 }
 
 /*
@@ -805,6 +811,11 @@ redisGetForeignPaths(PlannerInfo *root,
 
 }
 
+/*
+ * redisGetForeignPlan
+ *		Create ForeignScan plan node which implements only possible execution
+ *		"path" for Redis
+ */
 static ForeignScan *
 redisGetForeignPlan(PlannerInfo *root,
 					RelOptInfo *baserel,
@@ -919,16 +930,6 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 #ifdef DEBUG
 	elog(NOTICE, "BeginForeignScan");
 #endif
-
-	table_options.address = NULL;
-	table_options.port = 0;
-	table_options.password = NULL;
-	table_options.database = 0;
-	table_options.keyprefix = NULL;
-	table_options.keyset = NULL;
-	table_options.singleton_key = NULL;
-	table_options.table_type = PG_REDIS_SCALAR_TABLE;
-
 
 	/* Fetch options  */
 	redisGetOptions(RelationGetRelid(node->ss.ss_currentRelation),
@@ -1208,7 +1209,6 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
  * We have now spearated this into two streams of logic - one
  * for singleton key tables and one for multi-key tables.
  */
-
 static TupleTableSlot *
 redisIterateForeignScan(ForeignScanState *node)
 {
@@ -1475,8 +1475,7 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 				freeReplyObject(festate->reply);
 				redisFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
-				errmsg("not expecting an array for a singleton scalar table")
-								));
+								errmsg("not expecting an array for a singleton scalar table")));
 				break;
 		}
 	}
@@ -1501,8 +1500,7 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 				freeReplyObject(festate->reply);
 				redisFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
-								errmsg("not expecting an array for a single hash property: %s", festate->qual_value)
-								));
+								errmsg("not expecting an array for a single hash property: %s", festate->qual_value)));
 				break;
 		}
 	}
@@ -1644,11 +1642,13 @@ redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *push
 			return;
 		}
 	}
-
 	return;
 }
 
-
+/*
+ * process_redis_array
+ *		Returns StringInfo->data as char * for a Redis reply internal group of values
+ */
 static char *
 process_redis_array(redisReply *reply, redis_table_type type)
 {
@@ -1706,8 +1706,6 @@ process_redis_array(redisReply *reply, redis_table_type type)
 	return res->data;
 }
 
-
-
 static void
 redisAddForeignUpdateTargets(PlannerInfo *root,
 							 Index rtindex,
@@ -1742,9 +1740,12 @@ redisAddForeignUpdateTargets(PlannerInfo *root,
 
 	/* register it as a row-identity column needed by this target rel */
 	add_row_identity_var(root, var, rtindex, REDISMODKEYNAME);
-
 }
 
+/*
+ * redisPlanForeignModify
+ *		Plan an insert/update/delete operation on a foreign table
+ */
 static List *
 redisPlanForeignModify(PlannerInfo *root,
 					   ModifyTable *plan,
@@ -1794,7 +1795,6 @@ redisPlanForeignModify(PlannerInfo *root,
 			if (!attr->attisdropped)
 				targetAttrs = lappend_int(targetAttrs, attnum);
 		}
-
 	}
 	else if (operation == CMD_UPDATE)
 	{
@@ -1813,16 +1813,18 @@ redisPlanForeignModify(PlannerInfo *root,
 
 			targetAttrs = lappend_int(targetAttrs, col);
 		}
-
 	}
 
 	/* nothing extra needed for DELETE - all it needs is the resjunk column */
-
 	table_close(rel, NoLock);
 
 	return list_make2(targetAttrs, array_elem_list);
 }
 
+/*
+ * redisBeginForeignModify
+ *		Begin an insert/update/delete operation on a foreign table
+ */
 static void
 redisBeginForeignModify(ModifyTableState *mtstate,
 						ResultRelInfo *rinfo,
@@ -1847,20 +1849,9 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	elog(NOTICE, "redisBeginForeignModify");
 #endif
 
-	table_options.address = NULL;
-	table_options.port = 0;
-	table_options.password = NULL;
-	table_options.database = 0;
-	table_options.keyprefix = NULL;
-	table_options.keyset = NULL;
-	table_options.singleton_key = NULL;
-	table_options.table_type = PG_REDIS_SCALAR_TABLE;
-
-
 	/* Fetch options  */
 	redisGetOptions(RelationGetRelid(rel),
 					&table_options);
-
 
 	fmstate = (RedisFdwModifyState *) palloc(sizeof(RedisFdwModifyState));
 	rinfo->ri_FdwState = fmstate;
@@ -1893,12 +1884,10 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 		getTypeOutputInfo(attr->atttypid, &typefnoid, &isvarlena);
 		fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
 		fmstate->p_nums++;
-
 	}
 
 	if (op == CMD_UPDATE || op == CMD_INSERT)
 	{
-
 		fmstate->targetDims = (int *) palloc0(sizeof(int) * (n_attrs + 1));
 
 		foreach(lc, fmstate->target_attrs)
@@ -2030,7 +2019,6 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	freeReplyObject(reply);
 
 	fmstate->context = context;
-
 }
 
 static void
@@ -2070,6 +2058,10 @@ check_reply(redisReply *reply, redisContext *context, int error_code, char *mess
 				 ));
 }
 
+/*
+ * redisExecForeignInsert
+ *		Insert one row into a foreign table
+ */
 static TupleTableSlot *
 redisExecForeignInsert(EState *estate,
 					   ResultRelInfo *rinfo,
@@ -2094,7 +2086,6 @@ redisExecForeignInsert(EState *estate,
 
 	if (fmstate->singleton_key)
 	{
-
 		char	   *rkeyval;
 
 		if (fmstate->table_type == PG_REDIS_SCALAR_TABLE)
@@ -2107,7 +2098,6 @@ redisExecForeignInsert(EState *estate,
 		 * It is not an error for a list type singleton as they don't have to
 		 * be unique.
 		 */
-
 
 		switch (fmstate->table_type)
 		{
@@ -2135,7 +2125,6 @@ redisExecForeignInsert(EState *estate,
 
 		if (fmstate->table_type != PG_REDIS_LIST_TABLE)
 		{
-
 			bool		ok = true;
 
 			check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -2189,7 +2178,6 @@ redisExecForeignInsert(EState *estate,
 								   fmstate->singleton_key, keyval, extraval);
 				break;
 			case PG_REDIS_ZSET_TABLE:
-
 				/*
 				 * score comes BEFORE value in ZADD, which seems slightly
 				 * perverse
@@ -2208,14 +2196,8 @@ redisExecForeignInsert(EState *estate,
 					"cannot insert value for key %s", keyval);
 		freeReplyObject(sreply);
 	}
-	else
+	else /* if not a singleton key table */
 	{
-		/*
-		 * not a singleton key table
-		 *
-		 */
-
-		Datum		value;
 		char	   *valueval = NULL;
 		int			nitems;
 		Datum	   *elements;
@@ -2223,10 +2205,8 @@ redisExecForeignInsert(EState *estate,
 		int16		typlen;
 		bool		typbyval;
 		char		typalign;
-
 		bool		is_array = fmstate->array_elem_type != InvalidOid;
-
-		value = slot_getattr(slot, 2, &isnull);
+		Datum		value = slot_getattr(slot, 2, &isnull);
 
 		if (isnull)
 			ereport(ERROR,
@@ -2422,6 +2402,10 @@ redisExecForeignInsert(EState *estate,
 	return slot;
 }
 
+/*
+ * redisExecForeignDelete
+ *		Delete one row from a foreign table
+ */
 static TupleTableSlot *
 redisExecForeignDelete(EState *estate,
 					   ResultRelInfo *rinfo,
@@ -2503,6 +2487,10 @@ redisExecForeignDelete(EState *estate,
 	return slot;
 }
 
+/*
+ * redisExecForeignUpdate
+ *		Update one row in a foreign table
+ */
 static TupleTableSlot *
 redisExecForeignUpdate(EState *estate,
 					   ResultRelInfo *rinfo,
@@ -2615,7 +2603,6 @@ redisExecForeignUpdate(EState *estate,
 	/* now we have all the data we need */
 
 	/* if newkey = keyval then we're not updating the key */
-
 	if (strcmp(keyval, newkey) != 0)
 	{
 		bool		ok = true;
@@ -2806,7 +2793,7 @@ redisExecForeignUpdate(EState *estate,
 					break;
 			}
 		}
-	}							/* no key update */
+	}	/* no key update */
 	else if (newval)
 	{
 		if (!fmstate->singleton_key)
@@ -2926,11 +2913,13 @@ redisExecForeignUpdate(EState *estate,
 		}
 
 	}
-
 	return slot;
 }
 
-
+/*
+ * redisEndForeignModify
+ *		Finish an insert/update/delete operation on a foreign table
+ */
 static void
 redisEndForeignModify(EState *estate,
 					  ResultRelInfo *rinfo)

@@ -2,7 +2,7 @@ Redis Foreign Data Wrapper for PostgreSQL
 ==========================================
 
 This is a foreign data wrapper (FDW) to connect [PostgreSQL](https://www.postgresql.org/)
-to [Redis](http://redis.io/) key/value database. This FDW works with PostgreSQL 10+
+to [Redis](http://redis.io/) key/value databases. This FDW works with PostgreSQL 10+
 and confirmed with some Redis versions near 6.0.
 
 <img src="Postgres.svg" align="center" height="100" alt="PostgreSQL"/>	+	<img src="Redis.png" align="center" height="100" alt="Redis"/>
@@ -11,7 +11,7 @@ This code was originally experimental, and largely intended as a pet project
 for [Dave](#license-and-authors) to experiment with and learn about FDWs in PostgreSQL.
 It has now been extended for production use by [Andrew](#license-and-authors).
 
-![image](https://user-images.githubusercontent.com/41448637/219348148-13e507c7-e5e6-419a-9154-dcfebff814b2.png)
+![image](experimental.png)
 
 **By all means use it, but do so entirely at your own risk!** You have been
 warned!
@@ -73,7 +73,7 @@ No deb or rpm packages are avalillable.
 ### Source installation
 
 #### Prerequisites:
-- A Redis database accesible from PostgreSQL server.
+- A Redis database accessible from PostgreSQL server.
 - Local Redis *only* if you need `redis_fdw` testing.
 - [Hiredis C interface](https://github.com/redis/hiredis) installed
 on your system. You can checkout the `hiredis` from github or it might be available in [rpm or deb packages for your OS](https://pkgs.org/search/?q=hiredis).
@@ -165,7 +165,7 @@ column for zsets.
 
 ## IMPORT FOREIGN SCHEMA options
 
-`redis_fdw` **don't support** [IMPORT FOREIGN SCHEMA](https://www.postgresql.org/docs/current/sql-importforeignschema.html) and accepts no custom options for this command.
+`redis_fdw` **doesn't support** [IMPORT FOREIGN SCHEMA](https://www.postgresql.org/docs/current/sql-importforeignschema.html) and accepts no custom options for this command.
 There is no formal storing schema in Redis in oppose to RDBMS.
 
 ## TRUNCATE support
@@ -184,7 +184,7 @@ Identifier case handling
 
 PostgreSQL folds identifiers to lower case by default, Redis is case sensetive by default.
 It's important to be aware of potential issues with table and column names.
-If there will no proper name qouting in PostgreSQL, access from PostgreSQL foreign tables
+If there will no proper name quoting in PostgreSQL, access from PostgreSQL foreign tables
 with mixedcase or uppercase names to mixedcase or uppercase Redis objects can cause
 unexpected results.
 
@@ -202,9 +202,9 @@ Character set handling
 ----------------------
 
 All strings from Redis are interpreted acording to the PostgreSQL database's server encoding.
-Redis supports UTF-8 only data. It's not a problem only if PostgreSQL server encoding is UTF-8.
-Behaviour with non-UTF PostgreSQL servers **yet not described** and not tested.
-This serevers are strongly not recommended to interact with `redis_fdw`.
+Redis supports UTF-8 only data. It's not a problem if the PostgreSQL server encoding is UTF-8.
+Behaviour with non-UTF8 PostgreSQL servers is undefined and untested.
+It is not recommended to use `redis_fdw` with non UTF-8 PostgreSQL databases.
 
 Examples
 --------

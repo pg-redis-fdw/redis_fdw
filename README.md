@@ -68,7 +68,7 @@ Installation
 
 ### Package installation
 
-No deb or rpm packages are avalilable.
+No deb or rpm packages are available.
 
 ### Source installation
 

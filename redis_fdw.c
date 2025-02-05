@@ -600,10 +600,11 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 				table_options->table_type = PG_REDIS_SET_TABLE;
 			else if (strcmp(typeval, "zset") == 0)
 				table_options->table_type = PG_REDIS_ZSET_TABLE;
-			ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("invalid tabletype (%s) - must be hash, "
-						"list, set or zset", typeval)));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("invalid tabletype (%s) - must be hash, "
+								"list, set or zset", typeval)));
 		}
 	}
 

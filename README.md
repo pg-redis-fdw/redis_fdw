@@ -2,15 +2,16 @@ Redis Foreign Data Wrapper for PostgreSQL
 ==========================================
 
 This is a foreign data wrapper (FDW) to connect [PostgreSQL](https://www.postgresql.org/)
-to [Redis](http://redis.io/) key/value database. This FDW works with PostgreSQL 10+ and confirmed with some Redis versions near 6.0.
+to [Redis](http://redis.io/) key/value databases. This FDW works with PostgreSQL 10+
+and confirmed with some Redis versions near 6.0.
 
-<img src="Postgres.svg" align="center" height="100" alt="PostgreSQL"/>	+	<img src="Redis.png" align="center" height="100" alt="Redis"/>
+<img src="img/Postgres.svg" align="center" height="100" alt="PostgreSQL"/>	+	<img src="img/Redis.png" align="center" height="100" alt="Redis"/>
 
 This code was originally experimental, and largely intended as a pet project
-for [Dave](#license-and-authors) to experiment with and learn about FDWs in PostgreSQL. It has now been
-extended for production use by [Andrew](#license-and-authors).
+for [Dave](#license-and-authors) to experiment with and learn about FDWs in PostgreSQL.
+It has now been extended for production use by [Andrew](#license-and-authors).
 
-![image](https://user-images.githubusercontent.com/41448637/219348148-13e507c7-e5e6-419a-9154-dcfebff814b2.png)
+![image](img/experimental.png)
 
 **By all means use it, but do so entirely at your own risk!** You have been
 warned!
@@ -38,7 +39,7 @@ Features
 
 ### Common features
 - `SELECT`
-- `INSERT`, `UPDATE`, `DELETE`. There are a few restriction for the operatrions:
+- `INSERT`, `UPDATE`, `DELETE`. There are a few restrictions for the operations:
   - only `INSERT` works for singleton key list tables, due to limitations
   in the Redis API for lists.
   - `INSERT` and `UPDATE` only work for singleton key `ZSET` tables if they have the
@@ -57,24 +58,26 @@ Supported platforms
 -------------------
 
 `redis_fdw` was developed on Linux and Mac OS X and should run on any
-reasonably POSIX-compliant system.
-[Dave](#license-and-authors) has tested the original on Mac OS X 10.6 only, and [Andrew](#license-and-authors) on Fedora and
-Suse. Other *nix's should also work.
-Neither of us have tested on Windows, but the code should be good on MinGW.
+reasonably POSIX-compliant system. [Dave](#license-and-authors) has tested the
+original on Mac OS X 10.6 only, and [Andrew](#license-and-authors) on Fedora
+and Suse. Other *nix's should also work. Neither of us have tested on Windows,
+but the code should be good on MinGW.
 
 Installation
 ------------
 
-No deb or rpm packages are avalillable.
+### Package installation
+
+No deb or rpm packages are avalilable.
 
 ### Source installation
 
 #### Prerequisites:
-- A Redis database accesable from PostgreSQL server.
+- A Redis database accessible from PostgreSQL server.
 - Local Redis *only* if you need `redis_fdw` testing.
 - [Hiredis C interface](https://github.com/redis/hiredis) installed
 on your system. You can checkout the `hiredis` from github or it might be available in [rpm or deb packages for your OS](https://pkgs.org/search/?q=hiredis).
-- PostgreSQL development package. For Debian or Ubuntu: `apt-get install postgresql-server-dev-XX`, where `XX` matches your postgres version, i.e. `apt-get install postgresql-server-dev-15`
+- PostgreSQL development package. For Debian or Ubuntu: `apt-get install postgresql-server-dev-XX -y`, where `XX` matches your postgres version, i.e. `apt-get install postgresql-server-dev-15 -y`
 
 #### Build and install on OS
 
@@ -84,7 +87,6 @@ with commands below. Use release you need instead of `{REL}`, for ex.
 
 ```sh
 git clone https://github.com/pg-redis-fdw/redis_fdw.git -b {REL}
-
 
 make USE_PGXS=1
 sudo make install USE_PGXS=1
@@ -132,17 +134,22 @@ command:
 
   Can be `hash`, `list`, `set` or `zset`. If not provided only look at scalar values.
 
-- **tabletype** as *string*, optional, no default
+- **tablekeyprefix** as *string*, optional, no default
 
   Only get items whose names start with the prefix.
 
 - **tablekeyset** as *string*, optional, no default
 
-  Fetch item names from the named set. In a Redis database with many keys, searching even using "tablekeyprefix" might still be expensive. In that case, you can keep a list of specific keys in a separate set and define it using "tablekeyset". This way the global keyspace isn't searched at all. Only the keys in the "tablekeyset" will be mapped in the foreign table.
+  Fetch item names from the named set. In a Redis database with many keys,
+searching even using `tablekeyprefix` might still be expensive. In that case,
+you can keep a list of specific keys in a separate set and define it using
+`tablekeyset`. This way the global keyspace isn't searched at all.
+Only the keys in the `tablekeyset` will be mapped in the foreign table.
 
 - **singleton_key** as *string*, optional, no default
 
-  Get all the values in the table from a single named object. If not provided don't use a single object.
+  Get all the values in the table from a single named object. If not provided
+don't use a single object.
 
 You can only have one of `tablekeyset` and `tablekeyprefix`, and if you use
 `singleton_key` you can't have either.
@@ -158,7 +165,8 @@ column for zsets.
 
 ## IMPORT FOREIGN SCHEMA options
 
-`redis_fdw` **don't support** [IMPORT FOREIGN SCHEMA](https://www.postgresql.org/docs/current/sql-importforeignschema.html) and accepts no custom options for this command. There is no formal storing schema in Redis in oppose to RDBMS.
+`redis_fdw` **doesn't support** [IMPORT FOREIGN SCHEMA](https://www.postgresql.org/docs/current/sql-importforeignschema.html) and accepts no custom options for this command.
+There is no formal storing schema in Redis in oppose to RDBMS.
 
 ## TRUNCATE support
 
@@ -174,8 +182,11 @@ functions, `redis_fdw` provides no user-callable utility functions.
 Identifier case handling
 ------------------------
 
-PostgreSQL folds identifiers to lower case by default, Redis is case sensetive by default. It's important
-to be aware of potential issues with table and column names. If there will no proper name qouting in PostgreSQL, access from PostgreSQL foreign tables with mixedcase or uppercase names to mixedcase or uppercase Redis objects can cause unexpected results.
+PostgreSQL folds identifiers to lower case by default, Redis is case sensetive by default.
+It's important to be aware of potential issues with table and column names.
+If there will no proper name quoting in PostgreSQL, access from PostgreSQL foreign tables
+with mixedcase or uppercase names to mixedcase or uppercase Redis objects can cause
+unexpected results.
 
 Generated columns
 -----------------
@@ -191,9 +202,9 @@ Character set handling
 ----------------------
 
 All strings from Redis are interpreted acording to the PostgreSQL database's server encoding.
-Redis supports UTF-8 only data. It's not a problem only if PostgreSQL server encoding is UTF-8.
-Behaviour with non-UTF PostgreSQL servers **yet not described** and not tested.
-This serevers is strongly not recommended to interact with `redis_fdw`.
+Redis supports UTF-8 only data. It's not a problem if the PostgreSQL server encoding is UTF-8.
+Behaviour with non-UTF8 PostgreSQL servers is undefined and untested.
+It is not recommended to use `redis_fdw` with non UTF-8 PostgreSQL databases.
 
 Examples
 --------
@@ -315,8 +326,8 @@ Limitations
 - Redis has acquired cursors in 2.8+. This is used in all the
   mainline branches from REL9_2_STABLE on, for operations which would otherwise
   either scan the entire Redis database in a single sweep, or scan a single,
-  possible large, keyset in a single sweep. 
-  
+  possible large, keyset in a single sweep.
+
 - There is no [MVCC](https://en.wikipedia.org/wiki/Multiversion_concurrency_control),
   which leaves us with no way to atomically query the database for the available
   keys and then fetch each value. So, we get a list of keys to begin with,
@@ -349,7 +360,7 @@ The [test](test) script checks that the database is empty before it tries to
 populate it, and it cleans up afterwards.
 
 Some tests as `psql` expected outputs can be found in [test/expected](test/expected) directory.
- 
+
 Contributing
 ------------
 
@@ -366,14 +377,14 @@ Useful links
 - https://github.com/redis/hiredis/blob/master/README.md
 
 ### Source code
- 
+
 - https://github.com/redis/hiredis - hiredis C client library
 - https://github.com/redis/redis - redis DB
 - https://bitbucket.org/adunstan/redis_wrapper/src/master/ - PostgreSQL extension (not FDW) for Redis (also written by Andrew Dunstan)
 - https://github.com/jeffreydwalter/redis_cluster_fdw - Other FDW for Redis
 
  Reference FDW implementation, `postgres_fdw`
- - https://git.postgresql.org/gitweb/?p=postgresql.git;a=tree;f=contrib/postgres_fdw;hb=HEAD 
+ - https://git.postgresql.org/gitweb/?p=postgresql.git;a=tree;f=contrib/postgres_fdw;hb=HEAD
 
 ### General FDW Documentation
 

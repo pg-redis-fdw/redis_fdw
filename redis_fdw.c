@@ -86,6 +86,7 @@ static struct RedisFdwOption valid_options[] =
 	/* Connection options */
 	{"address", ForeignServerRelationId},
 	{"port", ForeignServerRelationId},
+	{"username", UserMappingRelationId},
 	{"password", UserMappingRelationId},
 	{"database", ForeignTableRelationId},
 
@@ -112,6 +113,7 @@ typedef struct redisTableOptions
 {
 	char	   *address;
 	int			port;
+	char	   *username;
 	char	   *password;
 	int			database;
 	char	   *keyprefix;
@@ -126,6 +128,7 @@ typedef struct
 {
 	char	   *svr_address;
 	int			svr_port;
+	char	   *svr_username;
 	char	   *svr_password;
 	int			svr_database;
 } RedisFdwPlanState;
@@ -142,6 +145,7 @@ typedef struct RedisFdwExecutionState
 	long long	row;
 	char	   *address;
 	int			port;
+	char	   *username;
 	char	   *password;
 	int			database;
 	char	   *keyprefix;
@@ -159,6 +163,7 @@ typedef struct RedisFdwModifyState
 	redisContext *context;
 	char	   *address;
 	int			port;
+    char	   *username;
 	char	   *password;
 	int			database;
 	char	   *keyprefix;
@@ -311,6 +316,7 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 	Oid			catalog = PG_GETARG_OID(1);
 	char	   *svr_address = NULL;
 	int			svr_port = 0;
+    char	   *svr_username = NULL;
 	char	   *svr_password = NULL;
 	int			svr_database = 0;
 	redis_table_type tabletype = PG_REDIS_SCALAR_TABLE;
@@ -385,6 +391,15 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 								));
 
 			svr_password = defGetString(def);
+		}
+		else if (strcmp(def->defname, "username") == 0)
+		{
+			if (svr_username)
+				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options: username")
+								));
+
+			svr_username = defGetString(def);
 		}
 		else if (strcmp(def->defname, "database") == 0)
 		{
@@ -566,6 +581,9 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 		if (strcmp(def->defname, "password") == 0)
 			table_options->password = defGetString(def);
 
+		if (strcmp(def->defname, "username") == 0)
+			table_options->username = defGetString(def);
+
 		if (strcmp(def->defname, "database") == 0)
 			table_options->database = atoi(defGetString(def));
 
@@ -632,6 +650,7 @@ redisGetForeignRelSize(PlannerInfo *root,
 	table_options.address = NULL;
 	table_options.port = 0;
 	table_options.password = NULL;
+	table_options.username = NULL;
 	table_options.database = 0;
 	table_options.keyprefix = NULL;
 	table_options.keyset = NULL;
@@ -641,6 +660,7 @@ redisGetForeignRelSize(PlannerInfo *root,
 	redisGetOptions(foreigntableid, &table_options);
 	fdw_private->svr_address = table_options.address;
 	fdw_private->svr_password = table_options.password;
+	fdw_private->svr_username = table_options.username;
 	fdw_private->svr_port = table_options.port;
 	fdw_private->svr_database = table_options.database;
 
@@ -657,7 +677,14 @@ redisGetForeignRelSize(PlannerInfo *root,
 	/* Authenticate */
 	if (table_options.password)
 	{
-		reply = redisCommand(context, "AUTH %s", table_options.password);
+        if (table_options.username)
+        {
+            reply = redisCommand(context, "AUTH %s %s", table_options.username, table_options.password);
+        }
+        else
+        {
+            reply = redisCommand(context, "AUTH %s", table_options.password);
+        }
 
 		if (!reply)
 		{
@@ -920,6 +947,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 
 	table_options.address = NULL;
 	table_options.port = 0;
+	table_options.username = NULL;
 	table_options.password = NULL;
 	table_options.database = 0;
 	table_options.keyprefix = NULL;
@@ -948,7 +976,14 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	/* Authenticate */
 	if (table_options.password)
 	{
-		reply = redisCommand(context, "AUTH %s", table_options.password);
+        if (table_options.username)
+        {
+            reply = redisCommand(context, "AUTH %s %s", table_options.username, table_options.password);
+        }
+        else
+        {
+            reply = redisCommand(context, "AUTH %s", table_options.password);
+        }
 
 		if (!reply)
 		{
@@ -1847,6 +1882,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 
 	table_options.address = NULL;
 	table_options.port = 0;
+	table_options.username = NULL;
 	table_options.password = NULL;
 	table_options.database = 0;
 	table_options.keyprefix = NULL;
@@ -2005,7 +2041,14 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	/* Authenticate */
 	if (table_options.password)
 	{
-		reply = redisCommand(context, "AUTH %s", table_options.password);
+        if (table_options.username)
+        {
+            reply = redisCommand(context, "AUTH %s %s", table_options.username, table_options.password);
+        }
+        else
+        {
+            reply = redisCommand(context, "AUTH %s", table_options.password);
+        }
 
 		if (!reply)
 		{

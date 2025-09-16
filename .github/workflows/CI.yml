@@ -1,0 +1,86 @@
+name: Redis FDW test
+
+on:
+  workflow_dispatch:
+  pull_request:  
+  push:
+    branches:
+      - master
+      - main
+jobs:
+  detect-pgversion:
+    runs-on: ubuntu-22.04
+    outputs:
+      pgversion: ${{ steps.detect-pgversion.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: detect-pgversion
+        id: detect-pgversion
+        run: |
+          targets=`bash GitHubActions/detect_targets.sh`
+          echo "targets=$targets" >> $GITHUB_OUTPUT
+
+  test:
+    needs: detect-pgversion
+    env:
+      POSTGIS_VERSION : "3.4.2"
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      HIREDIS_FOR_TESTING_DIR: "/opt/hiredis_testing"
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ${{ fromJSON(needs.detect-pgversion.outputs.pgversion) }}
+        config: ["default", "postgis"]
+        
+    name: Test on PostgreSQL ${{ matrix.pg }}, ${{ matrix.config }} mode
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: tar
+        run: tar zcvf redis_fdw.tar.gz ./*
+
+      - name: set_proxy
+        run: bash GitHubActions/env.sh
+
+      - name: download PostGIS, ${{ matrix.config }} mode
+        run: |
+          if [[ "${{ matrix.config }}" == "postgis" ]]; then
+            bash GitHubActions/download_postgis.sh ${{ env.POSTGIS_VERSION }}
+          fi
+
+      - name: install locales
+        run: bash GitHubActions/install_locales.sh
+
+      - name: build PostgreSQL ${{ matrix.pg }}
+        run: bash GitHubActions/build_postgres.sh ${{ matrix.pg }}
+
+      - name: install Redis, ${{ matrix.config }} mode
+        run: bash GitHubActions/install_redis.sh ${{ matrix.config }} ${{ env.HIREDIS_FOR_TESTING_DIR }}
+
+      - name: build PostGIS ${{ env.POSTGIS_VERSION }} for PostgreSQL ${{ matrix.pg }}, ${{ matrix.config }} mode
+        run: |
+          if [[ "${{ matrix.config }}" == "postgis" ]]; then
+            bash GitHubActions/build_postgis.sh ${{ matrix.pg }} ${{ env.POSTGIS_VERSION }}
+          fi
+
+      - name: build redis_fdw, ${{ matrix.config }} mode
+        run: |
+          bash GitHubActions/build_redis_fdw.sh ${{ matrix.pg }} ${{ matrix.config }} ${{ env.HIREDIS_FOR_TESTING_DIR }}
+
+      - name: execute redis_fdw test
+        run: bash GitHubActions/execute_test.sh ${{ matrix.pg }} ${{ matrix.config }} ${{ env.HIREDIS_FOR_TESTING_DIR }}
+
+      - name: download output files (regression.diffs)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pg }}-${{ matrix.config }}-test-results
+          path: |
+            workdir/postgresql-${{ matrix.pg }}/contrib/redis_fdw/test/regression.diffs
+            workdir/postgresql-${{ matrix.pg }}/contrib/redis_fdw/test/regression.out
+            workdir/postgresql-${{ matrix.pg }}/contrib/redis_fdw/test/results
+          retention-days: 7
+

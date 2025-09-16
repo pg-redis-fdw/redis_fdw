@@ -16,6 +16,9 @@ It has now been extended for production use by [Andrew](#license-and-authors).
 **By all means use it, but do so entirely at your own risk!** You have been
 warned!
 
+Current CI status.
+[![CI Status](https://github.com/pg-redis-fdw/redis_fdw/actions/workflows/CI.yml/badge.svg)](https://github.com/pg-redis-fdw/redis_fdw/actions/workflows/CI.yml)
+
 Contents
 --------
 
@@ -404,3 +407,6 @@ License and authors
 -------
 * Dave Page dpage@pgadmin.org
 * Andrew Dunstan andrew@dunslane.net
+
+Redis FDW is licensed under PostgreSQL license, see the [`License`](License) file for full details.
+Provided license based on https://opensource.org/license/postgresql

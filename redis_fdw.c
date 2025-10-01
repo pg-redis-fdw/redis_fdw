@@ -2,7 +2,7 @@
  *
  *		  foreign-data wrapper for Redis
  *
- * Copyright (c) 2011,2013 PostgreSQL Global Development Group
+ * Copyright (c) 2011-2025 The redis-fdw Development Team
  *
  * This software is released under the PostgreSQL Licence
  *
@@ -69,6 +69,12 @@
 #include "utils/rel.h"
 
 PG_MODULE_MAGIC;
+
+/*
+ * Code version is updated at new release.
+ * 		Older branches are equal to minor
+ */
+#define REDIS_FDW_CODE_VERSION  1901
 
 #define PROCID_TEXTEQ 67
 
@@ -187,9 +193,13 @@ typedef struct RedisFdwModifyState
  */
 extern Datum redis_fdw_handler(PG_FUNCTION_ARGS);
 extern Datum redis_fdw_validator(PG_FUNCTION_ARGS);
+extern Datum redis_fdw_version(PG_FUNCTION_ARGS);
+extern Datum redis_fdw_hiredis_version(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(redis_fdw_handler);
 PG_FUNCTION_INFO_V1(redis_fdw_validator);
+PG_FUNCTION_INFO_V1(redis_fdw_version);
+PG_FUNCTION_INFO_V1(redis_fdw_hiredis_version);
 
 /*
  * FDW callback routines
@@ -2958,3 +2968,22 @@ redisEndForeignModify(EState *estate,
 	}
 }
 
+/*
+ * redis_fdw_version
+ *		Gets source code version of this FDW
+ */
+Datum
+redis_fdw_version(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(REDIS_FDW_CODE_VERSION);
+}
+
+/*
+ * redis_fdw_hiredis_version
+ *		Gets used hiredis source code version
+ */
+Datum
+redis_fdw_hiredis_version(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(HIREDIS_MAJOR * 10000 + HIREDIS_MINOR * 100 + HIREDIS_PATCH);
+}

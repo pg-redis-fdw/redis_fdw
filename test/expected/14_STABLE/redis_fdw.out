@@ -1,11 +1,29 @@
+-- Testcase 001:
+CREATE EXTENSION hstore;
+-- Testcase 002:
+CREATE EXTENSION redis_fdw;
+-- Testcase 003:
+select redis_fdw_version();
+ redis_fdw_version 
+-------------------
+              1901
+(1 row)
+
+-- Testcase 004:
+select redis_fdw_hiredis_version();
+ redis_fdw_hiredis_version 
+---------------------------
+                      1401
+(1 row)
+
+-- Testcase 005:
 CREATE OR REPLACE FUNCTION atsort( a text[])
  RETURNS text[]
  LANGUAGE sql
  IMMUTABLE  STRICT
 AS $function$
   select array(select unnest($1) order by 1)
-$function$
-;
+$function$;
 create server localredis foreign data wrapper redis_fdw;
 create user mapping for public server localredis;
 -- tables for all 5 data types (4 structured plus scalar)
@@ -44,7 +62,7 @@ do $$
 $$;
 \unset ON_ERROR_STOP
 -- ok, empty, so now run the setup script
-\! redis-cli < test/sql/redis_setup
+\! redis-cli < test/redis_setup
 OK
 OK
 OK
@@ -378,7 +396,7 @@ select * from db15_1key_zset_scores order by score desc;
 
 -- insert delete update
 -- first clean the database again
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 OK
 OK
 -- singleton scalar table
@@ -1342,7 +1360,7 @@ select * from db15_w_hash_kset;
 (0 rows)
 
 -- now clean up for the cursor tests
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 OK
 OK
 -- cursor tests
@@ -1395,6 +1413,54 @@ select count(*) from db15bigkeysetscalar;
 (1 row)
 
 -- all done, so now blow everything in the db away again
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 OK
 OK
+DROP EXTENSION redis_fdw CASCADE;
+NOTICE:  drop cascades to 45 other objects
+DETAIL:  drop cascades to server localredis
+drop cascades to user mapping for public on server localredis
+drop cascades to foreign table db15
+drop cascades to foreign table db15_hash
+drop cascades to foreign table db15_set
+drop cascades to foreign table db15_list
+drop cascades to foreign table db15_zset
+drop cascades to foreign table db15_hash_prefix
+drop cascades to foreign table db15_hash_prefix_array
+drop cascades to foreign table db15_hash_keyset_array
+drop cascades to foreign table db15_set_prefix
+drop cascades to foreign table db15_set_prefix_array
+drop cascades to foreign table db15_set_keyset_array
+drop cascades to foreign table db15_list_prefix
+drop cascades to foreign table db15_list_prefix_array
+drop cascades to foreign table db15_list_keyset_array
+drop cascades to foreign table db15_zset_prefix
+drop cascades to foreign table db15_zset_prefix_array
+drop cascades to foreign table db15_zset_keyset_array
+drop cascades to foreign table db15_1key
+drop cascades to foreign table db15_1key_hash
+drop cascades to foreign table db15_1key_set
+drop cascades to foreign table db15_1key_list
+drop cascades to foreign table db15_1key_zset
+drop cascades to foreign table db15_1key_zset_scores
+drop cascades to foreign table db15_w_1key_scalar
+drop cascades to foreign table db15_w_1key_hash
+drop cascades to foreign table db15_w_1key_list
+drop cascades to foreign table db15_w_1key_set
+drop cascades to foreign table db15_w_1key_zset
+drop cascades to foreign table db15_w_1key_zsetx
+drop cascades to foreign table db15_w_scalar
+drop cascades to foreign table db15_w_scalar_pfx
+drop cascades to foreign table db15_w_scalar_kset
+drop cascades to foreign table db15_w_set_nonarr
+drop cascades to foreign table db15_w_set_pfx
+drop cascades to foreign table db15_w_set_kset
+drop cascades to foreign table db15_w_list_pfx
+drop cascades to foreign table db15_w_list_kset
+drop cascades to foreign table db15_w_zset_pfx
+drop cascades to foreign table db15_w_zset_kset
+drop cascades to foreign table db15_w_hash_pfx
+drop cascades to foreign table db15_w_hash_kset
+drop cascades to foreign table db15bigprefixscalar
+drop cascades to foreign table db15bigkeysetscalar
+DROP EXTENSION hstore;

@@ -1,4 +1,3 @@
-
 /*-------------------------------------------------------------------------
  *
  *		  foreign-data wrapper for Redis
@@ -20,18 +19,17 @@
 /* #define DEBUG */
 
 #include "postgres.h"
+#include <hiredis/hiredis.h>
 
 /* check that we are compiling for the right postgres version */
-#if PG_VERSION_NUM < 190000
-#error wrong Postgresql version this branch is only for 19.
+#if PG_VERSION_NUM < 140000
+#error Selected Postgresql version is very old for this branch, try to use some older branch.
 #endif
-
 
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <hiredis/hiredis.h>
 
 #include "funcapi.h"
 #include "access/reloptions.h"
@@ -42,8 +40,12 @@
 #include "catalog/pg_user_mapping.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#if PG_VERSION_NUM >= 180000
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
+#else
+#include "commands/explain.h"
+#endif
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -52,7 +54,9 @@
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "optimizer/appendinfo.h"
+#if PG_VERSION_NUM >= 160000
 #include "optimizer/inherit.h"
+#endif
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
@@ -83,7 +87,6 @@ struct RedisFdwOption
  */
 static struct RedisFdwOption valid_options[] =
 {
-
 	/* Connection options */
 	{"address", ForeignServerRelationId},
 	{"port", ForeignServerRelationId},
@@ -229,16 +232,20 @@ static TupleTableSlot *redisExecForeignInsert(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
 					   TupleTableSlot *planSlot);
+
 static void redisEndForeignModify(EState *estate,
-					  ResultRelInfo *rinfo);
+								  ResultRelInfo *rinfo);
+
 static void redisAddForeignUpdateTargets(PlannerInfo *root,
 										 Index rtindex,
 										 RangeTblEntry *target_rte,
 										 Relation target_relation);
+
 static TupleTableSlot *redisExecForeignDelete(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
 					   TupleTableSlot *planSlot);
+
 static TupleTableSlot *redisExecForeignUpdate(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
@@ -802,15 +809,18 @@ redisGetForeignPaths(PlannerInfo *root,
 			 create_foreignscan_path(root, baserel,
 									 NULL,      /* default pathtarget */
 									 baserel->rows,
+#if PG_VERSION_NUM >= 180000
 									 0,         /* no disabled nodes */
+#endif
 									 startup_cost,
 									 total_cost,
 									 NIL,		/* no pathkeys */
 									 NULL,		/* no outer rel either */
 									 NULL,      /* no extra plan */
+#if PG_VERSION_NUM >= 170000
 									 NIL,       /* no fdw_restrictinfo list */
+#endif
 									 NIL));		/* no fdw_private data */
-
 }
 
 /*
@@ -1737,7 +1747,6 @@ redisAddForeignUpdateTargets(PlannerInfo *root,
 				  attr->atttypmod,
 				  InvalidOid,
 				  0);
-
 	/* register it as a row-identity column needed by this target rel */
 	add_row_identity_var(root, var, rtindex, REDISMODKEYNAME);
 }
@@ -1798,16 +1807,27 @@ redisPlanForeignModify(PlannerInfo *root,
 	}
 	else if (operation == CMD_UPDATE)
 	{
-
+#if PG_VERSION_NUM >= 160000
 		/* code borrowed from mysql fdw */
-
 		RelOptInfo *rrel = find_base_rel(root, resultRelation);
 		Bitmapset  *tmpset = get_rel_all_updated_cols(root, rrel);
 		int	colidx = -1;
-
+#else
+		/* modifiedCols in pg < 9.5 */
+		Bitmapset  *tmpset = bms_copy(rte->updatedCols);
+		AttrNumber	col;
+#endif
+#if PG_VERSION_NUM >= 160000
 		while ((colidx = bms_next_member(tmpset, colidx)) >= 0)
+#else
+		while ((col = bms_first_member(tmpset)) >= 0)
+#endif
 		{
+#if PG_VERSION_NUM >= 160000
 			AttrNumber col = colidx + FirstLowInvalidHeapAttributeNumber;
+#else
+			col += FirstLowInvalidHeapAttributeNumber;
+#endif
 			if (col <= InvalidAttrNumber)		/* shouldn't happen */
 				elog(ERROR, "system-column update is not supported");
 
@@ -2937,3 +2957,4 @@ redisEndForeignModify(EState *estate,
 			redisFree(fmstate->context);
 	}
 }
+

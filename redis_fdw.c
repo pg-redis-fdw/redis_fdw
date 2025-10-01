@@ -1,9 +1,8 @@
-
 /*-------------------------------------------------------------------------
  *
  *		  foreign-data wrapper for Redis
  *
- * Copyright (c) 2011,2013 PostgreSQL Global Development Group
+ * Copyright (c) 2011 - 2025, PostgreSQL Global Development Group
  *
  * This software is released under the PostgreSQL Licence
  *
@@ -20,18 +19,17 @@
 /* #define DEBUG */
 
 #include "postgres.h"
+#include <hiredis/hiredis.h>
 
 /* check that we are compiling for the right postgres version */
-#if PG_VERSION_NUM < 190000
-#error wrong Postgresql version this branch is only for 19.
+#if PG_VERSION_NUM < 140000
+#error Selected Postgresql version is very old for this branch, try to use some older branch.
 #endif
-
 
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <hiredis/hiredis.h>
 
 #include "funcapi.h"
 #include "access/reloptions.h"
@@ -42,8 +40,12 @@
 #include "catalog/pg_user_mapping.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#if PG_VERSION_NUM >= 180000
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
+#else
+#include "commands/explain.h"
+#endif
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -52,7 +54,9 @@
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "optimizer/appendinfo.h"
+#if PG_VERSION_NUM >= 160000
 #include "optimizer/inherit.h"
+#endif
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
@@ -65,6 +69,13 @@
 #include "utils/rel.h"
 
 PG_MODULE_MAGIC;
+
+/*
+ * Code version is updated at new release.
+ * The last two digits are the minor version, whilst the leading digits should
+ * match the SQL API major version, e.g. 2 for 2.x.
+ */
+#define REDIS_FDW_CODE_VERSION  201
 
 #define PROCID_TEXTEQ 67
 
@@ -83,7 +94,6 @@ struct RedisFdwOption
  */
 static struct RedisFdwOption valid_options[] =
 {
-
 	/* Connection options */
 	{"address", ForeignServerRelationId},
 	{"port", ForeignServerRelationId},
@@ -184,9 +194,13 @@ typedef struct RedisFdwModifyState
  */
 extern Datum redis_fdw_handler(PG_FUNCTION_ARGS);
 extern Datum redis_fdw_validator(PG_FUNCTION_ARGS);
+extern Datum redis_fdw_version(PG_FUNCTION_ARGS);
+extern Datum redis_fdw_hiredis_version(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(redis_fdw_handler);
 PG_FUNCTION_INFO_V1(redis_fdw_validator);
+PG_FUNCTION_INFO_V1(redis_fdw_version);
+PG_FUNCTION_INFO_V1(redis_fdw_hiredis_version);
 
 /*
  * FDW callback routines
@@ -229,16 +243,20 @@ static TupleTableSlot *redisExecForeignInsert(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
 					   TupleTableSlot *planSlot);
+
 static void redisEndForeignModify(EState *estate,
-					  ResultRelInfo *rinfo);
+								  ResultRelInfo *rinfo);
+
 static void redisAddForeignUpdateTargets(PlannerInfo *root,
 										 Index rtindex,
 										 RangeTblEntry *target_rte,
 										 Relation target_relation);
+
 static TupleTableSlot *redisExecForeignDelete(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
 					   TupleTableSlot *planSlot);
+
 static TupleTableSlot *redisExecForeignUpdate(EState *estate,
 					   ResultRelInfo *rinfo,
 					   TupleTableSlot *slot,
@@ -802,15 +820,18 @@ redisGetForeignPaths(PlannerInfo *root,
 			 create_foreignscan_path(root, baserel,
 									 NULL,      /* default pathtarget */
 									 baserel->rows,
+#if PG_VERSION_NUM >= 180000
 									 0,         /* no disabled nodes */
+#endif
 									 startup_cost,
 									 total_cost,
 									 NIL,		/* no pathkeys */
 									 NULL,		/* no outer rel either */
 									 NULL,      /* no extra plan */
+#if PG_VERSION_NUM >= 170000
 									 NIL,       /* no fdw_restrictinfo list */
+#endif
 									 NIL));		/* no fdw_private data */
-
 }
 
 /*
@@ -1626,22 +1647,20 @@ redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *push
 
 		if (IsA(right, Const))
 		{
-			StringInfoData buf;
+			if (((Const *) right)->consttype == TEXTOID) {
+				/* And get the column and value... */
+				*key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
+				*value = TextDatumGetCString(((Const *) right)->constvalue);
 
-			initStringInfo(&buf);
+				/*
+				 * We can push down this qual if: - The operatory is TEXTEQ - The
+				 * qual is on the key column
+				 */
+				if (op->opfuncid == PROCID_TEXTEQ && strcmp(*key, "key") == 0)
+					*pushdown = true;
 
-			/* And get the column and value... */
-			*key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
-			*value = TextDatumGetCString(((Const *) right)->constvalue);
-
-			/*
-			 * We can push down this qual if: - The operatory is TEXTEQ - The
-			 * qual is on the key column
-			 */
-			if (op->opfuncid == PROCID_TEXTEQ && strcmp(*key, "key") == 0)
-				*pushdown = true;
-
-			return;
+				return;
+			}
 		}
 	}
 	return;
@@ -1739,7 +1758,6 @@ redisAddForeignUpdateTargets(PlannerInfo *root,
 				  attr->atttypmod,
 				  InvalidOid,
 				  0);
-
 	/* register it as a row-identity column needed by this target rel */
 	add_row_identity_var(root, var, rtindex, REDISMODKEYNAME);
 }
@@ -1800,16 +1818,27 @@ redisPlanForeignModify(PlannerInfo *root,
 	}
 	else if (operation == CMD_UPDATE)
 	{
-
+#if PG_VERSION_NUM >= 160000
 		/* code borrowed from mysql fdw */
-
 		RelOptInfo *rrel = find_base_rel(root, resultRelation);
 		Bitmapset  *tmpset = get_rel_all_updated_cols(root, rrel);
 		int	colidx = -1;
-
+#else
+		/* modifiedCols in pg < 9.5 */
+		Bitmapset  *tmpset = bms_copy(rte->updatedCols);
+		AttrNumber	col;
+#endif
+#if PG_VERSION_NUM >= 160000
 		while ((colidx = bms_next_member(tmpset, colidx)) >= 0)
+#else
+		while ((col = bms_first_member(tmpset)) >= 0)
+#endif
 		{
+#if PG_VERSION_NUM >= 160000
 			AttrNumber col = colidx + FirstLowInvalidHeapAttributeNumber;
+#else
+			col += FirstLowInvalidHeapAttributeNumber;
+#endif
 			if (col <= InvalidAttrNumber)		/* shouldn't happen */
 				elog(ERROR, "system-column update is not supported");
 
@@ -2938,4 +2967,24 @@ redisEndForeignModify(EState *estate,
 		if (fmstate->context)
 			redisFree(fmstate->context);
 	}
+}
+
+/*
+ * redis_fdw_version
+ *		Gets source code version of this FDW
+ */
+Datum
+redis_fdw_version(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(REDIS_FDW_CODE_VERSION);
+}
+
+/*
+ * redis_fdw_hiredis_version
+ *		Gets used hiredis source code version
+ */
+Datum
+redis_fdw_hiredis_version(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT32(HIREDIS_MAJOR * 10000 + HIREDIS_MINOR * 100 + HIREDIS_PATCH);
 }

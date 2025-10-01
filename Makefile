@@ -2,7 +2,7 @@
 #
 #                foreign-data wrapper for Redis
 #
-# Copyright (c) 2011,2013 PostgreSQL Global Development Group
+# Copyright (c) 2011 - 2025, PostgreSQL Global Development Group
 #
 # This software is released under the PostgreSQL Licence
 #
@@ -18,7 +18,7 @@ MODULE_big = redis_fdw
 OBJS = redis_fdw.o
 
 EXTENSION = redis_fdw
-DATA = redis_fdw--1.0.sql # here can be additional future file # redis_fdw--1.0--1.1.sql
+DATA = redis_fdw--1.0.sql redis_fdw--2.0.sql redis_fdw--1.0--2.0.sql
 
 ifdef ENABLE_GIS
 override PG_CFLAGS += -DREDIS_FDW_GIS_ENABLE

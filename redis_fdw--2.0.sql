@@ -9,7 +9,7 @@
  * Author: Dave Page <dpage@pgadmin.org>
  *
  * IDENTIFICATION
- *                redis_fdw/redis_fdw--1.0.sql
+ *                redis_fdw/redis_fdw--2.0.sql
  *
  *-------------------------------------------------------------------------
  */
@@ -29,3 +29,19 @@ LANGUAGE C STRICT;
 CREATE FOREIGN DATA WRAPPER redis_fdw
   HANDLER redis_fdw_handler
   VALIDATOR redis_fdw_validator;
+
+CREATE OR REPLACE FUNCTION redis_fdw_version()
+RETURNS int
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
+COMMENT ON FUNCTION redis_fdw_version()
+IS 'Returns Redis FDW code version';
+
+CREATE OR REPLACE FUNCTION redis_fdw_hiredis_version()
+RETURNS int
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
+COMMENT ON FUNCTION redis_fdw_hiredis_version()
+IS 'Returns hiredis library code version';

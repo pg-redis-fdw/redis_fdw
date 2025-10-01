@@ -2,7 +2,7 @@
  *
  *		  foreign-data wrapper for Redis
  *
- * Copyright (c) 2011-2025 The redis-fdw Development Team
+ * Copyright (c) 2011 - 2025, PostgreSQL Global Development Group
  *
  * This software is released under the PostgreSQL Licence
  *
@@ -72,9 +72,10 @@ PG_MODULE_MAGIC;
 
 /*
  * Code version is updated at new release.
- * 		Older branches are equal to minor
+ * The last two digits are the minor version, whilst the leading digits should
+ * match the SQL API major version, e.g. 2 for 2.x.
  */
-#define REDIS_FDW_CODE_VERSION  1901
+#define REDIS_FDW_CODE_VERSION  201
 
 #define PROCID_TEXTEQ 67
 

@@ -137,6 +137,7 @@ command:
 - **tablekeyprefix** as *string*, optional, no default
 
   Only get items whose names start with the prefix.
+  In a Redis database with  many keys, searching even using `tablekeyprefix` might still be expensive. In that case, you can keep a list of specific keys in a separate set and define it using `tablekeyset`. This way the global keyspace isn't searched at all.
 
 - **tablekeyset** as *string*, optional, no default
 
@@ -402,5 +403,10 @@ Useful links
 
 License and authors
 -------
+© 2011-2025 The redis-fdw Development Team
+
 * Dave Page dpage@pgadmin.org
 * Andrew Dunstan andrew@dunslane.net
+
+Redis FDW is licensed under PostgreSQL license, see the [`License`](License) file for full details.
+Provided license based on https://opensource.org/license/postgresql

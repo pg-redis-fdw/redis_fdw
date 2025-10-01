@@ -24,12 +24,14 @@ done
 
 mkdir -p ./workdir
 cd ./workdir
-adr="https://ftp.postgresql.org/pub/source/v${POSTGRESQL_VERSION}/postgresql-${POSTGRESQL_VERSION}.tar.bz2";
-echo "PG version URL:
-   $adr"
-curl -O "$adr"
-tar xjf postgresql-${POSTGRESQL_VERSION}.tar.bz2
-cd postgresql-${POSTGRESQL_VERSION}
+#adr="https://ftp.postgresql.org/pub/source/v${POSTGRESQL_VERSION}/postgresql-${POSTGRESQL_VERSION}.tar.bz2";
+#echo "PG version URL:
+#   $adr"
+#curl -O "$adr"
+#tar xjf postgresql-${POSTGRESQL_VERSION}.tar.bz2
+#cd postgresql-${POSTGRESQL_VERSION}
+git clone https://git.postgresql.org/git/postgresql.git -b "REL_${POSTGRESQL_VERSION}";
+cd "REL_${POSTGRESQL_VERSION}/postgresql";
 
 if [ -z "$CONFIGURE_OPTIONS" ]; then
   ./configure

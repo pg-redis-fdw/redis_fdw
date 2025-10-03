@@ -53,7 +53,7 @@ jobs:
         export PGETC=/etc/postgresql/$PGVER/main
         export PGBIN=/usr/lib/postgresql/$PGVER/bin
         sudo chmod -R 755 /home/`whoami`
-        sudo cp ./ci/pg_hba.conf $PGETC/pg_hba.conf
+        sudo cp ./GitHubActions/pg_hba.conf $PGETC/pg_hba.conf
         sudo systemctl stop postgresql
         sudo pg_ctlcluster $PGVER main start
         sudo pg_lsclusters    

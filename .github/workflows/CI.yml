@@ -1,86 +1,68 @@
-name: Redis FDW test
+name: Compilable against Ubuntu packages test instead of full C complex CI
 
-on:
-  workflow_dispatch:
-  pull_request:  
-  push:
-    branches:
-      - master
-      - main
+on: [push, pull_request]
+
 jobs:
-  detect-pgversion:
-    runs-on: ubuntu-22.04
-    outputs:
-      pgversion: ${{ steps.detect-pgversion.outputs.targets }}
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: detect-pgversion
-        id: detect-pgversion
-        run: |
-          targets=`bash GitHubActions/detect_targets.sh`
-          echo "targets=$targets" >> $GITHUB_OUTPUT
+  linux:
 
-  test:
-    needs: detect-pgversion
-    env:
-      POSTGIS_VERSION : "3.4.2"
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
-      HIREDIS_FOR_TESTING_DIR: "/opt/hiredis_testing"
+    runs-on: ubuntu-latest
+
+    name: "CI"
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
-        pg: ${{ fromJSON(needs.detect-pgversion.outputs.pgversion) }}
-        config: ["default", "postgis"]
-        
-    name: Test on PostgreSQL ${{ matrix.pg }}, ${{ matrix.config }} mode
-    runs-on: ubuntu-22.04
+        ci:
+        - { PGVER: 13 }
+        - { PGVER: 14 }
+        - { PGVER: 15 }
+        - { PGVER: 16 }
+        - { PGVER: 17 }
+        - { PGVER: 18 }
+
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: tar
-        run: tar zcvf redis_fdw.tar.gz ./*
 
-      - name: set_proxy
-        run: bash GitHubActions/env.sh
+    - name: 'Check Out'
+      uses: actions/checkout@v4
 
-      - name: download PostGIS, ${{ matrix.config }} mode
-        run: |
-          if [[ "${{ matrix.config }}" == "postgis" ]]; then
-            bash GitHubActions/download_postgis.sh ${{ env.POSTGIS_VERSION }}
-          fi
+    - name: 'Raise Priority for apt.postgresql.org'
+      run: |
+        cat << EOF >> ./pgdg.pref
+        Package: *
+        Pin: release o=apt.postgresql.org
+        Pin-Priority: 600
+        EOF
+        sudo mv ./pgdg.pref /etc/apt/preferences.d/
+        sudo apt update
 
-      - name: install locales
-        run: bash GitHubActions/install_locales.sh
+    - name: 'Install PostgreSQL'
+      run: |
+        sudo apt-get purge postgresql-*
+        sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg-snapshot main ${{ matrix.ci.PGVER }}" > /etc/apt/sources.list.d/pgdg.list'
+        curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg >/dev/null
+        sudo apt-get update
+        sudo apt-get -y install postgresql-${{ matrix.ci.PGVER }} postgresql-server-dev-${{ matrix.ci.PGVER }} postgresql-client-${{ matrix.ci.PGVER }}
 
-      - name: build PostgreSQL ${{ matrix.pg }}
-        run: bash GitHubActions/build_postgres.sh ${{ matrix.pg }}
+    - name: 'Install Redis + Hiredis'
+      run: |
+        sudo apt-get -y install libhiredis-dev redis-server
 
-      - name: install Redis, ${{ matrix.config }} mode
-        run: bash GitHubActions/install_redis.sh ${{ matrix.config }} ${{ env.HIREDIS_FOR_TESTING_DIR }}
+    - name: 'Start PostgreSQL'
+      run: |
+        export PGVER=${{ matrix.ci.PGVER }}
+        export PGDATA=/var/lib/postgresql/$PGVER/main
+        export PGETC=/etc/postgresql/$PGVER/main
+        export PGBIN=/usr/lib/postgresql/$PGVER/bin
+        sudo chmod -R 755 /home/`whoami`
+        sudo cp ./ci/pg_hba.conf $PGETC/pg_hba.conf
+        sudo systemctl stop postgresql
+        sudo pg_ctlcluster $PGVER main start
+        sudo pg_lsclusters    
 
-      - name: build PostGIS ${{ env.POSTGIS_VERSION }} for PostgreSQL ${{ matrix.pg }}, ${{ matrix.config }} mode
-        run: |
-          if [[ "${{ matrix.config }}" == "postgis" ]]; then
-            bash GitHubActions/build_postgis.sh ${{ matrix.pg }} ${{ env.POSTGIS_VERSION }}
-          fi
-
-      - name: build redis_fdw, ${{ matrix.config }} mode
-        run: |
-          bash GitHubActions/build_redis_fdw.sh ${{ matrix.pg }} ${{ matrix.config }} ${{ env.HIREDIS_FOR_TESTING_DIR }}
-
-      - name: execute redis_fdw test
-        run: bash GitHubActions/execute_test.sh ${{ matrix.pg }} ${{ matrix.config }} ${{ env.HIREDIS_FOR_TESTING_DIR }}
-
-      - name: download output files (regression.diffs)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.pg }}-${{ matrix.config }}-test-results
-          path: |
-            workdir/postgresql-${{ matrix.pg }}/contrib/redis_fdw/test/regression.diffs
-            workdir/postgresql-${{ matrix.pg }}/contrib/redis_fdw/test/regression.out
-            workdir/postgresql-${{ matrix.pg }}/contrib/redis_fdw/test/results
-          retention-days: 7
-
+    - name: 'Build & Test'
+      run: |
+        export PATH=/usr/lib/postgresql/${{ matrix.ci.PGVER }}/bin/:$PATH
+        export PG_CONFIG=/usr/lib/postgresql/${{ matrix.ci.PGVER }}/bin/pg_config
+        export PG_CFLAGS=-Werror
+        make
+        sudo -E make PG_CONFIG=$PG_CONFIG install
+        PGUSER=postgres make installcheck || (cat regression.diffs && /bin/false)

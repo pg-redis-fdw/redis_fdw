@@ -11,12 +11,8 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        ci:
-        - { PGVER: 14 }
-        - { PGVER: 15 }
-        - { PGVER: 16 }
-        - { PGVER: 17 }
-        - { PGVER: 18 }
+        pg: ["14", "15", "16", "17", "18"]
+        config: ["default", "postgis"]
 
     steps:
 
@@ -36,10 +32,11 @@ jobs:
     - name: 'Install PostgreSQL'
       run: |
         sudo apt-get purge postgresql-*
-        sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg-snapshot main ${{ matrix.ci.PGVER }}" > /etc/apt/sources.list.d/pgdg.list'
+        sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg-snapshot main ${{ matrix.pg }}" > /etc/apt/sources.list.d/pgdg.list'
         curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg >/dev/null
         sudo apt-get update
-        sudo apt-get -y install postgresql-${{ matrix.ci.PGVER }} postgresql-server-dev-${{ matrix.ci.PGVER }} postgresql-client-${{ matrix.ci.PGVER }}
+        sudo apt-get -y install postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} postgresql-client-${{ matrix.pg }}
+        [ "${{ matrix.config }}" == "postgis" ] && sudo apt-get -y install postgresql-${{ matrix.pg }}-postgis-3
 
     - name: 'Install Redis + Hiredis'
       run: |
@@ -47,7 +44,7 @@ jobs:
 
     - name: 'Start PostgreSQL'
       run: |
-        export PGVER=${{ matrix.ci.PGVER }}
+        export PGVER=${{ matrix.pg }}
         export PGDATA=/var/lib/postgresql/$PGVER/main
         export PGETC=/etc/postgresql/$PGVER/main
         export PGBIN=/usr/lib/postgresql/$PGVER/bin
@@ -59,9 +56,10 @@ jobs:
 
     - name: 'Build & Test'
       run: |
-        export PATH=/usr/lib/postgresql/${{ matrix.ci.PGVER }}/bin/:$PATH
-        export PG_CONFIG=/usr/lib/postgresql/${{ matrix.ci.PGVER }}/bin/pg_config
+        export PATH=/usr/lib/postgresql/${{ matrix.pg }}/bin/:$PATH
+        export PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
         export PG_CFLAGS=-Werror
+        [ "${{ matrix.config }}" == "postgis" ] && export ENABLE_GIS=1
         make
         sudo -E make PG_CONFIG=$PG_CONFIG install
         PGUSER=postgres make installcheck || (cat regression.diffs && /bin/false)

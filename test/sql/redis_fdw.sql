@@ -1,15 +1,21 @@
+-- Testcase 001:
+CREATE EXTENSION hstore;
+-- Testcase 002:
+CREATE EXTENSION redis_fdw;
 
+-- Testcase 003:
+select redis_fdw_version();
+-- Testcase 004:
+select redis_fdw_hiredis_version();
+
+-- Testcase 005:
 CREATE OR REPLACE FUNCTION atsort( a text[])
  RETURNS text[]
  LANGUAGE sql
  IMMUTABLE  STRICT
 AS $function$
   select array(select unnest($1) order by 1)
-$function$
-
-;
-
-
+$function$;
 
 create server localredis foreign data wrapper redis_fdw;
 
@@ -61,7 +67,7 @@ $$;
 
 -- ok, empty, so now run the setup script
 
-\! redis-cli < test/sql/redis_setup
+\! redis-cli < test/redis_setup
 
 select * from db15 order by key;
 
@@ -231,7 +237,7 @@ select * from db15_1key_zset_scores order by score desc;
 
 -- first clean the database again
 
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 
 -- singleton scalar table
 
@@ -841,7 +847,7 @@ select * from db15_w_hash_kset;
 
 -- now clean up for the cursor tests
 
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 
 -- cursor tests
 
@@ -891,5 +897,7 @@ select count(*) from db15bigkeysetscalar;
 
 -- all done, so now blow everything in the db away again
 
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 
+DROP EXTENSION redis_fdw CASCADE;
+DROP EXTENSION hstore;

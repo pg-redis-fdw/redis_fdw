@@ -123,6 +123,17 @@ typedef enum
 	PG_REDIS_ZSET_TABLE
 } redis_table_type;
 
+/*
+ * Column type categories for efficient data extraction.
+ * REDIS_VAL_TEXT can use VARDATA_ANY directly.
+ * REDIS_VAL_OTHER requires OutputFunctionCall conversion.
+ */
+typedef enum
+{
+	REDIS_VAL_OTHER = 0,		/* use OutputFunctionCall */
+	REDIS_VAL_TEXT				/* text/varchar - use VARDATA_ANY */
+} redis_val_type;
+
 typedef struct redisTableOptions
 {
 	char	   *address;
@@ -158,6 +169,7 @@ typedef struct RedisFdwExecutionState
 	char	   *password;
 	int			database;
 	char	   *keyprefix;
+	size_t		keyprefix_len;
 	char	   *keyset;
 	char	   *qual_value;
 	char	   *singleton_key;
@@ -175,9 +187,11 @@ typedef struct RedisFdwModifyState
 	char	   *password;
 	int			database;
 	char	   *keyprefix;
+	size_t		keyprefix_len;
 	char	   *keyset;
 	char	   *qual_value;
 	char	   *singleton_key;
+	size_t		singleton_key_len;
 	Relation	rel;
 	redis_table_type table_type;
 	List	   *target_attrs;
@@ -186,6 +200,7 @@ typedef struct RedisFdwModifyState
 	int			keyAttno;
 	Oid			array_elem_type;
 	FmgrInfo   *p_flinfo;
+	redis_val_type *val_types;	/* column value type categories */
 } RedisFdwModifyState;
 
 /* initial cursor */
@@ -318,6 +333,9 @@ static redisReply *redis_command2_impl(redisContext *context,
 	redis_command1_impl(ctx, cmd, sizeof(cmd) - 1, arg1, arg1_len)
 #define redis_command2(ctx, cmd, arg1, arg1_len, arg2, arg2_len) \
 	redis_command2_impl(ctx, cmd, sizeof(cmd) - 1, arg1, arg1_len, arg2, arg2_len)
+static inline redis_val_type classify_type(Oid typid);
+static void get_datum_as_string(Datum datum, redis_val_type valtype,
+						FmgrInfo *flinfo, const char **data, size_t *len);
 
 /* Connection cache functions */
 static void redis_conn_cache_init(void);
@@ -1353,6 +1371,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->address = table_options.address;
 	festate->port = table_options.port;
 	festate->keyprefix = table_options.keyprefix;
+	festate->keyprefix_len = table_options.keyprefix ? strlen(table_options.keyprefix) : 0;
 	festate->keyset = table_options.keyset;
 	festate->singleton_key = table_options.singleton_key;
 	festate->table_type = table_options.table_type;
@@ -1453,7 +1472,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		else if (festate->keyprefix)
 		{
 			if (strncmp(qual_value, festate->keyprefix,
-						strlen(festate->keyprefix)) != 0)
+						festate->keyprefix_len) != 0)
 				festate->row = -1;
 		}
 
@@ -2210,14 +2229,17 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	fmstate->address = table_options.address;
 	fmstate->port = table_options.port;
 	fmstate->keyprefix = table_options.keyprefix;
+	fmstate->keyprefix_len = table_options.keyprefix ? strlen(table_options.keyprefix) : 0;
 	fmstate->keyset = table_options.keyset;
 	fmstate->singleton_key = table_options.singleton_key;
+	fmstate->singleton_key_len = table_options.singleton_key ? strlen(table_options.singleton_key) : 0;
 	fmstate->table_type = table_options.table_type;
 	fmstate->target_attrs = (List *) list_nth(fdw_private, 0);
 
 	n_attrs = list_length(fmstate->target_attrs);
 	fmstate->p_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * (n_attrs + 1));
 	fmstate->targetDims = (int *) palloc0(sizeof(int) * (n_attrs + 1));
+	fmstate->val_types = (redis_val_type *) palloc0(sizeof(redis_val_type) * (n_attrs + 1));
 
 	array_elem_list = (List *) list_nth(fdw_private, 1);
 	fmstate->array_elem_type = list_nth_oid(array_elem_list, 0);
@@ -2231,6 +2253,8 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 
 		fmstate->keyAttno = ExecFindJunkAttributeInTlist(subplan->targetlist,
 														 REDISMODKEYNAME);
+
+		fmstate->val_types[0] = classify_type(attr->atttypid);
 
 		getTypeOutputInfo(attr->atttypid, &typefnoid, &isvarlena);
 		fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
@@ -2262,6 +2286,8 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 				  errmsg("value update not supported for this type of table")
 						 ));
 			}
+
+			fmstate->val_types[fmstate->p_nums] = classify_type(attr->atttypid);
 
 			/*
 			 * If the item is an array, store the output details for its
@@ -2457,6 +2483,60 @@ redis_command2_impl(redisContext *context,
 	return redisCommandArgv(context, 3, argv, argvlen);
 }
 
+/*
+ * classify_type
+ *		Determine how to extract string data from a datum of the given type.
+ *
+ *		NAMEOID is deliberately not bucketed here: "name" is a fixed
+ *		64-byte NUL-padded C string, not a varlena, so it must go through
+ *		OutputFunctionCall() like any other non-text type rather than being
+ *		treated as VARDATA_ANY/VARSIZE_ANY_EXHDR-compatible.
+ */
+static inline redis_val_type
+classify_type(Oid typid)
+{
+	switch (typid)
+	{
+		case TEXTOID:
+		case VARCHAROID:
+		case BPCHAROID:
+			return REDIS_VAL_TEXT;
+		default:
+			return REDIS_VAL_OTHER;
+	}
+}
+
+/*
+ * get_datum_as_string
+ *		Extract string data and length from a datum based on its type category.
+ *		For text-like types, extracts varlena data directly.
+ *		For other types, uses OutputFunctionCall (caller must ensure result is pfree'd).
+ */
+static void
+get_datum_as_string(Datum datum, redis_val_type valtype,
+					FmgrInfo *flinfo, const char **data, size_t *len)
+{
+	switch (valtype)
+	{
+		case REDIS_VAL_TEXT:
+			{
+				text	   *t = DatumGetTextPP(datum);
+
+				*data = VARDATA_ANY(t);
+				*len = VARSIZE_ANY_EXHDR(t);
+			}
+			break;
+		case REDIS_VAL_OTHER:
+		default:
+			{
+				char	   *str = OutputFunctionCall(flinfo, datum);
+
+				*data = str;
+				*len = strlen(str);
+			}
+			break;
+	}
+}
 
 /*
  * redisExecForeignInsert
@@ -2474,24 +2554,21 @@ redisExecForeignInsert(EState *estate,
 	redisReply *sreply = NULL;
 	bool		isnull;
 	Datum		key;
-	char	   *keyval;
-	char	   *extraval = "";	/* hash value or zset priority */
+	const char *key_data;
+	size_t		key_len;
+	char	   *keyval = NULL;	/* for error messages only */
 
 #ifdef DEBUG
 	elog(NOTICE, "redisExecForeignInsert");
 #endif
 
 	key = slot_getattr(slot, 1, &isnull);
-	keyval = OutputFunctionCall(&fmstate->p_flinfo[0], key);
+	get_datum_as_string(key, fmstate->val_types[0],
+						&fmstate->p_flinfo[0], &key_data, &key_len);
 
 	if (fmstate->singleton_key)
 	{
-		char	   *rkeyval;
-
-		if (fmstate->table_type == PG_REDIS_SCALAR_TABLE)
-			rkeyval = fmstate->singleton_key;
-		else
-			rkeyval = keyval;
+		Datum		extra = 0;
 
 		/*
 		 * Check if key is there using EXISTS / HEXISTS / SISMEMBER / ZRANK.
@@ -2507,18 +2584,18 @@ redisExecForeignInsert(EState *estate,
 				break;
 			case PG_REDIS_HASH_TABLE:
 				sreply = redis_command(context, "HEXISTS",		/* 1 or 0 */
-									   fmstate->singleton_key, strlen(fmstate->singleton_key),
-									   NULL, 0, keyval, strlen(keyval));
+									   fmstate->singleton_key, fmstate->singleton_key_len,
+									   NULL, 0, key_data, key_len);
 				break;
 			case PG_REDIS_SET_TABLE:
 				sreply = redis_command(context, "SISMEMBER",	/* 1 or 0 */
-									   fmstate->singleton_key, strlen(fmstate->singleton_key),
-									   NULL, 0, keyval, strlen(keyval));
+									   fmstate->singleton_key, fmstate->singleton_key_len,
+									   NULL, 0, key_data, key_len);
 				break;
 			case PG_REDIS_ZSET_TABLE:
 				sreply = redis_command(context, "ZRANK",		/* n or nil */
-									   fmstate->singleton_key, strlen(fmstate->singleton_key),
-									   NULL, 0, keyval, strlen(keyval));
+									   fmstate->singleton_key, fmstate->singleton_key_len,
+									   NULL, 0, key_data, key_len);
 				break;
 			case PG_REDIS_LIST_TABLE:
 			default:
@@ -2542,9 +2619,14 @@ redisExecForeignInsert(EState *estate,
 
 			if (!ok)
 			{
+				/* Get keyval only for error message */
+				if (fmstate->table_type == PG_REDIS_SCALAR_TABLE)
+					keyval = fmstate->singleton_key;
+				else
+					keyval = OutputFunctionCall(&fmstate->p_flinfo[0], key);
 				ereport(ERROR,
 						(errcode(ERRCODE_UNIQUE_VIOLATION),
-						 errmsg("key already exists: %s", rkeyval)));
+						 errmsg("key already exists: %s", keyval)));
 			}
 		}
 
@@ -2555,42 +2637,50 @@ redisExecForeignInsert(EState *estate,
 		if (fmstate->table_type == PG_REDIS_ZSET_TABLE ||
 			fmstate->table_type == PG_REDIS_HASH_TABLE)
 		{
-			Datum		extra;
-
 			extra = slot_getattr(slot, 2, &isnull);
-			extraval = OutputFunctionCall(&fmstate->p_flinfo[1], extra);
 		}
 
 		switch (fmstate->table_type)
 		{
 			case PG_REDIS_SCALAR_TABLE:
 				sreply = redis_command(context, "SET",
-									   fmstate->singleton_key, strlen(fmstate->singleton_key),
-									   NULL, 0, keyval, strlen(keyval));
+									   fmstate->singleton_key, fmstate->singleton_key_len,
+									   NULL, 0, key_data, key_len);
 				break;
 			case PG_REDIS_SET_TABLE:
 				sreply = redis_command(context, "SADD",
-									   fmstate->singleton_key, strlen(fmstate->singleton_key),
-									   NULL, 0, keyval, strlen(keyval));
+									   fmstate->singleton_key, fmstate->singleton_key_len,
+									   NULL, 0, key_data, key_len);
 				break;
 			case PG_REDIS_LIST_TABLE:
 				sreply = redis_command(context, "RPUSH",
-									   fmstate->singleton_key, strlen(fmstate->singleton_key),
-									   NULL, 0, keyval, strlen(keyval));
+									   fmstate->singleton_key, fmstate->singleton_key_len,
+									   NULL, 0, key_data, key_len);
 				break;
 			case PG_REDIS_HASH_TABLE:
-				sreply = redis_command(context, "HSET",
-									   fmstate->singleton_key, strlen(fmstate->singleton_key),
-									   keyval, strlen(keyval), extraval, strlen(extraval));
+				{
+					const char *val_data;
+					size_t		val_len;
+
+					get_datum_as_string(extra, fmstate->val_types[1],
+										&fmstate->p_flinfo[1], &val_data, &val_len);
+					sreply = redis_command(context, "HSET",
+										   fmstate->singleton_key, fmstate->singleton_key_len,
+										   key_data, key_len, val_data, val_len);
+				}
 				break;
 			case PG_REDIS_ZSET_TABLE:
-				/*
-				 * score comes BEFORE value in ZADD, which seems slightly
-				 * perverse
-				 */
-				sreply = redis_command(context, "ZADD",
-									   fmstate->singleton_key, strlen(fmstate->singleton_key),
-									   extraval, strlen(extraval), keyval, strlen(keyval));
+				{
+					const char *extra_data;
+					size_t		extra_len;
+
+					/* score comes BEFORE value in ZADD */
+					get_datum_as_string(extra, fmstate->val_types[1],
+										&fmstate->p_flinfo[1], &extra_data, &extra_len);
+					sreply = redis_command(context, "ZADD",
+										   fmstate->singleton_key, fmstate->singleton_key_len,
+										   extra_data, extra_len, key_data, key_len);
+				}
 				break;
 			default:
 				ereport(ERROR,
@@ -2599,6 +2689,8 @@ redisExecForeignInsert(EState *estate,
 						 ));
 		}
 
+		/* Get keyval for error message only if needed */
+		keyval = OutputFunctionCall(&fmstate->p_flinfo[0], key);
 		check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"cannot insert value for key %s", keyval);
 		freeReplyObject(sreply);
@@ -2612,8 +2704,12 @@ redisExecForeignInsert(EState *estate,
 		int16		typlen;
 		bool		typbyval;
 		char		typalign;
+		redis_val_type elem_valtype;
 		bool		is_array = fmstate->array_elem_type != InvalidOid;
 		Datum		value = slot_getattr(slot, 2, &isnull);
+
+		/* For non-singleton, get keyval for prefix checks and error messages */
+		keyval = OutputFunctionCall(&fmstate->p_flinfo[0], key);
 
 		if (isnull)
 			ereport(ERROR,
@@ -2634,8 +2730,8 @@ redisExecForeignInsert(EState *estate,
 
 		/* make sure the key has the right prefix, if any */
 		if (fmstate->keyprefix &&
-			strncmp(keyval, fmstate->keyprefix,
-					strlen(fmstate->keyprefix)) != 0)
+			strncmp(key_data, fmstate->keyprefix,
+					fmstate->keyprefix_len) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("key '%s' does not match table key prefix '%s'",
@@ -2644,8 +2740,8 @@ redisExecForeignInsert(EState *estate,
 
 		/* Check if key is there using EXISTS  */
 		{
-			const char *argv[2] = {"EXISTS", keyval};
-			size_t		argvlen[2] = {6, strlen(keyval)};
+			const char *argv[2] = {"EXISTS", key_data};
+			size_t		argvlen[2] = {6, key_len};
 
 			sreply = redisCommandArgv(context, 2, argv, argvlen);
 		}
@@ -2666,8 +2762,7 @@ redisExecForeignInsert(EState *estate,
 
 		if (fmstate->table_type == PG_REDIS_SCALAR_TABLE)
 		{
-			/* everything else will be an array */
-			valueval = OutputFunctionCall(&fmstate->p_flinfo[1], value);
+			/* valueval not needed - we use get_datum_as_string below */
 		}
 		else
 		{
@@ -2693,6 +2788,8 @@ redisExecForeignInsert(EState *estate,
 						 errmsg("cannot decompose odd number of items into a Redis hash")
 						 ));
 
+			elem_valtype = classify_type(fmstate->array_elem_type);
+
 			for (i = 0; i < nitems; i++)
 			{
 				if (nulls[i])
@@ -2706,13 +2803,20 @@ redisExecForeignInsert(EState *estate,
 		switch (fmstate->table_type)
 		{
 			case PG_REDIS_SCALAR_TABLE:
-				sreply = redis_command(context, "SET",
-									   keyval, strlen(keyval),
-									   NULL, 0, valueval, strlen(valueval));
-				check_reply(sreply, context,
-							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-							"could not add key %s", keyval);
-				freeReplyObject(sreply);
+				{
+					const char *data;
+					size_t		len;
+
+					get_datum_as_string(value, fmstate->val_types[1],
+										&fmstate->p_flinfo[1], &data, &len);
+					sreply = redis_command(context, "SET",
+										   key_data, key_len,
+										   NULL, 0, data, len);
+					check_reply(sreply, context,
+								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+								"could not add key %s", keyval);
+					freeReplyObject(sreply);
+				}
 				break;
 			case PG_REDIS_SET_TABLE:
 				{
@@ -2720,14 +2824,17 @@ redisExecForeignInsert(EState *estate,
 
 					for (i = 0; i < nitems; i++)
 					{
-						valueval = OutputFunctionCall(&fmstate->p_flinfo[1],
-													  elements[i]);
+						const char *data;
+						size_t		len;
+
+						get_datum_as_string(elements[i], elem_valtype,
+											&fmstate->p_flinfo[1], &data, &len);
 						sreply = redis_command(context, "SADD",
-											   keyval, strlen(keyval),
-											   NULL, 0, valueval, strlen(valueval));
+											   key_data, key_len,
+											   NULL, 0, data, len);
 						check_reply(sreply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add set member %s", valueval);
+									"could not add set member", NULL);
 						freeReplyObject(sreply);
 					}
 				}
@@ -2738,29 +2845,34 @@ redisExecForeignInsert(EState *estate,
 
 					for (i = 0; i < nitems; i++)
 					{
-						valueval = OutputFunctionCall(&fmstate->p_flinfo[1],
-													  elements[i]);
+						const char *data;
+						size_t		len;
+
+						get_datum_as_string(elements[i], elem_valtype,
+											&fmstate->p_flinfo[1], &data, &len);
 						sreply = redis_command(context, "RPUSH",
-											   keyval, strlen(keyval),
-											   NULL, 0, valueval, strlen(valueval));
+											   key_data, key_len,
+											   NULL, 0, data, len);
 						check_reply(sreply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add value %s", valueval);
+									"could not add value", NULL);
+						freeReplyObject(sreply);
 					}
 				}
 				break;
 			case PG_REDIS_HASH_TABLE:
 				{
 					int			i;
-					char	   *hk,
-							   *hv;
 
 					for (i = 0; i < nitems; i += 2)
 					{
-						hk = OutputFunctionCall(&fmstate->p_flinfo[1],
-												elements[i]);
-						hv = OutputFunctionCall(&fmstate->p_flinfo[1],
-												elements[i + 1]);
+						const char *hk_data, *hv_data;
+						size_t		hk_len, hv_len;
+
+						get_datum_as_string(elements[i], elem_valtype,
+											&fmstate->p_flinfo[1], &hk_data, &hk_len);
+						get_datum_as_string(elements[i + 1], elem_valtype,
+											&fmstate->p_flinfo[1], &hv_data, &hv_len);
 						/* HSET needs 4 args: key, field, value - use custom call */
 						{
 							const char *argv[4];
@@ -2768,17 +2880,17 @@ redisExecForeignInsert(EState *estate,
 
 							argv[0] = "HSET";
 							argvlen[0] = 4;
-							argv[1] = keyval;
-							argvlen[1] = strlen(keyval);
-							argv[2] = hk;
-							argvlen[2] = strlen(hk);
-							argv[3] = hv;
-							argvlen[3] = strlen(hv);
+							argv[1] = key_data;
+							argvlen[1] = key_len;
+							argv[2] = hk_data;
+							argvlen[2] = hk_len;
+							argv[3] = hv_data;
+							argvlen[3] = hv_len;
 							sreply = redisCommandArgv(context, 4, argv, argvlen);
 						}
 						check_reply(sreply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add key %s", hk);
+									"could not add hash field", NULL);
 						freeReplyObject(sreply);
 					}
 				}
@@ -2786,24 +2898,24 @@ redisExecForeignInsert(EState *estate,
 			case PG_REDIS_ZSET_TABLE:
 				{
 					int			i;
+					int			ibuff_len;
 					char		ibuff[100];
 
 					for (i = 0; i < nitems; i++)
 					{
-						valueval = OutputFunctionCall(&fmstate->p_flinfo[1],
-													  elements[i]);
-						sprintf(ibuff, "%d", i);
+						const char *data;
+						size_t		len;
 
-						/*
-						 * score comes BEFORE value in ZADD, which seems
-						 * slightly perverse
-						 */
+						ibuff_len = sprintf(ibuff, "%d", i);
+						/* score comes BEFORE value in ZADD */
+						get_datum_as_string(elements[i], elem_valtype,
+											&fmstate->p_flinfo[1], &data, &len);
 						sreply = redis_command(context, "ZADD",
-											   keyval, strlen(keyval),
-											   ibuff, strlen(ibuff), valueval, strlen(valueval));
+											   key_data, key_len,
+											   ibuff, ibuff_len, data, len);
 						check_reply(sreply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add key %s", valueval);
+									"could not add zset member", NULL);
 						freeReplyObject(sreply);
 					}
 				}
@@ -2847,7 +2959,9 @@ redisExecForeignDelete(EState *estate,
 	redisReply *reply = NULL;
 	bool		isNull;
 	Datum		datum;
-	char	   *keyval;
+	char	   *keyval = NULL;
+	const char *key_data;
+	size_t		key_len;
 
 #ifdef DEBUG
 	elog(NOTICE, "redisExecForeignDelete");
@@ -2858,9 +2972,12 @@ redisExecForeignDelete(EState *estate,
 								 fmstate->keyAttno,
 								 &isNull);
 
-	keyval = OutputFunctionCall(&fmstate->p_flinfo[0], datum);
+	/* Get key data for Redis command */
+	get_datum_as_string(datum, fmstate->val_types[0],
+						&fmstate->p_flinfo[0], &key_data, &key_len);
 
-	/* elog(NOTICE,"deleting keyval %s",keyval); */
+	/* Get text representation for error messages */
+	keyval = OutputFunctionCall(&fmstate->p_flinfo[0], datum);
 
 	if (fmstate->singleton_key)
 	{
@@ -2872,18 +2989,18 @@ redisExecForeignDelete(EState *estate,
 				break;
 			case PG_REDIS_SET_TABLE:
 				reply = redis_command(context, "SREM",
-									  fmstate->singleton_key, strlen(fmstate->singleton_key),
-									  NULL, 0, keyval, strlen(keyval));
+									  fmstate->singleton_key, fmstate->singleton_key_len,
+									  NULL, 0, key_data, key_len);
 				break;
 			case PG_REDIS_HASH_TABLE:
 				reply = redis_command(context, "HDEL",
-									  fmstate->singleton_key, strlen(fmstate->singleton_key),
-									  NULL, 0, keyval, strlen(keyval));
+									  fmstate->singleton_key, fmstate->singleton_key_len,
+									  NULL, 0, key_data, key_len);
 				break;
 			case PG_REDIS_ZSET_TABLE:
 				reply = redis_command(context, "ZREM",
-									  fmstate->singleton_key, strlen(fmstate->singleton_key),
-									  NULL, 0, keyval, strlen(keyval));
+									  fmstate->singleton_key, fmstate->singleton_key_len,
+									  NULL, 0, key_data, key_len);
 				break;
 			default:
 				/* Note: List table has already generated an error */
@@ -2935,14 +3052,21 @@ redisExecForeignUpdate(EState *estate,
 	redisContext *context = fmstate->context;
 	redisReply *ereply = NULL;
 	Datum		datum;
-	char	   *keyval;
-	char	   *newkey;
+	char	   *keyval;				/* for error messages */
+	const char *key_data;			/* old key data */
+	size_t		key_len;			/* old key length */
+	char	   *newkey;				/* for error messages */
+	const char *newkey_data;		/* new key data */
+	size_t		newkey_len;			/* new key length */
 	char	   *newval = NULL;
-	char	  **array_vals = NULL;
+	size_t		newval_len = 0;
 	bool		isNull;
 	ListCell   *lc = NULL;
 	int			flslot = 1;
 	int			nitems = 0;
+	/* For array updates */
+	Datum	   *array_elems = NULL;
+	redis_val_type array_elem_valtype = REDIS_VAL_OTHER;
 
 #ifdef DEBUG
 	elog(NOTICE, "redisExecForeignUpdate");
@@ -2953,9 +3077,14 @@ redisExecForeignUpdate(EState *estate,
 								 fmstate->keyAttno,
 								 &isNull);
 
+	/* Get key data and length */
+	get_datum_as_string(datum, fmstate->val_types[0],
+						&fmstate->p_flinfo[0], &key_data, &key_len);
 	keyval = OutputFunctionCall(&fmstate->p_flinfo[0], datum);
 
 	newkey = keyval;
+	newkey_data = key_data;
+	newkey_len = key_len;
 
 	Assert(keyval != NULL);
 
@@ -2972,6 +3101,8 @@ redisExecForeignUpdate(EState *estate,
 		if (attnum == 1)
 		{
 			newkey = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
+			newkey_len = strlen(newkey);
+			newkey_data = newkey;
 		}
 		else if (fmstate->singleton_key ||
 				 fmstate->table_type == PG_REDIS_SCALAR_TABLE)
@@ -2981,6 +3112,7 @@ redisExecForeignUpdate(EState *estate,
 			 * singleton zset priority.
 			 */
 			newval = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
+			newval_len = strlen(newval);
 		}
 		else
 		{
@@ -3015,7 +3147,9 @@ redisExecForeignUpdate(EState *estate,
 						 errmsg("cannot decompose odd number of items into a Redis hash")
 						 ));
 
-			array_vals = palloc(nitems * sizeof(char *));
+			/* Save elements for binary-safe commands */
+			array_elems = elements;
+			array_elem_valtype = classify_type(fmstate->array_elem_type);
 
 			for (i = 0; i < nitems; i++)
 			{
@@ -3024,9 +3158,6 @@ redisExecForeignUpdate(EState *estate,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot set NULL in a Redis table")
 							 ));
-
-				array_vals[i] = OutputFunctionCall(&fmstate->p_flinfo[flslot],
-												   elements[i]);
 			}
 		}
 
@@ -3098,7 +3229,7 @@ redisExecForeignUpdate(EState *estate,
 		if (!fmstate->singleton_key)
 		{
 			if (fmstate->keyprefix && strncmp(fmstate->keyprefix, newkey,
-											strlen(fmstate->keyprefix)) != 0)
+											fmstate->keyprefix_len) != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNIQUE_VIOLATION),
 					  errmsg("key prefix condition violation: %s", newkey)));
@@ -3115,9 +3246,8 @@ redisExecForeignUpdate(EState *estate,
 			if (newval && fmstate->table_type == PG_REDIS_SCALAR_TABLE)
 			{
 				ereply = redis_command(context, "SET",
-									   newkey, strlen(newkey),
-									   NULL, 0, newval, strlen(newval));
-
+									   newkey_data, newkey_len,
+									   NULL, 0, newval, newval_len);
 				check_reply(ereply, context,
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"updating key %s", newkey);
@@ -3149,8 +3279,8 @@ redisExecForeignUpdate(EState *estate,
 			{
 				case PG_REDIS_SCALAR_TABLE:
 					ereply = redis_command(context, "SET",
-										   fmstate->singleton_key, strlen(fmstate->singleton_key),
-										   NULL, 0, newkey, strlen(newkey));
+										   fmstate->singleton_key, fmstate->singleton_key_len,
+										   NULL, 0, newkey_data, newkey_len);
 					check_reply(ereply, context,
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"setting value %s", newkey);
@@ -3158,15 +3288,15 @@ redisExecForeignUpdate(EState *estate,
 					break;
 				case PG_REDIS_SET_TABLE:
 					ereply = redis_command(context, "SREM",
-										   fmstate->singleton_key, strlen(fmstate->singleton_key),
-										   NULL, 0, keyval, strlen(keyval));
+										   fmstate->singleton_key, fmstate->singleton_key_len,
+										   NULL, 0, key_data, key_len);
 					check_reply(ereply, context,
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"removing value %s", keyval);
 					freeReplyObject(ereply);
 					ereply = redis_command(context, "SADD",
-										   fmstate->singleton_key, strlen(fmstate->singleton_key),
-										   NULL, 0, newkey, strlen(newkey));
+										   fmstate->singleton_key, fmstate->singleton_key_len,
+										   NULL, 0, newkey_data, newkey_len);
 					check_reply(ereply, context,
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"setting value %s", newkey);
@@ -3175,29 +3305,34 @@ redisExecForeignUpdate(EState *estate,
 				case PG_REDIS_ZSET_TABLE:
 					{
 						char	   *priority = newval;
+						size_t		priority_len;
 
 						if (!priority)
 						{
 							ereply = redis_command(context, "ZSCORE",
-												   fmstate->singleton_key, strlen(fmstate->singleton_key),
-												   NULL, 0, keyval, strlen(keyval));
+												   fmstate->singleton_key, fmstate->singleton_key_len,
+												   NULL, 0, key_data, key_len);
 							check_reply(ereply, context,
 									  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 										"getting score for key %s", keyval);
 							priority = pstrdup(ereply->str);
+							priority_len = ereply->len;
 							freeReplyObject(ereply);
 						}
+						else
+							priority_len = newval_len;
+
 						ereply = redis_command(context, "ZREM",
-											   fmstate->singleton_key, strlen(fmstate->singleton_key),
-											   NULL, 0, keyval, strlen(keyval));
+											   fmstate->singleton_key, fmstate->singleton_key_len,
+											   NULL, 0, key_data, key_len);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"removing set element %s", keyval);
 						freeReplyObject(ereply);
 
 						ereply = redis_command(context, "ZADD",
-											   fmstate->singleton_key, strlen(fmstate->singleton_key),
-											   priority, strlen(priority), newkey, strlen(newkey));
+											   fmstate->singleton_key, fmstate->singleton_key_len,
+											   priority, priority_len, newkey_data, newkey_len);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"setting element %s", newkey);
@@ -3207,29 +3342,34 @@ redisExecForeignUpdate(EState *estate,
 				case PG_REDIS_HASH_TABLE:
 					{
 						char	   *nval = newval;
+						size_t		nval_len;
 
 						if (!nval)
 						{
 							ereply = redis_command(context, "HGET",
-												   fmstate->singleton_key, strlen(fmstate->singleton_key),
-												   NULL, 0, keyval, strlen(keyval));
+												   fmstate->singleton_key, fmstate->singleton_key_len,
+												   NULL, 0, key_data, key_len);
 							check_reply(ereply, context,
 									  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 										"fetching value for key %s", keyval);
 							nval = pstrdup(ereply->str);
+							nval_len = ereply->len;
 							freeReplyObject(ereply);
 						}
+						else
+							nval_len = newval_len;
+
 						ereply = redis_command(context, "HDEL",
-											   fmstate->singleton_key, strlen(fmstate->singleton_key),
-											   NULL, 0, keyval, strlen(keyval));
+											   fmstate->singleton_key, fmstate->singleton_key_len,
+											   NULL, 0, key_data, key_len);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"removing hash element %s", keyval);
 						freeReplyObject(ereply);
 
 						ereply = redis_command(context, "HSET",
-											   fmstate->singleton_key, strlen(fmstate->singleton_key),
-											   newkey, strlen(newkey), nval, strlen(nval));
+											   fmstate->singleton_key, fmstate->singleton_key_len,
+											   newkey_data, newkey_len, nval, nval_len);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"adding hash element %s", newkey);
@@ -3247,19 +3387,19 @@ redisExecForeignUpdate(EState *estate,
 		{
 			Assert(fmstate->table_type == PG_REDIS_SCALAR_TABLE);
 			ereply = redis_command(context, "SET",
-								   keyval, strlen(keyval),
-								   NULL, 0, newval, strlen(newval));
+								   key_data, key_len,
+								   NULL, 0, newval, newval_len);
 		}
 		else
 		{
 			if (fmstate->table_type == PG_REDIS_ZSET_TABLE)
 				ereply = redis_command(context, "ZADD",
-									   fmstate->singleton_key, strlen(fmstate->singleton_key),
-									   newval, strlen(newval), keyval, strlen(keyval));
+									   fmstate->singleton_key, fmstate->singleton_key_len,
+									   newval, newval_len, key_data, key_len);
 			else if (fmstate->table_type == PG_REDIS_HASH_TABLE)
 				ereply = redis_command(context, "HSET",
-									   fmstate->singleton_key, strlen(fmstate->singleton_key),
-									   keyval, strlen(keyval), newval, strlen(newval));
+									   fmstate->singleton_key, fmstate->singleton_key_len,
+									   key_data, key_len, newval, newval_len);
 			else
 				elog(ERROR, "impossible update");		/* should not happen */
 		}
@@ -3270,14 +3410,13 @@ redisExecForeignUpdate(EState *estate,
 		freeReplyObject(ereply);
 	}
 
-	if (array_vals)
+	if (array_elems)
 	{
-
 		Assert(!fmstate->singleton_key);
 
 		{
-			const char *argv[2] = {"DEL", newkey};
-			size_t		argvlen[2] = {3, strlen(newkey)};
+			const char *argv[2] = {"DEL", newkey_data};
+			size_t		argvlen[2] = {3, newkey_len};
 
 			ereply = redisCommandArgv(context, 2, argv, argvlen);
 		}
@@ -3294,12 +3433,17 @@ redisExecForeignUpdate(EState *estate,
 
 					for (i = 0; i < nitems; i++)
 					{
+						const char *data;
+						size_t		len;
+
+						get_datum_as_string(array_elems[i], array_elem_valtype,
+											&fmstate->p_flinfo[1], &data, &len);
 						ereply = redis_command(context, "SADD",
-											   newkey, strlen(newkey),
-											   NULL, 0, array_vals[i], strlen(array_vals[i]));
+											   newkey_data, newkey_len,
+											   NULL, 0, data, len);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add element %s", array_vals[i]);
+									"could not add element", NULL);
 						freeReplyObject(ereply);
 					}
 				}
@@ -3310,12 +3454,17 @@ redisExecForeignUpdate(EState *estate,
 
 					for (i = 0; i < nitems; i++)
 					{
+						const char *data;
+						size_t		len;
+
+						get_datum_as_string(array_elems[i], array_elem_valtype,
+											&fmstate->p_flinfo[1], &data, &len);
 						ereply = redis_command(context, "RPUSH",
-											   newkey, strlen(newkey),
-											   NULL, 0, array_vals[i], strlen(array_vals[i]));
+											   newkey_data, newkey_len,
+											   NULL, 0, data, len);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add value %s", array_vals[i]);
+									"could not add value", NULL);
 						freeReplyObject(ereply);
 					}
 				}
@@ -3323,31 +3472,33 @@ redisExecForeignUpdate(EState *estate,
 			case PG_REDIS_HASH_TABLE:
 				{
 					int			i;
-					char	   *hk,
-							   *hv;
 
 					for (i = 0; i < nitems; i += 2)
 					{
-						hk = array_vals[i];
-						hv = array_vals[i + 1];
-						/* HSET needs 4 args: key, field, value - use custom call */
+						const char *hk_data, *hv_data;
+						size_t		hk_len, hv_len;
+
+						get_datum_as_string(array_elems[i], array_elem_valtype,
+											&fmstate->p_flinfo[1], &hk_data, &hk_len);
+						get_datum_as_string(array_elems[i + 1], array_elem_valtype,
+											&fmstate->p_flinfo[1], &hv_data, &hv_len);
 						{
 							const char *argv[4];
 							size_t		argvlen[4];
 
 							argv[0] = "HSET";
 							argvlen[0] = 4;
-							argv[1] = newkey;
-							argvlen[1] = strlen(newkey);
-							argv[2] = hk;
-							argvlen[2] = strlen(hk);
-							argv[3] = hv;
-							argvlen[3] = strlen(hv);
+							argv[1] = newkey_data;
+							argvlen[1] = newkey_len;
+							argv[2] = hk_data;
+							argvlen[2] = hk_len;
+							argv[3] = hv_data;
+							argvlen[3] = hv_len;
 							ereply = redisCommandArgv(context, 4, argv, argvlen);
 						}
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add key %s", hk);
+									"could not add hash field", NULL);
 						freeReplyObject(ereply);
 					}
 				}
@@ -3355,24 +3506,24 @@ redisExecForeignUpdate(EState *estate,
 			case PG_REDIS_ZSET_TABLE:
 				{
 					int			i;
+					int			ibuff_len;
 					char		ibuff[100];
-					char	   *zval;
 
 					for (i = 0; i < nitems; i++)
 					{
-						zval = array_vals[i];
-						sprintf(ibuff, "%d", i);
+						const char *data;
+						size_t		len;
 
-						/*
-						 * score comes BEFORE value in ZADD, which seems
-						 * slightly perverse
-						 */
+						ibuff_len = sprintf(ibuff, "%d", i);
+						/* score comes BEFORE value in ZADD */
+						get_datum_as_string(array_elems[i], array_elem_valtype,
+											&fmstate->p_flinfo[1], &data, &len);
 						ereply = redis_command(context, "ZADD",
-											   newkey, strlen(newkey),
-											   ibuff, strlen(ibuff), zval, strlen(zval));
+											   newkey_data, newkey_len,
+											   ibuff, ibuff_len, data, len);
 						check_reply(ereply, context,
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add key %s", zval);
+									"could not add zset member", NULL);
 						freeReplyObject(ereply);
 					}
 				}

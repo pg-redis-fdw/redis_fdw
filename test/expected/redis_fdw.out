@@ -1716,3 +1716,290 @@ NOTICE:  drop cascades to user mapping for public on server aclbad
 \! redis-cli < test/sql/redis_clean
 OK
 OK
+-- =====================================================
+-- bytea column tests
+-- =====================================================
+-- Test that bytea columns work correctly for storing binary data
+-- including data with embedded NUL bytes
+-- singleton scalar table with bytea value
+create foreign table db15_bytea_scalar(val bytea)
+       server localredis
+       options (singleton_key 'bytea_scalar', database '15');
+select * from db15_bytea_scalar;
+ val 
+-----
+(0 rows)
+
+-- insert binary data with embedded NUL bytes
+insert into db15_bytea_scalar values (E'hello\\000world'::bytea);
+select * from db15_bytea_scalar;
+           val            
+--------------------------
+ \x68656c6c6f00776f726c64
+(1 row)
+
+select length(val), val from db15_bytea_scalar;
+ length |           val            
+--------+--------------------------
+     11 | \x68656c6c6f00776f726c64
+(1 row)
+
+-- update with different binary data
+update db15_bytea_scalar set val = E'binary\\000data\\000here'::bytea;
+select length(val), val from db15_bytea_scalar;
+ length |                val                 
+--------+------------------------------------
+     16 | \x62696e61727900646174610068657265
+(1 row)
+
+delete from db15_bytea_scalar;
+select * from db15_bytea_scalar;
+ val 
+-----
+(0 rows)
+
+-- non-singleton scalar table with bytea value column
+create foreign table db15_bytea_scalar_ns(key text, val bytea)
+       server localredis
+       options (database '15', tablekeyprefix 'bscalar_');
+select * from db15_bytea_scalar_ns;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_bytea_scalar_ns values
+    ('bscalar_a', E'binary\\000a'::bytea),
+    ('bscalar_b', E'binary\\000b'::bytea);
+select key, length(val), val from db15_bytea_scalar_ns order by key;
+    key    | length |        val         
+-----------+--------+--------------------
+ bscalar_a |      8 | \x62696e6172790061
+ bscalar_b |      8 | \x62696e6172790062
+(2 rows)
+
+update db15_bytea_scalar_ns set val = E'updated\\000val'::bytea where key = 'bscalar_a';
+select key, length(val), val from db15_bytea_scalar_ns order by key;
+    key    | length |           val            
+-----------+--------+--------------------------
+ bscalar_a |     11 | \x757064617465640076616c
+ bscalar_b |      8 | \x62696e6172790062
+(2 rows)
+
+delete from db15_bytea_scalar_ns where key = 'bscalar_a';
+select key, length(val), val from db15_bytea_scalar_ns order by key;
+    key    | length |        val         
+-----------+--------+--------------------
+ bscalar_b |      8 | \x62696e6172790062
+(1 row)
+
+delete from db15_bytea_scalar_ns;
+select * from db15_bytea_scalar_ns;
+ key | val 
+-----+-----
+(0 rows)
+
+-- singleton hash table with bytea value column (key must be text)
+create foreign table db15_bytea_hash(key text, val bytea)
+       server localredis
+       options (singleton_key 'bytea_hash', tabletype 'hash', database '15');
+select * from db15_bytea_hash;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_bytea_hash values
+    ('field1', E'hash\\000val1'::bytea),
+    ('field2', E'hash\\000val2'::bytea);
+select key, length(val), val from db15_bytea_hash order by key;
+  key   | length |         val          
+--------+--------+----------------------
+ field1 |      9 | \x686173680076616c31
+ field2 |      9 | \x686173680076616c32
+(2 rows)
+
+update db15_bytea_hash set val = E'new\\000hash\\000val'::bytea where key = 'field1';
+select key, length(val), val from db15_bytea_hash order by key;
+  key   | length |            val             
+--------+--------+----------------------------
+ field1 |     12 | \x6e657700686173680076616c
+ field2 |      9 | \x686173680076616c32
+(2 rows)
+
+delete from db15_bytea_hash where key = 'field2';
+select key, length(val), val from db15_bytea_hash order by key;
+  key   | length |            val             
+--------+--------+----------------------------
+ field1 |     12 | \x6e657700686173680076616c
+(1 row)
+
+delete from db15_bytea_hash;
+select * from db15_bytea_hash;
+ key | val 
+-----+-----
+(0 rows)
+
+-- test that bytea key column in hash is rejected
+create foreign table db15_bytea_hash_bad(key bytea, val text)
+       server localredis
+       options (singleton_key 'bytea_hash_bad', tabletype 'hash', database '15');
+insert into db15_bytea_hash_bad values (E'key'::bytea, 'val');
+ERROR:  bytea not supported for hash field column
+-- singleton set table with bytea member
+create foreign table db15_bytea_set(member bytea)
+       server localredis
+       options (singleton_key 'bytea_set', tabletype 'set', database '15');
+select * from db15_bytea_set;
+ member 
+--------
+(0 rows)
+
+insert into db15_bytea_set values
+    (E'set\\000member1'::bytea),
+    (E'set\\000member2'::bytea),
+    (E'set\\000member3'::bytea);
+select length(member), member from db15_bytea_set order by member;
+ length |          member          
+--------+--------------------------
+     11 | \x736574006d656d62657231
+     11 | \x736574006d656d62657232
+     11 | \x736574006d656d62657233
+(3 rows)
+
+delete from db15_bytea_set where member = E'set\\000member2'::bytea;
+select length(member), member from db15_bytea_set order by member;
+ length |          member          
+--------+--------------------------
+     11 | \x736574006d656d62657231
+     11 | \x736574006d656d62657233
+(2 rows)
+
+-- update member
+update db15_bytea_set set member = E'set\\000updated'::bytea where member = E'set\\000member1'::bytea;
+select length(member), member from db15_bytea_set order by member;
+ length |          member          
+--------+--------------------------
+     11 | \x736574006d656d62657233
+     11 | \x7365740075706461746564
+(2 rows)
+
+delete from db15_bytea_set;
+select * from db15_bytea_set;
+ member 
+--------
+(0 rows)
+
+-- singleton zset table with bytea member and scores
+create foreign table db15_bytea_zset(member bytea, score numeric)
+       server localredis
+       options (singleton_key 'bytea_zset', tabletype 'zset', database '15');
+select * from db15_bytea_zset;
+ member | score 
+--------+-------
+(0 rows)
+
+insert into db15_bytea_zset values
+    (E'zset\\000m1'::bytea, 1),
+    (E'zset\\000m2'::bytea, 2),
+    (E'zset\\000m3'::bytea, 3);
+select length(member), member, score from db15_bytea_zset order by score;
+ length |      member      | score 
+--------+------------------+-------
+      7 | \x7a736574006d31 |     1
+      7 | \x7a736574006d32 |     2
+      7 | \x7a736574006d33 |     3
+(3 rows)
+
+delete from db15_bytea_zset where member = E'zset\\000m2'::bytea;
+select length(member), member, score from db15_bytea_zset order by score;
+ length |      member      | score 
+--------+------------------+-------
+      7 | \x7a736574006d31 |     1
+      7 | \x7a736574006d33 |     3
+(2 rows)
+
+update db15_bytea_zset set score = 10 where member = E'zset\\000m1'::bytea;
+select length(member), member, score from db15_bytea_zset order by score;
+ length |      member      | score 
+--------+------------------+-------
+      7 | \x7a736574006d33 |     3
+      7 | \x7a736574006d31 |    10
+(2 rows)
+
+delete from db15_bytea_zset;
+select * from db15_bytea_zset;
+ member | score 
+--------+-------
+(0 rows)
+
+-- non-singleton set table with bytea[] array column
+create foreign table db15_bytea_set_arr(key text, val bytea[])
+       server localredis
+       options (database '15', tabletype 'set', tablekeyprefix 'bset_');
+select * from db15_bytea_set_arr;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_bytea_set_arr values
+    ('bset_a', array[E'a\\000'::bytea, E'b\\000'::bytea, E'c\\000'::bytea]);
+select key, val from db15_bytea_set_arr order by key;
+  key   |               val               
+--------+---------------------------------
+ bset_a | {"\\x6100","\\x6200","\\x6300"}
+(1 row)
+
+delete from db15_bytea_set_arr;
+select * from db15_bytea_set_arr;
+ key | val 
+-----+-----
+(0 rows)
+
+-- non-singleton zset table with bytea[] array column
+create foreign table db15_bytea_zset_arr(key text, val bytea[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'bzset_');
+select * from db15_bytea_zset_arr;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_bytea_zset_arr values
+    ('bzset_a', array[E'x\\000'::bytea, E'y\\000'::bytea, E'z\\000'::bytea]);
+select key, val from db15_bytea_zset_arr order by key;
+   key   |               val               
+---------+---------------------------------
+ bzset_a | {"\\x7800","\\x7900","\\x7a00"}
+(1 row)
+
+delete from db15_bytea_zset_arr;
+select * from db15_bytea_zset_arr;
+ key | val 
+-----+-----
+(0 rows)
+
+-- singleton list table with bytea value
+-- note: UPDATE and DELETE not supported for list tables (Redis API limitation)
+create foreign table db15_bytea_list(val bytea)
+       server localredis
+       options (singleton_key 'bytea_list', tabletype 'list', database '15');
+select * from db15_bytea_list;
+ val 
+-----
+(0 rows)
+
+insert into db15_bytea_list values
+    (E'list\\000item1'::bytea),
+    (E'list\\000item2'::bytea),
+    (E'list\\000item3'::bytea);
+select length(val), val from db15_bytea_list;
+ length |          val           
+--------+------------------------
+     10 | \x6c697374006974656d31
+     10 | \x6c697374006974656d32
+     10 | \x6c697374006974656d33
+(3 rows)
+
+-- clean up bytea tests
+\! redis-cli < test/sql/redis_clean
+OK
+OK

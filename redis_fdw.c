@@ -32,6 +32,7 @@
 
 
 #include "funcapi.h"
+#include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -128,13 +129,14 @@ typedef enum
 
 /*
  * Column type categories for efficient data extraction.
- * REDIS_VAL_TEXT can use VARDATA_ANY directly.
+ * REDIS_VAL_TEXT and REDIS_VAL_BYTEA can use VARDATA_ANY directly.
  * REDIS_VAL_OTHER requires OutputFunctionCall conversion.
  */
 typedef enum
 {
 	REDIS_VAL_OTHER = 0,		/* use OutputFunctionCall */
-	REDIS_VAL_TEXT				/* text/varchar - use VARDATA_ANY */
+	REDIS_VAL_TEXT,				/* text/varchar - use VARDATA_ANY */
+	REDIS_VAL_BYTEA				/* bytea - use VARDATA_ANY */
 } redis_val_type;
 
 typedef struct redisTableOptions
@@ -191,6 +193,10 @@ typedef struct RedisFdwExecutionState
 	char	   *cursor_search_string;
 	char	   *cursor_id;
 	MemoryContext mctxt;
+	redis_val_type *val_types;	/* column value type categories */
+	int			natts;			/* number of attributes */
+	TupleDesc	tupdesc;		/* cached tuple descriptor */
+	Oid			array_elem_type;	/* element type if value column is array */
 } RedisFdwExecutionState;
 
 typedef struct RedisFdwModifyState
@@ -350,6 +356,7 @@ static char *redis_escape_glob(const char *str);
 #define RTYPE_ANY	0
 
 static char *redis_array_to_text(redisReply *reply);
+static Datum process_redis_array(redisReply *reply, Oid elem_type);
 static void check_reply(redisReply *reply, redisContext *context,
 						int allowed, int error_code, char *message, char *arg);
 static redisReply *redis_command_impl(redisContext *context,
@@ -1693,6 +1700,24 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->attinmeta =
 		TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
 
+	/* Cache tuple descriptor and build val_types array for type handling */
+	festate->tupdesc = node->ss.ss_currentRelation->rd_att;
+	festate->natts = festate->tupdesc->natts;
+	festate->val_types = (redis_val_type *) palloc0(sizeof(redis_val_type) * festate->natts);
+	for (int i = 0; i < festate->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, i);
+		festate->val_types[i] = classify_type(attr->atttypid);
+	}
+
+	/* Get array element type for value column (column 2) if it's an array */
+	festate->array_elem_type = InvalidOid;
+	if (festate->natts >= 2)
+	{
+		Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, 1);
+		festate->array_elem_type = get_element_type(attr->atttypid);
+	}
+
 	if (festate->singleton_key)
 	{
 		festate->owned_reply = reply;
@@ -1779,8 +1804,12 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 	redisReply *reply = 0;
 	char	   *key;
 	char	   *data = 0;
+	size_t		data_len = 0;
 	char	  **values;
 	HeapTuple	tuple;
+	bool		has_bytea = false;
+	bool		has_array = false;
+	Datum		array_datum = (Datum) 0;
 
 	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
@@ -1791,6 +1820,19 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 
 	/* Cleanup */
 	ExecClearTuple(slot);
+
+	/*
+	 * Check if the value column (column 2) is bytea or an array type.
+	 * For scalar tables: bytea value column (has_bytea = true)
+	 * For set/zset/hash/list tables: array column (has_array = true)
+	 */
+	if (festate->natts >= 2)
+	{
+		if (festate->val_types[1] == REDIS_VAL_BYTEA)
+			has_bytea = true;
+		else if (festate->array_elem_type != InvalidOid)
+			has_array = true;
+	}
 
 	/* Get the next record, and set found */
 	found = false;
@@ -1957,17 +1999,21 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 			{
 				case REDIS_REPLY_INTEGER:
 					data = (char *) palloc(sizeof(char) * 64);
-					snprintf(data, 64, "%lld", reply->integer);
+					data_len = snprintf(data, 64, "%lld", reply->integer);
 					found = true;
 					break;
 
 				case REDIS_REPLY_STRING:
 					data = reply->str;
+					data_len = reply->len;
 					found = true;
 					break;
 
 				case REDIS_REPLY_ARRAY:
-					data = redis_array_to_text(reply);
+					if (has_array)
+						array_datum = process_redis_array(reply, festate->array_elem_type);
+					else
+						data = redis_array_to_text(reply);
 					found = true;
 					break;
 			}
@@ -1981,11 +2027,50 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 	/* Build the tuple */
 	if (found)
 	{
-		values = (char **) palloc(sizeof(char *) * 2);
-		values[0] = key;
-		values[1] = data;
-		tuple = BuildTupleFromCStrings(festate->attinmeta, values);
-		ExecStoreHeapTuple(tuple, slot, false);
+		if (has_bytea || has_array)
+		{
+			/* Use heap_form_tuple for bytea or array columns */
+			Datum	   *datums;
+			bool	   *nulls;
+
+			datums = (Datum *) palloc(sizeof(Datum) * festate->natts);
+			nulls = (bool *) palloc0(sizeof(bool) * festate->natts);
+
+			/* Column 0: key (always text) */
+			datums[0] = CStringGetTextDatum(key);
+
+			/* Column 1: value */
+			if (has_array)
+			{
+				if (array_datum == (Datum) 0)
+					nulls[1] = true;
+				else
+					datums[1] = array_datum;
+			}
+			else if (data == NULL)
+			{
+				nulls[1] = true;
+			}
+			else
+			{
+				bytea	   *bval = (bytea *) palloc(data_len + VARHDRSZ);
+				SET_VARSIZE(bval, data_len + VARHDRSZ);
+				memcpy(VARDATA(bval), data, data_len);
+				datums[1] = PointerGetDatum(bval);
+			}
+
+			tuple = heap_form_tuple(festate->tupdesc, datums, nulls);
+			ExecStoreHeapTuple(tuple, slot, false);
+		}
+		else
+		{
+			/* Use BuildTupleFromCStrings for text-only scalar tables */
+			values = (char **) palloc(sizeof(char *) * 2);
+			values[0] = key;
+			values[1] = data;
+			tuple = BuildTupleFromCStrings(festate->attinmeta, values);
+			ExecStoreHeapTuple(tuple, slot, false);
+		}
 	}
 
 	/* Cleanup */
@@ -2001,8 +2086,11 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 	bool		found;
 	char	   *key = NULL;
 	char	   *data = NULL;
+	size_t		key_len = 0;
+	size_t		data_len = 0;
 	char	  **values;
 	HeapTuple	tuple;
+	bool		has_bytea = false;
 
 	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
@@ -2017,6 +2105,16 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 	if (festate->row < 0)
 		return slot;
 
+	/* Check if any column is bytea */
+	for (int i = 0; i < festate->natts; i++)
+	{
+		if (festate->val_types[i] == REDIS_VAL_BYTEA)
+		{
+			has_bytea = true;
+			break;
+		}
+	}
+
 	/* Get the next record, and set found */
 	found = false;
 
@@ -2027,12 +2125,13 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 		{
 			case REDIS_REPLY_INTEGER:
 				key = (char *) palloc(sizeof(char) * 64);
-				snprintf(key, 64, "%lld", festate->reply->integer);
+				key_len = snprintf(key, 64, "%lld", festate->reply->integer);
 				found = true;
 				break;
 
 			case REDIS_REPLY_STRING:
 				key = festate->reply->str;
+				key_len = festate->reply->len;
 				found = true;
 				break;
 
@@ -2047,16 +2146,18 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 	{
 		festate->row = -1;		/* just one row for qual'd search in a hash */
 		key = festate->qual_value;
+		key_len = strlen(key);
 		switch (festate->reply->type)
 		{
 			case REDIS_REPLY_INTEGER:
 				data = (char *) palloc(sizeof(char) * 64);
-				snprintf(data, 64, "%lld", festate->reply->integer);
+				data_len = snprintf(data, 64, "%lld", festate->reply->integer);
 				found = true;
 				break;
 
 			case REDIS_REPLY_STRING:
 				data = festate->reply->str;
+				data_len = festate->reply->len;
 				found = true;
 				break;
 
@@ -2072,6 +2173,7 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 		/* everything else comes in as an array reply type */
 		found = true;
 		key = festate->reply->element[festate->row]->str;
+		key_len = festate->reply->element[festate->row]->len;
 		festate->row++;
 		if (festate->table_type == PG_REDIS_HASH_TABLE ||
 			festate->table_type == PG_REDIS_ZSET_TABLE)
@@ -2082,11 +2184,12 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 			{
 				case REDIS_REPLY_INTEGER:
 					data = (char *) palloc(sizeof(char) * 64);
-					snprintf(key, 64, "%lld", dreply->integer);
+					data_len = snprintf(data, 64, "%lld", dreply->integer);
 					break;
 
 				case REDIS_REPLY_STRING:
 					data = dreply->str;
+					data_len = dreply->len;
 					break;
 
 				case REDIS_REPLY_ARRAY:
@@ -2101,14 +2204,71 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 	}
 
 	/* Build the tuple */
-	values = (char **) palloc(sizeof(char *) * 2);
-
 	if (found)
 	{
-		values[0] = key;
-		values[1] = data;
-		tuple = BuildTupleFromCStrings(festate->attinmeta, values);
-		ExecStoreHeapTuple(tuple, slot, false);
+		if (has_bytea)
+		{
+			/* Use heap_form_tuple for bytea columns to preserve binary data */
+			Datum	   *datums;
+			bool	   *nulls;
+
+			datums = (Datum *) palloc(sizeof(Datum) * festate->natts);
+			nulls = (bool *) palloc0(sizeof(bool) * festate->natts);
+
+			for (int i = 0; i < festate->natts; i++)
+			{
+				char	   *val;
+				size_t		val_len;
+
+				if (i == 0)
+				{
+					val = key;
+					val_len = key_len;
+				}
+				else
+				{
+					val = data;
+					val_len = data_len;
+				}
+
+				if (val == NULL)
+				{
+					nulls[i] = true;
+				}
+				else if (festate->val_types[i] == REDIS_VAL_BYTEA)
+				{
+					/* Construct bytea datum directly from binary data */
+					bytea	   *bval = (bytea *) palloc(val_len + VARHDRSZ);
+					SET_VARSIZE(bval, val_len + VARHDRSZ);
+					memcpy(VARDATA(bval), val, val_len);
+					datums[i] = PointerGetDatum(bval);
+				}
+				else if (festate->val_types[i] == REDIS_VAL_TEXT)
+				{
+					datums[i] = CStringGetTextDatum(val);
+				}
+				else
+				{
+					/* Use InputFunctionCall for other column types */
+					datums[i] = InputFunctionCall(&festate->attinmeta->attinfuncs[i],
+												  val,
+												  festate->attinmeta->attioparams[i],
+												  festate->attinmeta->atttypmods[i]);
+				}
+			}
+
+			tuple = heap_form_tuple(festate->tupdesc, datums, nulls);
+			ExecStoreHeapTuple(tuple, slot, false);
+		}
+		else
+		{
+			/* Use BuildTupleFromCStrings for text-only tables */
+			values = (char **) palloc(sizeof(char *) * 2);
+			values[0] = key;
+			values[1] = data;
+			tuple = BuildTupleFromCStrings(festate->attinmeta, values);
+			ExecStoreHeapTuple(tuple, slot, false);
+		}
 	}
 
 	return slot;
@@ -2264,6 +2424,95 @@ redis_array_to_text(redisReply *reply)
 	appendStringInfoChar(res, '}');
 
 	return res->data;
+}
+
+/*
+ * process_redis_array
+ *		Build a text[] or bytea[] datum from a Redis array reply.
+ *		For bytea, this preserves binary data including embedded NUL bytes.
+ *		For text, validates UTF-8 encoding.
+ */
+static Datum
+process_redis_array(redisReply *reply, Oid elem_type)
+{
+	Datum	   *elems;
+	int			nelems = reply->elements;
+	ArrayType  *result;
+	bool		is_bytea = (elem_type == BYTEAOID);
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+
+	elems = (Datum *) palloc(sizeof(Datum) * nelems);
+
+	for (int i = 0; i < nelems; i++)
+	{
+		redisReply *ir = reply->element[i];
+
+		if (ir->type == REDIS_REPLY_ARRAY)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("nested array returns not yet supported")));
+
+		switch (ir->type)
+		{
+			case REDIS_REPLY_STATUS:
+			case REDIS_REPLY_STRING:
+				if (is_bytea)
+				{
+					bytea	   *bval = (bytea *) palloc(ir->len + VARHDRSZ);
+
+					SET_VARSIZE(bval, ir->len + VARHDRSZ);
+					memcpy(VARDATA(bval), ir->str, ir->len);
+					elems[i] = PointerGetDatum(bval);
+				}
+				else
+				{
+					pg_verifymbstr(ir->str, ir->len, false);
+					elems[i] = PointerGetDatum(cstring_to_text_with_len(ir->str, ir->len));
+				}
+				break;
+			case REDIS_REPLY_INTEGER:
+				{
+					char		buf[64];
+					int			len;
+
+					len = snprintf(buf, sizeof(buf), "%lld", ir->integer);
+					if (is_bytea)
+					{
+						bytea	   *bval = (bytea *) palloc(len + VARHDRSZ);
+
+						SET_VARSIZE(bval, len + VARHDRSZ);
+						memcpy(VARDATA(bval), buf, len);
+						elems[i] = PointerGetDatum(bval);
+					}
+					else
+					{
+						elems[i] = PointerGetDatum(cstring_to_text_with_len(buf, len));
+					}
+				}
+				break;
+			case REDIS_REPLY_NIL:
+			default:
+				/* Create an empty value for NULL/unknown types */
+				if (is_bytea)
+				{
+					bytea	   *bval = (bytea *) palloc(VARHDRSZ);
+
+					SET_VARSIZE(bval, VARHDRSZ);
+					elems[i] = PointerGetDatum(bval);
+				}
+				else
+				{
+					elems[i] = PointerGetDatum(cstring_to_text(""));
+				}
+				break;
+		}
+	}
+
+	get_typlenbyvalalign(elem_type, &typlen, &typbyval, &typalign);
+	result = construct_array(elems, nelems, elem_type, typlen, typbyval, typalign);
+	return PointerGetDatum(result);
 }
 
 static void
@@ -2452,6 +2701,10 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 		fmstate->keyAttno = ExecFindJunkAttributeInTlist(subplan->targetlist,
 														 REDISMODKEYNAME);
 
+		/*
+		 * Classify key column type - needed for DELETE and UPDATE
+		 * operations on singleton SET/ZSET tables with bytea members.
+		 */
 		fmstate->val_types[0] = classify_type(attr->atttypid);
 
 		getTypeOutputInfo(attr->atttypid, &typefnoid, &isvarlena);
@@ -2485,7 +2738,32 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 						 ));
 			}
 
+			/*
+			 * Check for bytea columns and validate they're used appropriately.
+			 * Bytea is supported for:
+			 * - Scalar tables: value column (singleton or non-singleton)
+			 * - Hash singleton tables: value column only (not the field/key column)
+			 * - Set singleton tables: member column
+			 * - Zset singleton tables: member column (not the score column)
+			 * - List singleton tables: value column
+			 */
 			fmstate->val_types[fmstate->p_nums] = classify_type(attr->atttypid);
+			if (fmstate->val_types[fmstate->p_nums] == REDIS_VAL_BYTEA)
+			{
+				/* bytea key column not allowed for non-singleton tables */
+				if (attnum == 1 && !fmstate->singleton_key)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("bytea key column not supported")));
+
+				/* For hash singleton: field column (attnum 1) must be text */
+				if (fmstate->singleton_key &&
+					fmstate->table_type == PG_REDIS_HASH_TABLE &&
+					attnum == 1)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("bytea not supported for hash field column")));
+			}
 
 			/*
 			 * If the item is an array, store the output details for its
@@ -2713,6 +2991,8 @@ classify_type(Oid typid)
 		case VARCHAROID:
 		case BPCHAROID:
 			return REDIS_VAL_TEXT;
+		case BYTEAOID:
+			return REDIS_VAL_BYTEA;
 		default:
 			return REDIS_VAL_OTHER;
 	}
@@ -2722,6 +3002,7 @@ classify_type(Oid typid)
  * get_datum_as_string
  *		Extract string data and length from a datum based on its type category.
  *		For text-like types, extracts varlena data directly.
+ *		For bytea, extracts raw binary data.
  *		For other types, uses OutputFunctionCall (caller must ensure result is pfree'd).
  */
 static void
@@ -2736,6 +3017,14 @@ get_datum_as_string(Datum datum, redis_val_type valtype,
 
 				*data = VARDATA_ANY(t);
 				*len = VARSIZE_ANY_EXHDR(t);
+			}
+			break;
+		case REDIS_VAL_BYTEA:
+			{
+				bytea	   *b = DatumGetByteaPP(datum);
+
+				*data = VARDATA_ANY(b);
+				*len = VARSIZE_ANY_EXHDR(b);
 			}
 			break;
 		case REDIS_VAL_OTHER:
@@ -3286,6 +3575,11 @@ redisExecForeignUpdate(EState *estate,
 	ListCell   *lc = NULL;
 	int			flslot = 1;
 	int			nitems = 0;
+	/* For bytea support */
+	bool		value_is_bytea = false;
+	Datum		bytea_datum = 0;
+	/* For old key bytea (SET/ZSET member being replaced) */
+	bool		old_key_is_bytea = false;
 	/* For array updates */
 	Datum	   *array_elems = NULL;
 	redis_val_type array_elem_valtype = REDIS_VAL_OTHER;
@@ -3303,6 +3597,17 @@ redisExecForeignUpdate(EState *estate,
 	get_datum_as_string(datum, fmstate->val_types[0],
 						&fmstate->p_flinfo[0], &key_data, &key_len);
 	keyval = OutputFunctionCall(&fmstate->p_flinfo[0], datum);
+
+	/*
+	 * For singleton set/zset tables with bytea members, mark old key as bytea.
+	 */
+	if (fmstate->singleton_key &&
+		(fmstate->table_type == PG_REDIS_SET_TABLE ||
+		 fmstate->table_type == PG_REDIS_ZSET_TABLE) &&
+		fmstate->val_types[0] == REDIS_VAL_BYTEA)
+	{
+		old_key_is_bytea = true;
+	}
 
 	newkey = keyval;
 	newkey_data = key_data;
@@ -3322,9 +3627,31 @@ redisExecForeignUpdate(EState *estate,
 
 		if (attnum == 1)
 		{
-			newkey = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
-			newkey_len = strlen(newkey);
-			newkey_data = newkey;
+			/*
+			 * For singleton scalar tables, column 1 is the value (stored under
+			 * singleton_key). For singleton set/zset tables, column 1 is the
+			 * member. For bytea, we need to force the "key changed" branch by
+			 * setting newkey to something different from keyval.
+			 */
+			if (fmstate->singleton_key &&
+				(fmstate->table_type == PG_REDIS_SCALAR_TABLE ||
+				 fmstate->table_type == PG_REDIS_SET_TABLE ||
+				 fmstate->table_type == PG_REDIS_ZSET_TABLE) &&
+				fmstate->val_types[flslot] == REDIS_VAL_BYTEA)
+			{
+				value_is_bytea = true;
+				bytea_datum = datum;
+				/* Force entry into key-change branch */
+				newkey = "";
+				get_datum_as_string(datum, REDIS_VAL_BYTEA,
+									NULL, &newkey_data, &newkey_len);
+			}
+			else
+			{
+				newkey = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
+				newkey_len = strlen(newkey);
+				newkey_data = newkey;
+			}
 		}
 		else if (fmstate->singleton_key ||
 				 fmstate->table_type == PG_REDIS_SCALAR_TABLE)
@@ -3333,8 +3660,16 @@ redisExecForeignUpdate(EState *estate,
 			 * non-singleton scalar value, or singleton hash value, or
 			 * singleton zset priority.
 			 */
-			newval = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
-			newval_len = strlen(newval);
+			if (fmstate->val_types[flslot] == REDIS_VAL_BYTEA)
+			{
+				value_is_bytea = true;
+				bytea_datum = datum;
+			}
+			else
+			{
+				newval = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
+				newval_len = strlen(newval);
+			}
 		}
 		else
 		{
@@ -3465,11 +3800,22 @@ redisExecForeignUpdate(EState *estate,
 						"failure renaming key %s", keyval);
 			freeReplyObject(ereply);
 
-			if (newval && fmstate->table_type == PG_REDIS_SCALAR_TABLE)
+			if ((newval || value_is_bytea) && fmstate->table_type == PG_REDIS_SCALAR_TABLE)
 			{
+				const char *data;
+				size_t		len;
+
+				if (value_is_bytea)
+					get_datum_as_string(bytea_datum, REDIS_VAL_BYTEA,
+										NULL, &data, &len);
+				else
+				{
+					data = newval;
+					len = newval_len;
+				}
 				ereply = redis_command(context, "SET",
 									   newkey_data, newkey_len,
-									   NULL, 0, newval, newval_len);
+									   NULL, 0, data, len);
 				check_reply(ereply, context, RTYPE(REDIS_REPLY_STATUS),
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"updating key %s", newkey);
@@ -3510,43 +3856,74 @@ redisExecForeignUpdate(EState *estate,
 			switch (fmstate->table_type)
 			{
 				case PG_REDIS_SCALAR_TABLE:
-					ereply = redis_command(context, "SET",
-										   fmstate->singleton_key, fmstate->singleton_key_len,
-										   NULL, 0, newkey_data, newkey_len);
-					check_reply(ereply, context, RTYPE(REDIS_REPLY_STATUS),
-								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-								"setting value %s", newkey);
-					freeReplyObject(ereply);
+					{
+						const char *data;
+						size_t		len;
+
+						if (value_is_bytea)
+							get_datum_as_string(bytea_datum, REDIS_VAL_BYTEA,
+												NULL, &data, &len);
+						else
+						{
+							data = newkey_data;
+							len = newkey_len;
+						}
+						ereply = redis_command(context, "SET",
+											   fmstate->singleton_key, fmstate->singleton_key_len,
+											   NULL, 0, data, len);
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_STATUS),
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"setting value %s", newkey);
+						freeReplyObject(ereply);
+					}
 					break;
 				case PG_REDIS_SET_TABLE:
-					/* add before removing - see the keyset case above */
-					ereply = redis_command(context, "SADD",
-										   fmstate->singleton_key, fmstate->singleton_key_len,
-										   NULL, 0, newkey_data, newkey_len);
-					check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-								"setting value %s", newkey);
-					freeReplyObject(ereply);
-					ereply = redis_command(context, "SREM",
-										   fmstate->singleton_key, fmstate->singleton_key_len,
-										   NULL, 0, key_data, key_len);
-					check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-								"removing value %s", keyval);
-					freeReplyObject(ereply);
+					{
+						const char *new_data;
+						size_t		new_len;
+
+						if (value_is_bytea)
+							get_datum_as_string(bytea_datum, REDIS_VAL_BYTEA,
+												NULL, &new_data, &new_len);
+						else
+						{
+							new_data = newkey_data;
+							new_len = newkey_len;
+						}
+
+						/* add before removing - see the keyset case above */
+						ereply = redis_command(context, "SADD",
+											   fmstate->singleton_key, fmstate->singleton_key_len,
+											   NULL, 0, new_data, new_len);
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"setting value %s", newkey);
+						freeReplyObject(ereply);
+
+						ereply = redis_command(context, "SREM",
+											   fmstate->singleton_key, fmstate->singleton_key_len,
+											   NULL, 0, key_data, key_len);
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"removing value %s", keyval);
+						freeReplyObject(ereply);
+					}
 					break;
 				case PG_REDIS_ZSET_TABLE:
 					{
 						char	   *priority = newval;
 						size_t		priority_len;
+						const char *new_data;
+						size_t		new_len;
 
 						if (!priority)
 						{
+							/* Get current score */
 							ereply = redis_command(context, "ZSCORE",
 												   fmstate->singleton_key, fmstate->singleton_key_len,
 												   NULL, 0, key_data, key_len);
 							check_reply(ereply, context, RTYPE(REDIS_REPLY_STRING),
-									  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 										"getting score for key %s", keyval);
 							/*
 							 * Copy by length, not pstrdup: a Redis value is
@@ -3562,6 +3939,16 @@ redisExecForeignUpdate(EState *estate,
 						else
 							priority_len = newval_len;
 
+						/* Add new member */
+						if (value_is_bytea)
+							get_datum_as_string(bytea_datum, REDIS_VAL_BYTEA,
+												NULL, &new_data, &new_len);
+						else
+						{
+							new_data = newkey_data;
+							new_len = newkey_len;
+						}
+
 						/*
 						 * Add before removing - see the keyset case above.
 						 * The score was read from the old member further up,
@@ -3570,7 +3957,7 @@ redisExecForeignUpdate(EState *estate,
 						 */
 						ereply = redis_command(context, "ZADD",
 											   fmstate->singleton_key, fmstate->singleton_key_len,
-											   priority, priority_len, newkey_data, newkey_len);
+											   priority, priority_len, new_data, new_len);
 						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"setting element %s", newkey);
@@ -3589,14 +3976,16 @@ redisExecForeignUpdate(EState *estate,
 					{
 						char	   *nval = newval;
 						size_t		nval_len;
+						const char *val_data;
+						size_t		val_len;
 
-						if (!nval)
+						if (!nval && !value_is_bytea)
 						{
 							ereply = redis_command(context, "HGET",
 												   fmstate->singleton_key, fmstate->singleton_key_len,
 												   NULL, 0, key_data, key_len);
 							check_reply(ereply, context, RTYPE(REDIS_REPLY_STRING),
-									  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+										ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 										"fetching value for key %s", keyval);
 							/*
 							 * Copy by length, not pstrdup: a Redis hash value
@@ -3620,9 +4009,18 @@ redisExecForeignUpdate(EState *estate,
 									"removing hash element %s", keyval);
 						freeReplyObject(ereply);
 
+						/* Add new entry */
+						if (value_is_bytea)
+							get_datum_as_string(bytea_datum, REDIS_VAL_BYTEA,
+												NULL, &val_data, &val_len);
+						else
+						{
+							val_data = nval;
+							val_len = nval_len;
+						}
 						ereply = redis_command(context, "HSET",
 											   fmstate->singleton_key, fmstate->singleton_key_len,
-											   newkey_data, newkey_len, nval, nval_len);
+											   newkey_data, newkey_len, val_data, val_len);
 						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"adding hash element %s", newkey);
@@ -3634,25 +4032,64 @@ redisExecForeignUpdate(EState *estate,
 			}
 		}
 	}	/* no key update */
-	else if (newval)
+	else if (newval || value_is_bytea)
 	{
 		if (!fmstate->singleton_key)
 		{
+			const char *val_data;
+			size_t		val_len;
+
 			Assert(fmstate->table_type == PG_REDIS_SCALAR_TABLE);
+			if (value_is_bytea)
+				get_datum_as_string(bytea_datum, REDIS_VAL_BYTEA,
+									NULL, &val_data, &val_len);
+			else
+			{
+				val_data = newval;
+				val_len = newval_len;
+			}
 			ereply = redis_command(context, "SET",
 								   key_data, key_len,
-								   NULL, 0, newval, newval_len);
+								   NULL, 0, val_data, val_len);
 		}
 		else
 		{
 			if (fmstate->table_type == PG_REDIS_ZSET_TABLE)
+			{
+				const char *member_data;
+				size_t		member_len;
+
+				if (old_key_is_bytea)
+				{
+					member_data = key_data;
+					member_len = key_len;
+				}
+				else
+				{
+					member_data = key_data;
+					member_len = key_len;
+				}
 				ereply = redis_command(context, "ZADD",
 									   fmstate->singleton_key, fmstate->singleton_key_len,
-									   newval, newval_len, key_data, key_len);
+									   newval, newval_len, member_data, member_len);
+			}
 			else if (fmstate->table_type == PG_REDIS_HASH_TABLE)
+			{
+				const char *val_data;
+				size_t		val_len;
+
+				if (value_is_bytea)
+					get_datum_as_string(bytea_datum, REDIS_VAL_BYTEA,
+										NULL, &val_data, &val_len);
+				else
+				{
+					val_data = newval;
+					val_len = newval_len;
+				}
 				ereply = redis_command(context, "HSET",
 									   fmstate->singleton_key, fmstate->singleton_key_len,
-									   key_data, key_len, newval, newval_len);
+									   key_data, key_len, val_data, val_len);
+			}
 			else
 				elog(ERROR, "impossible update");		/* should not happen */
 		}

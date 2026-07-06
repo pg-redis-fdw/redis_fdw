@@ -1096,6 +1096,79 @@ commit;
 
 drop foreign table db15_conntest;
 
+-- A username with no password must be rejected. Authentication is gated on
+-- the password being set, so accepting a lone username would silently connect
+-- unauthenticated while the operator believed ACL auth was configured.
+
+create server authtest foreign data wrapper redis_fdw;
+
+create user mapping for public server authtest options (username 'u');
+
+-- both together are fine
+create user mapping for public server authtest options (username 'u', password 'p');
+
+-- and dropping just the password must be rejected too
+alter user mapping for public server authtest options (drop password);
+
+drop user mapping for public server authtest;
+
+-- the legacy password-only form is still accepted
+create user mapping for public server authtest options (password 'p');
+
+drop user mapping for public server authtest;
+
+drop server authtest;
+
+-- ACL authentication end to end. The suite's default Redis user is
+-- unauthenticated, so the test can provision its own ACL user. "reset" makes
+-- the setup idempotent: a plain SETUSER merges into an existing user rather
+-- than replacing it, so a run that aborted before cleaning up would otherwise
+-- leave a user with two passwords and stale rules.
+
+\! redis-cli ACL SETUSER fdwtest reset on '>secret' '~*' '+@all' > /dev/null
+\! redis-cli -n 15 set acltest_k hello > /dev/null
+
+create server aclsrv foreign data wrapper redis_fdw;
+
+create user mapping for public server aclsrv
+       options (username 'fdwtest', password 'secret');
+
+create foreign table db15_acl(key text, value text)
+       server aclsrv
+       options (database '15', tablekeyprefix 'acltest_');
+
+select * from db15_acl order by key;
+
+-- A wrong password must be refused. This is the case that carries the weight:
+-- were AUTH skipped altogether, the connection would fall back to the
+-- unauthenticated default user and the query would succeed. The message comes
+-- from the server and is not a stable contract, so assert only the failure.
+
+create server aclbad foreign data wrapper redis_fdw;
+
+create user mapping for public server aclbad
+       options (username 'fdwtest', password 'wrongpw');
+
+create foreign table db15_aclbad(key text, value text)
+       server aclbad
+       options (database '15', tablekeyprefix 'acltest_');
+
+do $$
+begin
+  perform * from db15_aclbad;
+  raise notice 'unexpectedly connected with a bad password';
+exception when others then
+  raise notice 'authentication refused as expected';
+end
+$$;
+
+drop foreign table db15_acl;
+drop foreign table db15_aclbad;
+drop server aclsrv cascade;
+drop server aclbad cascade;
+
+\! redis-cli ACL DELUSER fdwtest > /dev/null
+
 -- all done, so now blow everything in the db away again
 
 \! redis-cli < test/sql/redis_clean

@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17, 18]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Remove any preinstalled PostgreSQL
+        run: sudo apt-get purge -y 'postgresql*' || true
+
+      - name: Add the PostgreSQL APT repository
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update
+
+      # Install PostgreSQL and Valkey from their standard release packages -
+      # only redis_fdw itself is built from source here. Valkey is the
+      # actively-developed, license-compatible fork of Redis; libhiredis
+      # still works against it since Valkey speaks the same RESP wire
+      # protocol, and valkey-redis-compat provides the redis-cli symlink
+      # our test scripts use.
+      - name: Remove any preinstalled Redis
+        run: sudo apt-get purge -y 'redis-*' || true
+
+      - name: Install PostgreSQL ${{ matrix.pg }}, Valkey, and hiredis
+        run: |
+          sudo apt-get install -y \
+            postgresql-${{ matrix.pg }} \
+            postgresql-server-dev-${{ matrix.pg }} \
+            postgresql-client-${{ matrix.pg }} \
+            valkey-server \
+            valkey-redis-compat \
+            libhiredis-dev
+
+      - name: Put the PostgreSQL binaries on PATH
+        run: echo "/usr/lib/postgresql/${{ matrix.pg }}/bin" >> "$GITHUB_PATH"
+
+      - name: Build redis_fdw
+        run: make
+
+      - name: Install redis_fdw
+        run: sudo env "PATH=$PATH" make install
+
+      - name: Allow local trust authentication for the test run
+        run: |
+          sudo tee /etc/postgresql/${{ matrix.pg }}/main/pg_hba.conf > /dev/null <<'EOF'
+          local   all             all                                     trust
+          host    all             all             127.0.0.1/32            trust
+          host    all             all             ::1/128                 trust
+          EOF
+          sudo pg_ctlcluster ${{ matrix.pg }} main restart
+
+      - name: Create a superuser role for the CI user
+        run: sudo -u postgres createuser -s "$(whoami)"
+
+      - name: Confirm Valkey is available
+        run: |
+          valkey-cli ping
+          redis-cli ping
+
+      - name: Run regression tests
+        run: make installcheck || { cat test/regression.diffs; exit 1; }

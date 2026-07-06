@@ -1756,7 +1756,7 @@ redisAddForeignUpdateTargets(PlannerInfo *root,
 				  1,
 				  attr->atttypid,
 				  attr->atttypmod,
-				  InvalidOid,
+				  attr->attcollation,
 				  0);
 	/* register it as a row-identity column needed by this target rel */
 	add_row_identity_var(root, var, rtindex, REDISMODKEYNAME);
@@ -1884,7 +1884,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	redisGetOptions(RelationGetRelid(rel),
 					&table_options);
 
-	fmstate = (RedisFdwModifyState *) palloc(sizeof(RedisFdwModifyState));
+	fmstate = (RedisFdwModifyState *) palloc0(sizeof(RedisFdwModifyState));
 	rinfo->ri_FdwState = fmstate;
 	fmstate->rel = rel;
 	fmstate->address = table_options.address;

@@ -185,6 +185,12 @@ Structured items are returned as `array text`, or, if the value column is a
 text array as an array of values. In the case of hash objects this array is
 an array of key, value, key, value ...
 
+Non-singleton `zset` tables may optionally declare a third column, of type
+`numeric[]`, to receive the score for each member in the value array, in
+the same order (i.e. `scores[i]` is the score of `value[i]`). This column
+is read-only; `INSERT`/`UPDATE` still require exactly the `key`/`value`
+columns.
+
 Singleton key tables are returned as rows with a single column of text
 in the case of lists sets and scalars, rows with key and value text columns
 for hashes, and rows with a value text columns and an optional numeric score

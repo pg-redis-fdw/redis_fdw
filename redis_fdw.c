@@ -197,6 +197,9 @@ typedef struct RedisFdwExecutionState
 	int			natts;			/* number of attributes */
 	TupleDesc	tupdesc;		/* cached tuple descriptor */
 	Oid			array_elem_type;	/* element type if value column is array */
+	Oid			scores_elem_type;	/* element type of the scores column */
+	bool		with_scores;	/* non-singleton zset table has a 3rd
+								 * (scores array) column */
 } RedisFdwExecutionState;
 
 typedef struct RedisFdwModifyState
@@ -355,8 +358,9 @@ static char *redis_escape_glob(const char *str);
 #define RTYPE(t)	(1 << (t))
 #define RTYPE_ANY	0
 
-static char *redis_array_to_text(redisReply *reply);
-static Datum process_redis_array(redisReply *reply, Oid elem_type);
+static char *redis_array_to_text(redisReply *reply, int offset, int stride);
+static Datum process_redis_array(redisReply *reply, Oid elem_type,
+								 int offset, int stride);
 static void check_reply(redisReply *reply, redisContext *context,
 						int allowed, int error_code, char *message, char *arg);
 static redisReply *redis_command_impl(redisContext *context,
@@ -1557,6 +1561,15 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->cursor_id = NULL;
 	festate->cursor_search_string = NULL;
 
+	/*
+	 * A non-singleton zset table may optionally have a 3rd column holding
+	 * a parallel array of scores, alongside the usual key and members-array
+	 * columns.
+	 */
+	festate->with_scores = (festate->table_type == PG_REDIS_ZSET_TABLE &&
+							!festate->singleton_key &&
+							node->ss.ss_currentRelation->rd_att->natts == 3);
+
 	festate->qual_value = pushdown ? qual_value : NULL;
 
 	/* OK, we connected. If this is an EXPLAIN, bail out now */
@@ -1583,6 +1596,19 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	{
 		Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, 1);
 		festate->array_elem_type = get_element_type(attr->atttypid);
+	}
+
+	/*
+	 * The scores column, when the table declares one. Its element type is
+	 * whatever the user declared - numeric[] in the usual case - so the
+	 * decoder needs it to know which input function to use.
+	 */
+	festate->scores_elem_type = InvalidOid;
+	if (festate->with_scores && festate->natts >= 3)
+	{
+		Form_pg_attribute sattr = TupleDescAttr(festate->tupdesc, 2);
+
+		festate->scores_elem_type = get_element_type(sattr->atttypid);
 	}
 
 	/*
@@ -1825,11 +1851,13 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 	char	   *key;
 	char	   *data = 0;
 	size_t		data_len = 0;
+	char	   *scores = 0;
 	char	  **values;
 	HeapTuple	tuple;
 	bool		has_bytea = false;
 	bool		has_array = false;
 	Datum		array_datum = (Datum) 0;
+	Datum		scores_datum = (Datum) 0;
 
 	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
@@ -1981,8 +2009,12 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 										 "SMEMBERS %s", key);
 					break;
 				case PG_REDIS_ZSET_TABLE:
-					reply = redisCommand(festate->context,
-										 "ZRANGE %s 0 -1", key);
+					if (festate->with_scores)
+						reply = redisCommand(festate->context,
+											 "ZRANGE %s 0 -1 WITHSCORES", key);
+					else
+						reply = redisCommand(festate->context,
+											 "ZRANGE %s 0 -1", key);
 					break;
 				case PG_REDIS_SCALAR_TABLE:
 				default:
@@ -2030,10 +2062,26 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 					break;
 
 				case REDIS_REPLY_ARRAY:
-					if (has_array)
-						array_datum = process_redis_array(reply, festate->array_elem_type);
-					else
-						data = redis_array_to_text(reply);
+					{
+						int			stride = festate->with_scores ? 2 : 1;
+
+						if (has_array)
+							array_datum = process_redis_array(reply,
+															  festate->array_elem_type,
+															  0, stride);
+						else
+							data = redis_array_to_text(reply, 0, stride);
+
+						if (festate->with_scores)
+						{
+							if (festate->scores_elem_type != InvalidOid)
+								scores_datum = process_redis_array(reply,
+																   festate->scores_elem_type,
+																   1, 2);
+							else
+								scores = redis_array_to_text(reply, 1, 2);
+						}
+					}
 					found = true;
 					break;
 			}
@@ -2047,7 +2095,7 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 	/* Build the tuple */
 	if (found)
 	{
-		if (has_bytea || has_array)
+		if (has_bytea || has_array || festate->with_scores)
 		{
 			/* Use heap_form_tuple for bytea or array columns */
 			Datum	   *datums;
@@ -2071,12 +2119,36 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 			{
 				nulls[1] = true;
 			}
-			else
+			else if (has_bytea)
 			{
 				bytea	   *bval = (bytea *) palloc(data_len + VARHDRSZ);
 				SET_VARSIZE(bval, data_len + VARHDRSZ);
 				memcpy(VARDATA(bval), data, data_len);
 				datums[1] = PointerGetDatum(bval);
+			}
+			else
+			{
+				/*
+				 * with_scores can reach here with a scalar text members
+				 * column, which must not be built as a bytea.
+				 */
+				datums[1] = CStringGetTextDatum(data);
+			}
+
+			/* Column 2: scores, when the table declares one */
+			if (festate->with_scores && festate->natts >= 3)
+			{
+				if (festate->scores_elem_type != InvalidOid)
+				{
+					if (scores_datum == (Datum) 0)
+						nulls[2] = true;
+					else
+						datums[2] = scores_datum;
+				}
+				else if (scores == NULL)
+					nulls[2] = true;
+				else
+					datums[2] = CStringGetTextDatum(scores);
 			}
 
 			tuple = heap_form_tuple(festate->tupdesc, datums, nulls);
@@ -2383,18 +2455,45 @@ redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *push
 }
 
 /*
+ * append_quoted_array_element
+ *		Append str (of length len) to buf as a double-quoted,
+ *		backslash-escaped PostgreSQL array literal element.
+ */
+static void
+append_quoted_array_element(StringInfo buf, const char *str, int len)
+{
+	char	   *quoted;
+	char	   *crs;
+
+	pg_verifymbstr(str, len, false);
+	quoted = palloc(len * 2 + 3);
+	crs = quoted;
+	*crs++ = '"';
+	for (int j = 0; j < len; j++)
+	{
+		if (str[j] == '"' || str[j] == '\\')
+			*crs++ = '\\';
+		*crs++ = str[j];
+	}
+	*crs++ = '"';
+	*crs = '\0';
+	appendStringInfoString(buf, quoted);
+	pfree(quoted);
+}
+
+/*
  * redis_array_to_text
  *		Convert a Redis array reply to a PostgreSQL array literal string.
  *		Used for scalar text columns that receive array data from Redis.
  */
 static char *
-redis_array_to_text(redisReply *reply)
+redis_array_to_text(redisReply *reply, int offset, int stride)
 {
 	StringInfo	res = makeStringInfo();
 	bool		need_sep = false;
 
 	appendStringInfoChar(res, '{');
-	for (int i = 0; i < reply->elements; i++)
+	for (int i = offset; i < reply->elements; i += stride)
 	{
 		redisReply *ir = reply->element[i];
 
@@ -2411,25 +2510,7 @@ redis_array_to_text(redisReply *reply)
 		{
 			case REDIS_REPLY_STATUS:
 			case REDIS_REPLY_STRING:
-				{
-					char	   *buff;
-					char	   *crs;
-
-					pg_verifymbstr(ir->str, ir->len, false);
-					buff = palloc(ir->len * 2 + 3);
-					crs = buff;
-					*crs++ = '"';
-					for (int j = 0; j < ir->len; j++)
-					{
-						if (ir->str[j] == '"' || ir->str[j] == '\\')
-							*crs++ = '\\';
-						*crs++ = ir->str[j];
-					}
-					*crs++ = '"';
-					*crs = '\0';
-					appendStringInfoString(res, buff);
-					pfree(buff);
-				}
+				append_quoted_array_element(res, ir->str, ir->len);
 				break;
 			case REDIS_REPLY_INTEGER:
 				appendStringInfo(res, "%lld", ir->integer);
@@ -2453,19 +2534,39 @@ redis_array_to_text(redisReply *reply)
  *		For text, validates UTF-8 encoding.
  */
 static Datum
-process_redis_array(redisReply *reply, Oid elem_type)
+process_redis_array(redisReply *reply, Oid elem_type, int offset, int stride)
 {
 	Datum	   *elems;
-	int			nelems = reply->elements;
+	int			nelems = (reply->elements > offset)
+		? ((reply->elements - offset + stride - 1) / stride)
+		: 0;
+	int			n = 0;
 	ArrayType  *result;
 	bool		is_bytea = (elem_type == BYTEAOID);
+	bool		is_text = (elem_type == TEXTOID ||
+						   elem_type == VARCHAROID ||
+						   elem_type == BPCHAROID);
+	Oid			typinput = InvalidOid;
+	Oid			typioparam = InvalidOid;
+	FmgrInfo	inputproc;
 	int16		typlen;
 	bool		typbyval;
 	char		typalign;
 
+	/*
+	 * Redis hands every value back as text. text and bytea are converted
+	 * directly; any other element type has no route in but its own input
+	 * function, so look that up once rather than per element.
+	 */
+	if (!is_bytea && !is_text)
+	{
+		getTypeInputInfo(elem_type, &typinput, &typioparam);
+		fmgr_info(typinput, &inputproc);
+	}
+
 	elems = (Datum *) palloc(sizeof(Datum) * nelems);
 
-	for (int i = 0; i < nelems; i++)
+	for (int i = offset; i < reply->elements; i += stride, n++)
 	{
 		redisReply *ir = reply->element[i];
 
@@ -2484,12 +2585,19 @@ process_redis_array(redisReply *reply, Oid elem_type)
 
 					SET_VARSIZE(bval, ir->len + VARHDRSZ);
 					memcpy(VARDATA(bval), ir->str, ir->len);
-					elems[i] = PointerGetDatum(bval);
+					elems[n] = PointerGetDatum(bval);
+				}
+				else if (is_text)
+				{
+					pg_verifymbstr(ir->str, ir->len, false);
+					elems[n] = PointerGetDatum(cstring_to_text_with_len(ir->str, ir->len));
 				}
 				else
 				{
-					pg_verifymbstr(ir->str, ir->len, false);
-					elems[i] = PointerGetDatum(cstring_to_text_with_len(ir->str, ir->len));
+					char	   *val = pnstrdup(ir->str, ir->len);
+
+					elems[n] = InputFunctionCall(&inputproc, val, typioparam, -1);
+					pfree(val);
 				}
 				break;
 			case REDIS_REPLY_INTEGER:
@@ -2504,11 +2612,15 @@ process_redis_array(redisReply *reply, Oid elem_type)
 
 						SET_VARSIZE(bval, len + VARHDRSZ);
 						memcpy(VARDATA(bval), buf, len);
-						elems[i] = PointerGetDatum(bval);
+						elems[n] = PointerGetDatum(bval);
+					}
+					else if (is_text)
+					{
+						elems[n] = PointerGetDatum(cstring_to_text_with_len(buf, len));
 					}
 					else
 					{
-						elems[i] = PointerGetDatum(cstring_to_text_with_len(buf, len));
+						elems[n] = InputFunctionCall(&inputproc, buf, typioparam, -1);
 					}
 				}
 				break;
@@ -2520,12 +2632,16 @@ process_redis_array(redisReply *reply, Oid elem_type)
 					bytea	   *bval = (bytea *) palloc(VARHDRSZ);
 
 					SET_VARSIZE(bval, VARHDRSZ);
-					elems[i] = PointerGetDatum(bval);
+					elems[n] = PointerGetDatum(bval);
+				}
+				else if (is_text)
+				{
+					elems[n] = PointerGetDatum(cstring_to_text(""));
 				}
 				else
-				{
-					elems[i] = PointerGetDatum(cstring_to_text(""));
-				}
+					ereport(ERROR,
+							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+							 errmsg("unexpected NULL element in a Redis array reply")));
 				break;
 		}
 	}

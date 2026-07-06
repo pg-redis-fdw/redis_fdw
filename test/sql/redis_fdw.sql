@@ -174,6 +174,22 @@ select * from db15_zset_prefix_array where key = 'zset1';
 select * from db15_zset_keyset_array order by key;
 select * from db15_zset_keyset_array where key = 'zset1';
 
+-- zset with a parallel scores array column
+
+create foreign table db15_zset_prefix_array_scores(key text, value text[], scores numeric[])
+       server localredis
+       options (tabletype 'zset', tablekeyprefix 'zset', database '15');
+
+create foreign table db15_zset_keyset_array_scores(key text, value text[], scores numeric[])
+       server localredis
+       options (tabletype 'zset', tablekeyset 'zkeys', database '15');
+
+select * from db15_zset_prefix_array_scores order by key;
+select * from db15_zset_prefix_array_scores where key = 'zset1';
+
+select * from db15_zset_keyset_array_scores order by key;
+select * from db15_zset_keyset_array_scores where key = 'zset1';
+
 -- singleton scalar
 
 create foreign table db15_1key(value text)
@@ -1468,3 +1484,50 @@ drop foreign table db15_bytea_set_dup;
 -- clean up bytea tests
 \! redis-cli < test/sql/redis_clean
 
+-- bytea[] members with a scores column: binary members must survive intact and
+-- keep their scores. Neither PR could express this shape on its own.
+
+-- -x reads the member from stdin, which is the only way to get real binary
+-- through redis-cli: an escape passed via argv arrives as literal characters.
+\! printf 'bin\001a' | redis-cli -n 15 -x zadd bsc_z 1 > /dev/null
+\! printf 'bin\002b' | redis-cli -n 15 -x zadd bsc_z 2 > /dev/null
+
+create foreign table db15_bsc(key text, value bytea[], scores numeric[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'bsc_');
+
+select key, scores from db15_bsc;
+
+select octet_length(value[1]) as len1, octet_length(value[2]) as len2 from db15_bsc;
+
+drop foreign table db15_bsc;
+
+-- a scores column beside a scalar text members column: legal, because the
+-- scores column requires only zset, non-singleton and three columns
+
+create foreign table db15_ssc(key text, value text, scores numeric[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'bsc_');
+
+select * from db15_ssc;
+
+drop foreign table db15_ssc;
+
+-- infinite scores round-trip both ways. numeric has accepted inf since PG 14,
+-- and Redis accepts PostgreSQL's Infinity rendering back again.
+
+\! redis-cli -n 15 zadd inf_z inf a -inf b 2.5 c > /dev/null
+
+create foreign table db15_inf(key text, value text[], scores numeric[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'inf_');
+
+select * from db15_inf;
+
+insert into db15_inf values ('inf_z2', '{x,y}', '{inf,-inf}');
+
+select * from db15_inf order by key;
+
+delete from db15_inf;
+
+drop foreign table db15_inf;

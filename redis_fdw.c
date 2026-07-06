@@ -120,7 +120,8 @@ typedef enum
 	PG_REDIS_HASH_TABLE,
 	PG_REDIS_LIST_TABLE,
 	PG_REDIS_SET_TABLE,
-	PG_REDIS_ZSET_TABLE
+	PG_REDIS_ZSET_TABLE,
+	PG_REDIS_GEO_TABLE
 } redis_table_type;
 
 /*
@@ -336,6 +337,12 @@ static redisReply *redis_command2_impl(redisContext *context,
 static inline redis_val_type classify_type(Oid typid);
 static void get_datum_as_string(Datum datum, redis_val_type valtype,
 						FmgrInfo *flinfo, const char **data, size_t *len);
+static void redis_geo_fill_missing_coords(redisContext *context,
+						RedisFdwModifyState *fmstate,
+						const char *member_data, size_t member_len,
+						char *keyval,
+						char **lat, size_t *lat_len,
+						char **lon, size_t *lon_len);
 
 /* Connection cache functions */
 static void redis_conn_cache_init(void);
@@ -926,11 +933,13 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 				tabletype = PG_REDIS_SET_TABLE;
 			else if (strcmp(typeval, "zset") == 0)
 				tabletype = PG_REDIS_ZSET_TABLE;
+			else if (strcmp(typeval, "geo") == 0)
+				tabletype = PG_REDIS_GEO_TABLE;
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("invalid tabletype (%s) - must be hash, "
-								"list, set or zset", typeval)));
+								"list, set, zset or geo", typeval)));
 		}
 	}
 
@@ -1037,11 +1046,13 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 				table_options->table_type = PG_REDIS_SET_TABLE;
 			else if (strcmp(typeval, "zset") == 0)
 				table_options->table_type = PG_REDIS_ZSET_TABLE;
+			else if (strcmp(typeval, "geo") == 0)
+				table_options->table_type = PG_REDIS_GEO_TABLE;
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("invalid tabletype (%s) - must be hash, "
-								"list, set or zset", typeval)));
+								"list, set, zset or geo", typeval)));
 		}
 	}
 
@@ -1054,6 +1065,13 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 
 	if (!table_options->database)
 		table_options->database = 0;
+
+	if (table_options->table_type == PG_REDIS_GEO_TABLE &&
+		!table_options->singleton_key)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("geo tables are only supported with singleton_key")
+				 ));
 }
 
 /*
@@ -1129,6 +1147,8 @@ redisGetForeignRelSize(PlannerInfo *root,
 				reply = redisCommand(context, "SCARD %s", table_options.singleton_key);
 				break;
 			case PG_REDIS_ZSET_TABLE:
+			case PG_REDIS_GEO_TABLE:
+				/* geo sets are zsets internally, so ZCARD works for them too */
 				reply = redisCommand(context, "ZCARD %s", table_options.singleton_key);
 				break;
 			default:
@@ -1424,6 +1444,16 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 				break;
 			case PG_REDIS_ZSET_TABLE:
 				reply = redisCommand(context, "ZRANGEBYSCORE %s -inf inf WITHSCORES", table_options.singleton_key);
+				break;
+			case PG_REDIS_GEO_TABLE:
+				/*
+				 * There's no direct "get everything" command for geo sets,
+				 * so search a box large enough to cover the whole Earth
+				 * from an arbitrary origin.
+				 */
+				reply = redisCommand(context,
+									 "GEOSEARCH %s FROMLONLAT 0 0 BYBOX 40075 40075 km ASC WITHCOORD",
+									 table_options.singleton_key);
 				break;
 			default:
 				;
@@ -1797,6 +1827,8 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 	bool		found;
 	char	   *key = NULL;
 	char	   *data = NULL;
+	char	   *lat_str = NULL;
+	char	   *long_str = NULL;
 	char	  **values;
 	HeapTuple	tuple;
 
@@ -1865,6 +1897,22 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 				break;
 		}
 	}
+	else if (festate->table_type == PG_REDIS_GEO_TABLE &&
+			festate->row < festate->reply->elements)
+	{
+		/*
+		 * GEOSEARCH ... WITHCOORD replies with one entry per member:
+		 * [member, [longitude, latitude]]
+		 */
+		redisReply *entry = festate->reply->element[festate->row];
+		redisReply *coord = entry->element[1];
+
+		found = true;
+		key = entry->element[0]->str;
+		long_str = coord->element[0]->str;
+		lat_str = coord->element[1]->str;
+		festate->row++;
+	}
 	else if (festate->row < festate->reply->elements)
 	{
 		/* everything else comes in as an array reply type */
@@ -1900,12 +1948,21 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 	}
 
 	/* Build the tuple */
-	values = (char **) palloc(sizeof(char *) * 2);
-
 	if (found)
 	{
-		values[0] = key;
-		values[1] = data;
+		if (festate->table_type == PG_REDIS_GEO_TABLE)
+		{
+			values = (char **) palloc(sizeof(char *) * 3);
+			values[0] = key;
+			values[1] = lat_str;
+			values[2] = long_str;
+		}
+		else
+		{
+			values = (char **) palloc(sizeof(char *) * 2);
+			values[0] = key;
+			values[1] = data;
+		}
 		tuple = BuildTupleFromCStrings(festate->attinmeta, values);
 		ExecStoreHeapTuple(tuple, slot, false);
 	}
@@ -2311,13 +2368,30 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	{
 		if (table_options.singleton_key)
 		{
+			int			expected_cols;
+
 			if (table_options.table_type == PG_REDIS_ZSET_TABLE && fmstate->p_nums < 2)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("operation not supported for singleton zset "
 								"table without priorities column")
 						 ));
-			else if (fmstate->p_nums != ((table_options.table_type == PG_REDIS_HASH_TABLE || table_options.table_type == PG_REDIS_ZSET_TABLE) ? 2 : 1))
+
+			switch (table_options.table_type)
+			{
+				case PG_REDIS_HASH_TABLE:
+				case PG_REDIS_ZSET_TABLE:
+					expected_cols = 2;
+					break;
+				case PG_REDIS_GEO_TABLE:
+					expected_cols = 3;
+					break;
+				default:
+					expected_cols = 1;
+					break;
+			}
+
+			if (fmstate->p_nums != expected_cols)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("table has incorrect number of columns: %d for type %d", fmstate->p_nums, table_options.table_type)
@@ -2569,11 +2643,13 @@ redisExecForeignInsert(EState *estate,
 	if (fmstate->singleton_key)
 	{
 		Datum		extra = 0;
+		Datum		extra2 = 0;
 
 		/*
 		 * Check if key is there using EXISTS / HEXISTS / SISMEMBER / ZRANK.
 		 * It is not an error for a list type singleton as they don't have to
-		 * be unique.
+		 * be unique. Geo sets are zsets internally, so ZRANK works for them
+		 * too.
 		 */
 
 		switch (fmstate->table_type)
@@ -2593,6 +2669,7 @@ redisExecForeignInsert(EState *estate,
 									   NULL, 0, key_data, key_len);
 				break;
 			case PG_REDIS_ZSET_TABLE:
+			case PG_REDIS_GEO_TABLE:
 				sreply = redis_command(context, "ZRANK",		/* n or nil */
 									   fmstate->singleton_key, fmstate->singleton_key_len,
 									   NULL, 0, key_data, key_len);
@@ -2609,7 +2686,8 @@ redisExecForeignInsert(EState *estate,
 			check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failed checking key existence", NULL);
 
-			if (fmstate->table_type != PG_REDIS_ZSET_TABLE)
+			if (fmstate->table_type != PG_REDIS_ZSET_TABLE &&
+				fmstate->table_type != PG_REDIS_GEO_TABLE)
 				ok = sreply->type == REDIS_REPLY_INTEGER &&
 					sreply->integer == 0;
 			else
@@ -2638,6 +2716,11 @@ redisExecForeignInsert(EState *estate,
 			fmstate->table_type == PG_REDIS_HASH_TABLE)
 		{
 			extra = slot_getattr(slot, 2, &isnull);
+		}
+		else if (fmstate->table_type == PG_REDIS_GEO_TABLE)
+		{
+			extra = slot_getattr(slot, 2, &isnull);	/* lat */
+			extra2 = slot_getattr(slot, 3, &isnull);	/* long */
 		}
 
 		switch (fmstate->table_type)
@@ -2680,6 +2763,34 @@ redisExecForeignInsert(EState *estate,
 					sreply = redis_command(context, "ZADD",
 										   fmstate->singleton_key, fmstate->singleton_key_len,
 										   extra_data, extra_len, key_data, key_len);
+				}
+				break;
+			case PG_REDIS_GEO_TABLE:
+				{
+					const char *lat_data,
+							   *long_data;
+					size_t		lat_len,
+								long_len;
+					const char *argv[5];
+					size_t		argvlen[5];
+
+					get_datum_as_string(extra, fmstate->val_types[1],
+										&fmstate->p_flinfo[1], &lat_data, &lat_len);
+					get_datum_as_string(extra2, fmstate->val_types[2],
+										&fmstate->p_flinfo[2], &long_data, &long_len);
+
+					/* GEOADD key longitude latitude member */
+					argv[0] = "GEOADD";
+					argvlen[0] = 6;
+					argv[1] = fmstate->singleton_key;
+					argvlen[1] = fmstate->singleton_key_len;
+					argv[2] = long_data;
+					argvlen[2] = long_len;
+					argv[3] = lat_data;
+					argvlen[3] = lat_len;
+					argv[4] = key_data;
+					argvlen[4] = key_len;
+					sreply = redisCommandArgv(context, 5, argv, argvlen);
 				}
 				break;
 			default:
@@ -2997,6 +3108,8 @@ redisExecForeignDelete(EState *estate,
 									  NULL, 0, key_data, key_len);
 				break;
 			case PG_REDIS_ZSET_TABLE:
+			case PG_REDIS_GEO_TABLE:
+				/* geo sets are zsets internally, so ZREM works for them too */
 				reply = redis_command(context, "ZREM",
 									  fmstate->singleton_key, fmstate->singleton_key_len,
 									  NULL, 0, key_data, key_len);
@@ -3037,6 +3150,54 @@ redisExecForeignDelete(EState *estate,
 }
 
 /*
+ * redis_geo_fill_missing_coords
+ *		If either lat or lon is not already set (i.e. that coordinate wasn't
+ *		part of this UPDATE), fetch the member's current position with
+ *		GEOPOS and fill in whichever of the two is missing.
+ */
+static void
+redis_geo_fill_missing_coords(redisContext *context, RedisFdwModifyState *fmstate,
+							  const char *member_data, size_t member_len,
+							  char *keyval,
+							  char **lat, size_t *lat_len,
+							  char **lon, size_t *lon_len)
+{
+	redisReply *posreply;
+	redisReply *pos;
+
+	if (*lat && *lon)
+		return;
+
+	posreply = redis_command(context, "GEOPOS",
+							 fmstate->singleton_key, fmstate->singleton_key_len,
+							 NULL, 0, member_data, member_len);
+	check_reply(posreply, context,
+				ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+				"getting position for key %s", keyval);
+
+	pos = posreply->element[0];
+	if (pos->type != REDIS_REPLY_ARRAY)
+	{
+		freeReplyObject(posreply);
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+				 errmsg("could not find current position for key %s", keyval)));
+	}
+
+	if (!*lon)
+	{
+		*lon = pstrdup(pos->element[0]->str);
+		*lon_len = pos->element[0]->len;
+	}
+	if (!*lat)
+	{
+		*lat = pstrdup(pos->element[1]->str);
+		*lat_len = pos->element[1]->len;
+	}
+	freeReplyObject(posreply);
+}
+
+/*
  * redisExecForeignUpdate
  *		Update one row in a foreign table
  */
@@ -3059,6 +3220,10 @@ redisExecForeignUpdate(EState *estate,
 	size_t		newkey_len;			/* new key length */
 	char	   *newval = NULL;
 	size_t		newval_len = 0;
+	char	   *newlat = NULL;			/* singleton geo latitude */
+	size_t		newlat_len = 0;
+	char	   *newlong = NULL;		/* singleton geo longitude */
+	size_t		newlong_len = 0;
 	bool		isNull;
 	ListCell   *lc = NULL;
 	int			flslot = 1;
@@ -3102,6 +3267,20 @@ redisExecForeignUpdate(EState *estate,
 			newkey = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
 			newkey_len = strlen(newkey);
 			newkey_data = newkey;
+		}
+		else if (fmstate->table_type == PG_REDIS_GEO_TABLE)
+		{
+			/* singleton geo: column 2 is latitude, column 3 is longitude */
+			if (attnum == 2)
+			{
+				newlat = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
+				newlat_len = strlen(newlat);
+			}
+			else
+			{
+				newlong = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
+				newlong_len = strlen(newlong);
+			}
 		}
 		else if (fmstate->singleton_key ||
 				 fmstate->table_type == PG_REDIS_SCALAR_TABLE)
@@ -3191,6 +3370,8 @@ redisExecForeignUpdate(EState *estate,
 											newkey, strlen(newkey));
 					break;
 				case PG_REDIS_ZSET_TABLE:
+				case PG_REDIS_GEO_TABLE:
+					/* geo sets are zsets internally, so ZRANK works too */
 					ereply = redis_command2(context, "ZRANK",
 											fmstate->singleton_key, strlen(fmstate->singleton_key),
 											newkey, strlen(newkey));
@@ -3205,7 +3386,8 @@ redisExecForeignUpdate(EState *estate,
 			}
 			if (fmstate->table_type != PG_REDIS_SCALAR_TABLE)
 			{
-				if (fmstate->table_type != PG_REDIS_ZSET_TABLE)
+				if (fmstate->table_type != PG_REDIS_ZSET_TABLE &&
+					fmstate->table_type != PG_REDIS_GEO_TABLE)
 					ok = ereply->type == REDIS_REPLY_INTEGER &&
 						ereply->integer == 0;
 				else
@@ -3338,6 +3520,42 @@ redisExecForeignUpdate(EState *estate,
 						freeReplyObject(ereply);
 					}
 					break;
+				case PG_REDIS_GEO_TABLE:
+					{
+						const char *argv[5];
+						size_t		argvlen[5];
+
+						redis_geo_fill_missing_coords(context, fmstate,
+													  key_data, key_len, keyval,
+													  &newlat, &newlat_len,
+													  &newlong, &newlong_len);
+
+						ereply = redis_command(context, "ZREM",
+											   fmstate->singleton_key, fmstate->singleton_key_len,
+											   NULL, 0, key_data, key_len);
+						check_reply(ereply, context,
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"removing set element %s", keyval);
+						freeReplyObject(ereply);
+
+						/* GEOADD key longitude latitude member */
+						argv[0] = "GEOADD";
+						argvlen[0] = 6;
+						argv[1] = fmstate->singleton_key;
+						argvlen[1] = fmstate->singleton_key_len;
+						argv[2] = newlong;
+						argvlen[2] = newlong_len;
+						argv[3] = newlat;
+						argvlen[3] = newlat_len;
+						argv[4] = newkey_data;
+						argvlen[4] = newkey_len;
+						ereply = redisCommandArgv(context, 5, argv, argvlen);
+						check_reply(ereply, context,
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"setting element %s", newkey);
+						freeReplyObject(ereply);
+					}
+					break;
 				case PG_REDIS_HASH_TABLE:
 					{
 						char	   *nval = newval;
@@ -3380,7 +3598,7 @@ redisExecForeignUpdate(EState *estate,
 			}
 		}
 	}	/* no key update */
-	else if (newval)
+	else if (newval || newlat || newlong)
 	{
 		if (!fmstate->singleton_key)
 		{
@@ -3399,6 +3617,29 @@ redisExecForeignUpdate(EState *estate,
 				ereply = redis_command(context, "HSET",
 									   fmstate->singleton_key, fmstate->singleton_key_len,
 									   key_data, key_len, newval, newval_len);
+			else if (fmstate->table_type == PG_REDIS_GEO_TABLE)
+			{
+				const char *argv[5];
+				size_t		argvlen[5];
+
+				redis_geo_fill_missing_coords(context, fmstate,
+											  key_data, key_len, keyval,
+											  &newlat, &newlat_len,
+											  &newlong, &newlong_len);
+
+				/* GEOADD key longitude latitude member (overwrites in place) */
+				argv[0] = "GEOADD";
+				argvlen[0] = 6;
+				argv[1] = fmstate->singleton_key;
+				argvlen[1] = fmstate->singleton_key_len;
+				argv[2] = newlong;
+				argvlen[2] = newlong_len;
+				argv[3] = newlat;
+				argvlen[3] = newlat_len;
+				argv[4] = key_data;
+				argvlen[4] = key_len;
+				ereply = redisCommandArgv(context, 5, argv, argvlen);
+			}
 			else
 				elog(ERROR, "impossible update");		/* should not happen */
 		}

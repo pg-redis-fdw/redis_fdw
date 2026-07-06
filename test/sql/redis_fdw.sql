@@ -393,6 +393,64 @@ delete from db15_w_1key_zsetx where key = 'z';
 
 select * from db15_w_1key_zsetx order by key;
 
+-- singleton geo table
+
+create foreign table db15_w_1key_geo(value text, lat double precision, long double precision)
+       server localredis
+       options (singleton_key 'w_1key_geo', tabletype 'geo', database '15');
+
+select * from db15_w_1key_geo;
+
+insert into db15_w_1key_geo (value, lat, long) values
+       ('Palermo', 38.115556, 13.361389),
+       ('Catania', 37.502669, 15.087269);
+
+select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
+from db15_w_1key_geo order by value;
+
+-- duplicate member is rejected
+insert into db15_w_1key_geo (value, lat, long) values ('Palermo', 0, 0);
+
+-- update just one coordinate - the other must be preserved
+update db15_w_1key_geo set lat = 40 where value = 'Palermo';
+
+select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
+from db15_w_1key_geo order by value;
+
+-- update both coordinates at once
+update db15_w_1key_geo set lat = 41, long = 14 where value = 'Catania';
+
+select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
+from db15_w_1key_geo order by value;
+
+-- rename a member; its position must carry over
+update db15_w_1key_geo set value = 'Palermo2' where value = 'Palermo';
+
+select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
+from db15_w_1key_geo order by value;
+
+-- rename a member and change a coordinate in the same update
+update db15_w_1key_geo set value = 'Catania2', lat = 42 where value = 'Catania';
+
+select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
+from db15_w_1key_geo order by value;
+
+delete from db15_w_1key_geo where value = 'Palermo2';
+
+select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
+from db15_w_1key_geo order by value;
+
+delete from db15_w_1key_geo;
+
+-- geo tables require singleton_key
+create foreign table db15_geo_no_singleton(key text, lat double precision, long double precision)
+       server localredis
+       options (tabletype 'geo', database '15');
+
+select * from db15_geo_no_singleton;
+
+drop foreign table db15_geo_no_singleton;
+
 -- non-singleton scalar table no prefix no keyset
 
 create foreign table db15_w_scalar(key text, val text)

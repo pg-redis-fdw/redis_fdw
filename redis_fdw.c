@@ -26,6 +26,7 @@
 #error Selected Postgresql version is very old for this branch, try to use some older branch.
 #endif
 
+#include <ctype.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -121,7 +122,8 @@ typedef enum
 	PG_REDIS_LIST_TABLE,
 	PG_REDIS_SET_TABLE,
 	PG_REDIS_ZSET_TABLE,
-	PG_REDIS_GEO_TABLE
+	PG_REDIS_GEO_TABLE,
+	PG_REDIS_GEO4326_TABLE
 } redis_table_type;
 
 /*
@@ -343,6 +345,10 @@ static void redis_geo_fill_missing_coords(redisContext *context,
 						char *keyval,
 						char **lat, size_t *lat_len,
 						char **lon, size_t *lon_len);
+static char *redis_format_geo4326_point(const char *long_str, const char *lat_str);
+static void redis_parse_geo4326_point(const char *text,
+						char **lon, size_t *lon_len,
+						char **lat, size_t *lat_len);
 
 /* Connection cache functions */
 static void redis_conn_cache_init(void);
@@ -935,11 +941,13 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 				tabletype = PG_REDIS_ZSET_TABLE;
 			else if (strcmp(typeval, "geo") == 0)
 				tabletype = PG_REDIS_GEO_TABLE;
+			else if (strcmp(typeval, "geo4326") == 0)
+				tabletype = PG_REDIS_GEO4326_TABLE;
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("invalid tabletype (%s) - must be hash, "
-								"list, set, zset or geo", typeval)));
+								"list, set, zset, geo or geo4326", typeval)));
 		}
 	}
 
@@ -1048,11 +1056,13 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 				table_options->table_type = PG_REDIS_ZSET_TABLE;
 			else if (strcmp(typeval, "geo") == 0)
 				table_options->table_type = PG_REDIS_GEO_TABLE;
+			else if (strcmp(typeval, "geo4326") == 0)
+				table_options->table_type = PG_REDIS_GEO4326_TABLE;
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("invalid tabletype (%s) - must be hash, "
-								"list, set, zset or geo", typeval)));
+								"list, set, zset, geo or geo4326", typeval)));
 		}
 	}
 
@@ -1066,7 +1076,8 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 	if (!table_options->database)
 		table_options->database = 0;
 
-	if (table_options->table_type == PG_REDIS_GEO_TABLE &&
+	if ((table_options->table_type == PG_REDIS_GEO_TABLE ||
+		 table_options->table_type == PG_REDIS_GEO4326_TABLE) &&
 		!table_options->singleton_key)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1148,6 +1159,7 @@ redisGetForeignRelSize(PlannerInfo *root,
 				break;
 			case PG_REDIS_ZSET_TABLE:
 			case PG_REDIS_GEO_TABLE:
+			case PG_REDIS_GEO4326_TABLE:
 				/* geo sets are zsets internally, so ZCARD works for them too */
 				reply = redisCommand(context, "ZCARD %s", table_options.singleton_key);
 				break;
@@ -1446,6 +1458,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 				reply = redisCommand(context, "ZRANGEBYSCORE %s -inf inf WITHSCORES", table_options.singleton_key);
 				break;
 			case PG_REDIS_GEO_TABLE:
+			case PG_REDIS_GEO4326_TABLE:
 				/*
 				 * There's no direct "get everything" command for geo sets,
 				 * so search a box large enough to cover the whole Earth
@@ -1897,8 +1910,9 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 				break;
 		}
 	}
-	else if (festate->table_type == PG_REDIS_GEO_TABLE &&
-			festate->row < festate->reply->elements)
+	else if ((festate->table_type == PG_REDIS_GEO_TABLE ||
+			  festate->table_type == PG_REDIS_GEO4326_TABLE) &&
+			 festate->row < festate->reply->elements)
 	{
 		/*
 		 * GEOSEARCH ... WITHCOORD replies with one entry per member:
@@ -1956,6 +1970,12 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 			values[0] = key;
 			values[1] = lat_str;
 			values[2] = long_str;
+		}
+		else if (festate->table_type == PG_REDIS_GEO4326_TABLE)
+		{
+			values = (char **) palloc(sizeof(char *) * 2);
+			values[0] = key;
+			values[1] = redis_format_geo4326_point(long_str, lat_str);
 		}
 		else
 		{
@@ -2381,6 +2401,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 			{
 				case PG_REDIS_HASH_TABLE:
 				case PG_REDIS_ZSET_TABLE:
+				case PG_REDIS_GEO4326_TABLE:
 					expected_cols = 2;
 					break;
 				case PG_REDIS_GEO_TABLE:
@@ -2670,6 +2691,7 @@ redisExecForeignInsert(EState *estate,
 				break;
 			case PG_REDIS_ZSET_TABLE:
 			case PG_REDIS_GEO_TABLE:
+			case PG_REDIS_GEO4326_TABLE:
 				sreply = redis_command(context, "ZRANK",		/* n or nil */
 									   fmstate->singleton_key, fmstate->singleton_key_len,
 									   NULL, 0, key_data, key_len);
@@ -2687,7 +2709,8 @@ redisExecForeignInsert(EState *estate,
 						"failed checking key existence", NULL);
 
 			if (fmstate->table_type != PG_REDIS_ZSET_TABLE &&
-				fmstate->table_type != PG_REDIS_GEO_TABLE)
+				fmstate->table_type != PG_REDIS_GEO_TABLE &&
+				fmstate->table_type != PG_REDIS_GEO4326_TABLE)
 				ok = sreply->type == REDIS_REPLY_INTEGER &&
 					sreply->integer == 0;
 			else
@@ -2713,9 +2736,10 @@ redisExecForeignInsert(EState *estate,
 		/* get the second value for appropriate table types */
 
 		if (fmstate->table_type == PG_REDIS_ZSET_TABLE ||
-			fmstate->table_type == PG_REDIS_HASH_TABLE)
+			fmstate->table_type == PG_REDIS_HASH_TABLE ||
+			fmstate->table_type == PG_REDIS_GEO4326_TABLE)
 		{
-			extra = slot_getattr(slot, 2, &isnull);
+			extra = slot_getattr(slot, 2, &isnull);	/* score / value / point */
 		}
 		else if (fmstate->table_type == PG_REDIS_GEO_TABLE)
 		{
@@ -2786,6 +2810,36 @@ redisExecForeignInsert(EState *estate,
 					argvlen[1] = fmstate->singleton_key_len;
 					argv[2] = long_data;
 					argvlen[2] = long_len;
+					argv[3] = lat_data;
+					argvlen[3] = lat_len;
+					argv[4] = key_data;
+					argvlen[4] = key_len;
+					sreply = redisCommandArgv(context, 5, argv, argvlen);
+				}
+				break;
+			case PG_REDIS_GEO4326_TABLE:
+				{
+					char	   *point_text = fmstate->val_types[1] == REDIS_VAL_TEXT ?
+						TextDatumGetCString(extra) :
+						OutputFunctionCall(&fmstate->p_flinfo[1], extra);
+					char	   *lon_data,
+							   *lat_data;
+					size_t		lon_len,
+								lat_len;
+					const char *argv[5];
+					size_t		argvlen[5];
+
+					redis_parse_geo4326_point(point_text,
+											  &lon_data, &lon_len,
+											  &lat_data, &lat_len);
+
+					/* GEOADD key longitude latitude member */
+					argv[0] = "GEOADD";
+					argvlen[0] = 6;
+					argv[1] = fmstate->singleton_key;
+					argvlen[1] = fmstate->singleton_key_len;
+					argv[2] = lon_data;
+					argvlen[2] = lon_len;
 					argv[3] = lat_data;
 					argvlen[3] = lat_len;
 					argv[4] = key_data;
@@ -3109,6 +3163,7 @@ redisExecForeignDelete(EState *estate,
 				break;
 			case PG_REDIS_ZSET_TABLE:
 			case PG_REDIS_GEO_TABLE:
+			case PG_REDIS_GEO4326_TABLE:
 				/* geo sets are zsets internally, so ZREM works for them too */
 				reply = redis_command(context, "ZREM",
 									  fmstate->singleton_key, fmstate->singleton_key_len,
@@ -3198,6 +3253,108 @@ redis_geo_fill_missing_coords(redisContext *context, RedisFdwModifyState *fmstat
 }
 
 /*
+ * redis_format_geo4326_point
+ *		Format a GEOPOS/GEOSEARCH longitude/latitude pair as EWKT text,
+ *		e.g. "SRID=4326;POINT(13.361389 38.115556)", so it can be cast
+ *		directly to a PostGIS geometry(Point, 4326).
+ */
+static char *
+redis_format_geo4326_point(const char *long_str, const char *lat_str)
+{
+	size_t		len = strlen(long_str) + strlen(lat_str) + 32;
+	char	   *result = palloc(len);
+
+	snprintf(result, len, "SRID=4326;POINT(%s %s)", long_str, lat_str);
+	return result;
+}
+
+/*
+ * redis_parse_geo4326_point
+ *		Parse EWKT point text, optionally prefixed with "SRID=4326;", into
+ *		separate longitude/latitude text values suitable for GEOADD. Any
+ *		SRID given must be 4326, since that's the coordinate system Redis's
+ *		GEOADD/GEOPOS use.
+ */
+static void
+redis_parse_geo4326_point(const char *text,
+						  char **lon, size_t *lon_len,
+						  char **lat, size_t *lat_len)
+{
+	const char *p = text;
+	char	   *endptr;
+	double		londbl,
+				latdbl;
+
+	while (isspace((unsigned char) *p))
+		p++;
+
+	if (pg_strncasecmp(p, "SRID=", 5) == 0)
+	{
+		long		srid;
+
+		p += 5;
+		srid = strtol(p, &endptr, 10);
+		if (endptr == p || *endptr != ';')
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid geo4326 point value: \"%s\"", text)));
+		if (srid != 4326)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("unsupported SRID %ld in geo4326 point value: only 4326 is supported", srid)));
+		p = endptr + 1;
+		while (isspace((unsigned char) *p))
+			p++;
+	}
+
+	if (pg_strncasecmp(p, "POINT", 5) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid geo4326 point value: \"%s\"", text)));
+	p += 5;
+
+	while (isspace((unsigned char) *p))
+		p++;
+	if (*p != '(')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid geo4326 point value: \"%s\"", text)));
+	p++;
+
+	londbl = strtod(p, &endptr);
+	if (endptr == p)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid geo4326 point value: \"%s\"", text)));
+	p = endptr;
+
+	while (isspace((unsigned char) *p))
+		p++;
+
+	latdbl = strtod(p, &endptr);
+	if (endptr == p)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid geo4326 point value: \"%s\"", text)));
+	p = endptr;
+
+	while (isspace((unsigned char) *p))
+		p++;
+	if (*p != ')')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid geo4326 point value: \"%s\"", text)));
+
+	*lon = palloc(64);
+	snprintf(*lon, 64, "%.17g", londbl);
+	*lon_len = strlen(*lon);
+
+	*lat = palloc(64);
+	snprintf(*lat, 64, "%.17g", latdbl);
+	*lat_len = strlen(*lat);
+}
+
+/*
  * redisExecForeignUpdate
  *		Update one row in a foreign table
  */
@@ -3281,6 +3438,15 @@ redisExecForeignUpdate(EState *estate,
 				newlong = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
 				newlong_len = strlen(newlong);
 			}
+		}
+		else if (fmstate->table_type == PG_REDIS_GEO4326_TABLE)
+		{
+			/* singleton geo4326: column 2 is the EWKT point text */
+			char	   *point_text = OutputFunctionCall(&fmstate->p_flinfo[flslot], datum);
+
+			redis_parse_geo4326_point(point_text,
+									  &newlong, &newlong_len,
+									  &newlat, &newlat_len);
 		}
 		else if (fmstate->singleton_key ||
 				 fmstate->table_type == PG_REDIS_SCALAR_TABLE)
@@ -3371,6 +3537,7 @@ redisExecForeignUpdate(EState *estate,
 					break;
 				case PG_REDIS_ZSET_TABLE:
 				case PG_REDIS_GEO_TABLE:
+				case PG_REDIS_GEO4326_TABLE:
 					/* geo sets are zsets internally, so ZRANK works too */
 					ereply = redis_command2(context, "ZRANK",
 											fmstate->singleton_key, strlen(fmstate->singleton_key),
@@ -3387,7 +3554,8 @@ redisExecForeignUpdate(EState *estate,
 			if (fmstate->table_type != PG_REDIS_SCALAR_TABLE)
 			{
 				if (fmstate->table_type != PG_REDIS_ZSET_TABLE &&
-					fmstate->table_type != PG_REDIS_GEO_TABLE)
+					fmstate->table_type != PG_REDIS_GEO_TABLE &&
+					fmstate->table_type != PG_REDIS_GEO4326_TABLE)
 					ok = ereply->type == REDIS_REPLY_INTEGER &&
 						ereply->integer == 0;
 				else
@@ -3520,6 +3688,7 @@ redisExecForeignUpdate(EState *estate,
 						freeReplyObject(ereply);
 					}
 					break;
+				case PG_REDIS_GEO4326_TABLE:
 				case PG_REDIS_GEO_TABLE:
 					{
 						const char *argv[5];
@@ -3617,7 +3786,8 @@ redisExecForeignUpdate(EState *estate,
 				ereply = redis_command(context, "HSET",
 									   fmstate->singleton_key, fmstate->singleton_key_len,
 									   key_data, key_len, newval, newval_len);
-			else if (fmstate->table_type == PG_REDIS_GEO_TABLE)
+			else if (fmstate->table_type == PG_REDIS_GEO_TABLE ||
+					 fmstate->table_type == PG_REDIS_GEO4326_TABLE)
 			{
 				const char *argv[5];
 				size_t		argvlen[5];

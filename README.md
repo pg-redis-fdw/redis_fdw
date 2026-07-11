@@ -133,7 +133,7 @@ command:
 
 - **tabletype** as *string*, optional, no default
 
-  Can be `hash`, `list`, `set`, `zset` or `geo`. If not provided only look at scalar values.
+  Can be `hash`, `list`, `set`, `zset`, `geo` or `geo4326`. If not provided only look at scalar values.
 
 - **tablekeyprefix** as *string*, optional, no default
 
@@ -190,13 +190,54 @@ very slightly from what was inserted.
 
 Non-singleton geo tables are not currently supported.
 
+### Geo4326 tables
+
+`tabletype 'geo4326'` is a variant of `geo` that exposes the same
+underlying Redis geospatial index as a table of `(member, point)` rows,
+where `point` is EWKT text such as `SRID=4326;POINT(long lat)` —
+PostGIS's own text representation of a `geometry(Point, 4326)`. This
+makes it simpler to use with PostGIS: no view or trigger is needed,
+just cast the column directly.
+
+```sql
+CREATE FOREIGN TABLE mygeo (value text, point text)
+    SERVER redis_server
+    OPTIONS (database '0', tabletype 'geo4326', singleton_key 'mygeo');
+
+INSERT INTO mygeo (value, point) VALUES ('Palermo', 'SRID=4326;POINT(13.361389 38.115556)');
+
+SELECT value, point::geometry FROM mygeo;
+
+-- distance in metres between two members, using a geography cast
+SELECT a.value, b.value,
+       ST_Distance(a.point::geometry::geography, b.point::geometry::geography) AS metres
+FROM mygeo a, mygeo b
+WHERE a.value = 'Palermo' AND b.value = 'Catania';
+```
+
+A bare WKT point (no `SRID=...;` prefix, e.g. `POINT(13.361389 38.115556)`)
+is also accepted on input, since 4326 is implied. Any other SRID is
+rejected, since `4326` is the only coordinate system that matches what
+`GEOADD`/`GEOPOS` use.
+
+`UPDATE` supports changing the member name, the point, or both at once,
+but — unlike plain `geo` — not just one coordinate: since there's a
+single `point` column instead of separate `lat`/`long` columns, setting
+it always replaces both coordinates together. Renaming a member without
+touching `point` still preserves its position via `GEOPOS`, just as with
+`geo`. The same geohash precision caveat as `geo` applies: a point read
+back may differ very slightly from what was inserted.
+
+Non-singleton geo4326 tables are not currently supported.
+
 #### Using geo tables with PostGIS
 
 `redis_fdw` itself has no PostGIS dependency — geo tables always expose
-plain `double precision` columns. If PostGIS is installed,
-a `geometry(Point, 4326)` view can be layered on top with an
-`INSTEAD OF` trigger, giving full read/write access via
-`ST_Distance`/`ST_DWithin`/etc. without redis_fdw needing to know
+plain `double precision` columns (or, for `geo4326`, plain EWKT text —
+see above for casting that directly to `geometry`). If PostGIS is
+installed, a `geometry(Point, 4326)` view can be layered on top of a
+`geo` table with an `INSTEAD OF` trigger, giving full read/write access
+via `ST_Distance`/`ST_DWithin`/etc. without redis_fdw needing to know
 PostGIS exists:
 
 ```sql

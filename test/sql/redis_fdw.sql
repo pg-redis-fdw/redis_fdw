@@ -478,6 +478,85 @@ select * from db15_geo_no_singleton;
 
 drop foreign table db15_geo_no_singleton;
 
+-- singleton geo4326 table (PostGIS-friendly EWKT variant of geo)
+
+create foreign table db15_w_1key_geo4326(value text, point text)
+       server localredis
+       options (singleton_key 'w_1key_geo4326', tabletype 'geo4326', database '15');
+
+select * from db15_w_1key_geo4326;
+
+insert into db15_w_1key_geo4326 (value, point) values
+       ('Palermo', 'SRID=4326;POINT(13.361389 38.115556)'),
+       ('Catania', 'SRID=4326;POINT(15.087269 37.502669)');
+
+select value,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[1]::numeric, 4) as long,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[2]::numeric, 4) as lat
+from db15_w_1key_geo4326 order by value;
+
+-- duplicate member is rejected
+insert into db15_w_1key_geo4326 (value, point) values ('Palermo', 'SRID=4326;POINT(0 0)');
+
+-- a plain WKT point with no SRID prefix is accepted (SRID 4326 is implied)
+insert into db15_w_1key_geo4326 (value, point) values ('Messina', 'POINT(15.556349 38.193299)');
+
+select value,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[1]::numeric, 4) as long,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[2]::numeric, 4) as lat
+from db15_w_1key_geo4326 order by value;
+
+-- a point with a non-4326 SRID is rejected
+insert into db15_w_1key_geo4326 (value, point) values ('Rome', 'SRID=3857;POINT(1391469 5146449)');
+
+-- malformed point text is rejected
+insert into db15_w_1key_geo4326 (value, point) values ('Bad', 'not a point');
+
+delete from db15_w_1key_geo4326 where value = 'Messina';
+
+-- update the whole point at once (partial-coordinate update, as with plain
+-- geo, isn't meaningful here since there's only one point column)
+update db15_w_1key_geo4326 set point = 'SRID=4326;POINT(14 41)' where value = 'Catania';
+
+select value,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[1]::numeric, 4) as long,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[2]::numeric, 4) as lat
+from db15_w_1key_geo4326 order by value;
+
+-- rename a member; its position must carry over
+update db15_w_1key_geo4326 set value = 'Palermo2' where value = 'Palermo';
+
+select value,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[1]::numeric, 4) as long,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[2]::numeric, 4) as lat
+from db15_w_1key_geo4326 order by value;
+
+-- rename a member and change its point in the same update
+update db15_w_1key_geo4326 set value = 'Catania2', point = 'SRID=4326;POINT(14.5 41.5)' where value = 'Catania';
+
+select value,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[1]::numeric, 4) as long,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[2]::numeric, 4) as lat
+from db15_w_1key_geo4326 order by value;
+
+delete from db15_w_1key_geo4326 where value = 'Palermo2';
+
+select value,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[1]::numeric, 4) as long,
+       round((regexp_match(point, 'POINT\(([-0-9.eE]+) ([-0-9.eE]+)\)'))[2]::numeric, 4) as lat
+from db15_w_1key_geo4326 order by value;
+
+delete from db15_w_1key_geo4326;
+
+-- geo4326 tables require singleton_key
+create foreign table db15_geo4326_no_singleton(key text, point text)
+       server localredis
+       options (tabletype 'geo4326', database '15');
+
+select * from db15_geo4326_no_singleton;
+
+drop foreign table db15_geo4326_no_singleton;
+
 -- non-singleton scalar table no prefix no keyset
 
 create foreign table db15_w_scalar(key text, val text)

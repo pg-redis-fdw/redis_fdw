@@ -133,7 +133,7 @@ command:
 
 - **tabletype** as *string*, optional, no default
 
-  Can be `hash`, `list`, `set`, `zset`, `geo` or `geo4326`. If not provided only look at scalar values.
+  Can be `hash`, `list`, `set`, `zset` or `geo`. If not provided only look at scalar values.
 
 - **tablekeyprefix** as *string*, optional, no default
 
@@ -168,9 +168,19 @@ column for zsets.
 ### Geo tables
 
 `tabletype 'geo'` exposes a Redis [geospatial index](https://redis.io/docs/latest/develop/data-types/geospatial/)
-(a zset under the hood, with each member's score encoding its coordinates)
-as a table of `(member, lat, long)` rows. Only the singleton-key form is
-supported:
+(a zset under the hood, with each member's score encoding its coordinates).
+Only the singleton-key form is supported. The table can be declared in
+either of two shapes, and `redis_fdw` picks the matching behavior from the
+declared columns — there's no separate tabletype for this:
+
+- `(member text, lat double precision, long double precision)` — a row per
+  member with separate coordinate columns.
+- `(member text, point text)` — a row per member with a single EWKT point
+  column such as `SRID=4326;POINT(long lat)`, PostGIS's own text
+  representation of a `geometry(Point, 4326)`. This is simpler to use with
+  PostGIS: no view or trigger is needed, just cast the column directly.
+
+Any other column count or column types on a `geo` table raise an error.
 
 ```sql
 CREATE FOREIGN TABLE mygeo (value text, lat double precision, long double precision)
@@ -182,63 +192,47 @@ INSERT INTO mygeo (value, lat, long) VALUES ('Palermo', 38.115556, 13.361389);
 SELECT * FROM mygeo;
 ```
 
-`UPDATE` supports changing the member name, either coordinate, or both at
-once; updating only one coordinate looks up the other via `GEOPOS` so it's
-preserved. Note that Redis's internal geohash encoding is not perfectly
-exact (sub-meter precision loss), so a coordinate read back may differ
-very slightly from what was inserted.
-
-Non-singleton geo tables are not currently supported.
-
-### Geo4326 tables
-
-`tabletype 'geo4326'` is a variant of `geo` that exposes the same
-underlying Redis geospatial index as a table of `(member, point)` rows,
-where `point` is EWKT text such as `SRID=4326;POINT(long lat)` —
-PostGIS's own text representation of a `geometry(Point, 4326)`. This
-makes it simpler to use with PostGIS: no view or trigger is needed,
-just cast the column directly.
-
 ```sql
-CREATE FOREIGN TABLE mygeo (value text, point text)
+CREATE FOREIGN TABLE mygeo_ewkt (value text, point text)
     SERVER redis_server
-    OPTIONS (database '0', tabletype 'geo4326', singleton_key 'mygeo');
+    OPTIONS (database '0', tabletype 'geo', singleton_key 'mygeo_ewkt');
 
-INSERT INTO mygeo (value, point) VALUES ('Palermo', 'SRID=4326;POINT(13.361389 38.115556)');
+INSERT INTO mygeo_ewkt (value, point) VALUES ('Palermo', 'SRID=4326;POINT(13.361389 38.115556)');
 
-SELECT value, point::geometry FROM mygeo;
+SELECT value, point::geometry FROM mygeo_ewkt;
 
 -- distance in metres between two members, using a geography cast
 SELECT a.value, b.value,
        ST_Distance(a.point::geometry::geography, b.point::geometry::geography) AS metres
-FROM mygeo a, mygeo b
+FROM mygeo_ewkt a, mygeo_ewkt b
 WHERE a.value = 'Palermo' AND b.value = 'Catania';
 ```
 
 A bare WKT point (no `SRID=...;` prefix, e.g. `POINT(13.361389 38.115556)`)
-is also accepted on input, since 4326 is implied. Any other SRID is
-rejected, since `4326` is the only coordinate system that matches what
-`GEOADD`/`GEOPOS` use.
+is also accepted on input for the `point`-column shape, since 4326 is
+implied. Any other SRID is rejected, since `4326` is the only coordinate
+system that matches what `GEOADD`/`GEOPOS` use.
 
-`UPDATE` supports changing the member name, the point, or both at once,
-but — unlike plain `geo` — not just one coordinate: since there's a
-single `point` column instead of separate `lat`/`long` columns, setting
-it always replaces both coordinates together. Renaming a member without
-touching `point` still preserves its position via `GEOPOS`, just as with
-`geo`. The same geohash precision caveat as `geo` applies: a point read
-back may differ very slightly from what was inserted.
+`UPDATE` supports changing the member name, the coordinates, or both at
+once. With the `lat`/`long` shape, updating just one coordinate looks up
+the other via `GEOPOS` so it's preserved; with the `point` shape there's
+only one column to update, so setting it always replaces both coordinates
+together (renaming a member without touching `point` still preserves its
+position via `GEOPOS`). Note that Redis's internal geohash encoding is not
+perfectly exact (sub-meter precision loss), so a coordinate read back may
+differ very slightly from what was inserted.
 
-Non-singleton geo4326 tables are not currently supported.
+Non-singleton geo tables are not currently supported.
 
 #### Using geo tables with PostGIS
 
 `redis_fdw` itself has no PostGIS dependency — geo tables always expose
-plain `double precision` columns (or, for `geo4326`, plain EWKT text —
-see above for casting that directly to `geometry`). If PostGIS is
-installed, a `geometry(Point, 4326)` view can be layered on top of a
-`geo` table with an `INSTEAD OF` trigger, giving full read/write access
-via `ST_Distance`/`ST_DWithin`/etc. without redis_fdw needing to know
-PostGIS exists:
+plain `double precision` columns, or plain EWKT text for the `point`-column
+shape (see above for casting that directly to `geometry`). If PostGIS is
+installed, a `geometry(Point, 4326)` view can be layered on top of the
+`lat`/`long` shape with an `INSTEAD OF` trigger, giving full read/write
+access via `ST_Distance`/`ST_DWithin`/etc. without redis_fdw needing to
+know PostGIS exists:
 
 ```sql
 CREATE VIEW mygeo_postgis AS

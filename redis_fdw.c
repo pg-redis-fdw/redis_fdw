@@ -66,8 +66,10 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "storage/ipc.h"
 
 PG_MODULE_MAGIC;
@@ -304,9 +306,12 @@ static void check_reply(redisReply *reply, redisContext *context,
 /* Connection cache functions */
 static void redis_conn_cache_init(void);
 static void redis_conn_cache_cleanup(int code, Datum arg);
+static void redis_conn_cache_invalidate_callback(Datum arg, int cacheid, uint32 hashvalue);
 static void redis_build_cache_key(RedisConnCacheKey *key, redisTableOptions *options);
 static bool redis_validate_connection(redisContext *context);
 static redisContext *redis_get_connection(redisTableOptions *options);
+static RedisConnCacheEntry *redis_find_cache_entry(redisContext *context);
+static void redis_invalidate_connection(redisContext *context);
 static void redis_release_connection(redisContext *context);
 
 /*
@@ -404,6 +409,46 @@ redis_conn_cache_cleanup(int code, Datum arg)
 }
 
 /*
+ * redis_conn_cache_invalidate_callback
+ *		Syscache callback for FOREIGNSERVEROID/USERMAPPINGOID. The cache is
+ *		keyed by connection option values, not by (serverid, userid), so we
+ *		can't target the invalidation to just the changed object; mark every
+ *		entry invalidated instead. This is cheap and safe for the small
+ *		per-backend cache we maintain here. Entries currently checked out
+ *		elsewhere are not disturbed immediately - redis_get_connection()
+ *		defers the actual reconnect until the entry is no longer in use.
+ */
+static void
+redis_conn_cache_invalidate_callback(Datum arg, int cacheid, uint32 hashvalue)
+{
+	HASH_SEQ_STATUS scan;
+	RedisConnCacheEntry *entry;
+
+	if (!RedisConnCacheInitialized || !RedisConnCache)
+		return;
+
+	hash_seq_init(&scan, RedisConnCache);
+	while ((entry = hash_seq_search(&scan)) != NULL)
+		entry->invalidated = true;
+}
+
+/*
+ * _PG_init
+ *		Module load callback: register for invalidation of cached
+ *		connections when a foreign server or user mapping changes.
+ */
+void
+_PG_init(void)
+{
+	CacheRegisterSyscacheCallback(FOREIGNSERVEROID,
+								   redis_conn_cache_invalidate_callback,
+								   (Datum) 0);
+	CacheRegisterSyscacheCallback(USERMAPPINGOID,
+								   redis_conn_cache_invalidate_callback,
+								   (Datum) 0);
+}
+
+/*
  * redis_build_cache_key
  *		Build a cache key from connection options.
  */
@@ -473,19 +518,33 @@ redis_get_connection(redisTableOptions *options)
 
 	entry = hash_search(RedisConnCache, &key, HASH_ENTER, &found);
 
-	if (found && entry->context && !entry->invalidated)
+	if (found && entry->context)
 	{
-		if (redis_validate_connection(entry->context))
+		if (entry->refcount > 0)
+		{
+			/*
+			 * Still checked out elsewhere. Even if it's invalidated or
+			 * fails a liveness probe, freeing/replacing it here would
+			 * leave the other holder with a dangling pointer (use-after-
+			 * free) and a subsequent double-free when it releases. Hand
+			 * out the same connection and defer any reconnect until the
+			 * entry is no longer in use.
+			 */
+			entry->refcount++;
+			entry->in_use = true;
+			return entry->context;
+		}
+
+		if (!entry->invalidated && redis_validate_connection(entry->context))
 		{
 			entry->refcount++;
 			entry->in_use = true;
 			return entry->context;
 		}
-		else
-		{
-			redisFree(entry->context);
-			entry->context = NULL;
-		}
+
+		/* Not referenced anywhere else, so it's safe to discard. */
+		redisFree(entry->context);
+		entry->context = NULL;
 	}
 
 	context = redisConnectWithTimeout(
@@ -572,32 +631,69 @@ redis_get_connection(redisTableOptions *options)
 }
 
 /*
- * redis_release_connection
- *		Release a connection back to the cache.
+ * redis_find_cache_entry
+ *		Find the cache entry currently holding the given connection, if any.
  */
-static void
-redis_release_connection(redisContext *context)
+static RedisConnCacheEntry *
+redis_find_cache_entry(redisContext *context)
 {
 	HASH_SEQ_STATUS scan;
 	RedisConnCacheEntry *entry;
 
-	if (!context || !RedisConnCacheInitialized)
-		return;
+	if (!context || !RedisConnCacheInitialized || !RedisConnCache)
+		return NULL;
 
 	hash_seq_init(&scan, RedisConnCache);
 	while ((entry = hash_seq_search(&scan)) != NULL)
 	{
 		if (entry->context == context)
 		{
-			entry->refcount--;
-			if (entry->refcount <= 0)
-			{
-				entry->in_use = false;
-				entry->refcount = 0;
-			}
 			hash_seq_term(&scan);
-			return;
+			return entry;
 		}
+	}
+
+	return NULL;
+}
+
+/*
+ * redis_invalidate_connection
+ *		Mark the cache entry holding this connection invalidated, so it is
+ *		discarded and reconnected on its next checkout (once no longer in
+ *		use). Used when a command fails at the I/O level, indicating the
+ *		underlying socket is no longer usable.
+ */
+static void
+redis_invalidate_connection(redisContext *context)
+{
+	RedisConnCacheEntry *entry = redis_find_cache_entry(context);
+
+	if (entry)
+		entry->invalidated = true;
+}
+
+/*
+ * redis_release_connection
+ *		Release a connection back to the cache.
+ */
+static void
+redis_release_connection(redisContext *context)
+{
+	RedisConnCacheEntry *entry;
+
+	if (!context || !RedisConnCacheInitialized)
+		return;
+
+	entry = redis_find_cache_entry(context);
+	if (entry)
+	{
+		entry->refcount--;
+		if (entry->refcount <= 0)
+		{
+			entry->in_use = false;
+			entry->refcount = 0;
+		}
+		return;
 	}
 
 	/* Connection not found in cache - shouldn't happen, but free it */
@@ -1016,6 +1112,7 @@ redisGetForeignRelSize(PlannerInfo *root,
 
 	if (!reply)
 	{
+		redis_invalidate_connection(context);
 		redis_release_connection(context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
@@ -1161,6 +1258,7 @@ redisExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	if (!reply)
 	{
+		redis_invalidate_connection(festate->context);
 		redis_release_connection(festate->context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
@@ -1309,6 +1407,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 								  festate->keyset, qual_value);
 			if (!sreply)
 			{
+				redis_invalidate_connection(festate->context);
 				redis_release_connection(festate->context);
 				ereport(ERROR,
 						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
@@ -1373,6 +1472,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 
 	if (!reply)
 	{
+		redis_invalidate_connection(festate->context);
 		redis_release_connection(festate->context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
@@ -1587,6 +1687,7 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 			if (!reply)
 			{
 				freeReplyObject(festate->reply);
+				redis_invalidate_connection(festate->context);
 				redis_release_connection(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 						 errmsg("failed to get the value for key \"%s\": %s",
@@ -2223,7 +2324,9 @@ check_reply(redisReply *reply, redisContext *context, int error_code, char *mess
 	if (!reply)
 	{
 		err = pstrdup(context->errstr);
-		/* Don't free context here - let the cache handle it */
+		/* Don't free context here - mark it invalidated so the cache
+		 * discards and reconnects it on the next checkout. */
+		redis_invalidate_connection(context);
 	}
 	else if (reply->type == REDIS_REPLY_ERROR)
 	{

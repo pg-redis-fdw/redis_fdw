@@ -1468,6 +1468,36 @@ reset enable_hashjoin;
 reset enable_nestloop;
 drop table joinupd_src;
 drop foreign table db15_joinupd;
+-- Regression test for the connection cache (concache):
+-- - a self-join forces two concurrently-open ForeignScans to share the same
+--   cached connection (same connection options => same cache key); this
+--   must not crash or corrupt results (guards against use-after-free /
+--   double-free if a scan invalidates the shared connection while another
+--   scan still holds it)
+-- - ALTER SERVER must not crash the invalidation callback, and the
+--   connection must keep working afterwards (even though the actual
+--   address value here is unchanged, this exercises the FOREIGNSERVEROID
+--   syscache invalidation path)
+create foreign table db15_cachetest(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'cachetest_');
+insert into db15_cachetest values
+       ('cachetest_a', '1'), ('cachetest_b', '2'), ('cachetest_c', '3');
+select count(*) from db15_cachetest t1 join db15_cachetest t2
+       on t1.key <> t2.key;
+ count 
+-------
+     6
+(1 row)
+
+alter server localredis options (add address '127.0.0.1');
+select value from db15_cachetest where key = 'cachetest_a';
+ value 
+-------
+ 1
+(1 row)
+
+drop foreign table db15_cachetest;
 -- all done, so now blow everything in the db away again
 \! redis-cli < test/sql/redis_clean
 OK

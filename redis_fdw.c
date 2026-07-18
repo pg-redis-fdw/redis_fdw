@@ -2585,11 +2585,10 @@ redis_command_impl(redisContext *context,
 /*
  * redis_command1_impl / redis_command2_impl
  *		Execute a Redis command with 1 or 2 binary-safe arguments after the
- *		command name, via redisCommandArgv. redis_command_impl() above can't
- *		express these shapes (it always appends a mandatory "data" argument),
- *		which is why some call sites were left using unsafe %s-interpolated
- *		redisCommand() after the redisCommandArgv migration - use these for
- *		commands like "EXISTS key", "SISMEMBER key member", "RENAME key newkey".
+ *		command name, via redisCommandArgv. Use these for commands like
+ *		"EXISTS key", "SISMEMBER key member", "RENAME key newkey" -
+ *		redis_command_impl() above always appends a mandatory "data"
+ *		argument, so it can't express these shapes.
  */
 static redisReply *
 redis_command1_impl(redisContext *context,

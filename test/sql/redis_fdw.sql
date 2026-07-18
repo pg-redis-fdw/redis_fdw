@@ -1359,6 +1359,42 @@ insert into db15_bytea_list values
 
 select length(val), val from db15_bytea_list;
 
+-- regression test: bytea key column on a non-singleton table must be
+-- rejected for DELETE too, not just INSERT/UPDATE. Before the fix, DELETE
+-- skipped this check entirely and sent the escaped-text representation of
+-- the key to Redis's DEL command instead of the real binary key, so the
+-- delete would silently affect 0 keys while PostgreSQL reported success.
+
+create foreign table db15_bytea_key_ns(key bytea, val text)
+       server localredis
+       options (database '15');
+
+delete from db15_bytea_key_ns where key = E'anything'::bytea; -- bytea key error
+
+drop foreign table db15_bytea_key_ns;
+
+-- regression test: updating a singleton set member to a bytea value that
+-- already exists in the set must be rejected as a duplicate. Before the
+-- fix, the pre-flight SISMEMBER check used a text sentinel ("") instead of
+-- the real new member bytes, so it always reported "not found" and let the
+-- update through regardless of whether the new value already existed.
+
+create foreign table db15_bytea_set_dup(member bytea)
+       server localredis
+       options (singleton_key 'bytea_set_dup', tabletype 'set', database '15');
+
+insert into db15_bytea_set_dup values
+    (E'dup\\000existing'::bytea), (E'other\\000member'::bytea);
+
+update db15_bytea_set_dup set member = E'dup\\000existing'::bytea
+       where member = E'other\\000member'::bytea; -- must fail: key already exists
+
+select length(member), member from db15_bytea_set_dup order by member;
+
+delete from db15_bytea_set_dup;
+
+drop foreign table db15_bytea_set_dup;
+
 -- clean up bytea tests
 \! redis-cli < test/sql/redis_clean
 

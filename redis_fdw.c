@@ -2707,6 +2707,19 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 		 */
 		fmstate->val_types[0] = classify_type(attr->atttypid);
 
+		/*
+		 * bytea key column not allowed for non-singleton tables. The
+		 * INSERT/UPDATE loop below also checks this for its own target
+		 * columns, but that loop doesn't run for DELETE, and a bytea key
+		 * sent through the escaped-text OutputFunctionCall path (instead
+		 * of the real binary bytes) would make DEL silently no-op while
+		 * PostgreSQL reports success.
+		 */
+		if (fmstate->val_types[0] == REDIS_VAL_BYTEA && !fmstate->singleton_key)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("bytea key column not supported")));
+
 		getTypeOutputInfo(attr->atttypid, &typefnoid, &isvarlena);
 		fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
 		fmstate->p_nums++;
@@ -2750,8 +2763,13 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 			fmstate->val_types[fmstate->p_nums] = classify_type(attr->atttypid);
 			if (fmstate->val_types[fmstate->p_nums] == REDIS_VAL_BYTEA)
 			{
-				/* bytea key column not allowed for non-singleton tables */
-				if (attnum == 1 && !fmstate->singleton_key)
+				/*
+				 * bytea key column not allowed for non-singleton tables.
+				 * For CMD_UPDATE this is already checked above (key
+				 * classification runs for both CMD_UPDATE and CMD_DELETE);
+				 * only CMD_INSERT still needs it here.
+				 */
+				if (attnum == 1 && !fmstate->singleton_key && op == CMD_INSERT)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("bytea key column not supported")));
@@ -3746,17 +3764,17 @@ redisExecForeignUpdate(EState *estate,
 				case PG_REDIS_SET_TABLE:
 					ereply = redis_command2(context, "SISMEMBER",
 											fmstate->singleton_key, strlen(fmstate->singleton_key),
-											newkey, strlen(newkey));
+											newkey_data, newkey_len);
 					break;
 				case PG_REDIS_ZSET_TABLE:
 					ereply = redis_command2(context, "ZRANK",
 											fmstate->singleton_key, strlen(fmstate->singleton_key),
-											newkey, strlen(newkey));
+											newkey_data, newkey_len);
 					break;
 				case PG_REDIS_HASH_TABLE:
 					ereply = redis_command2(context, "HEXISTS",
 											fmstate->singleton_key, strlen(fmstate->singleton_key),
-											newkey, strlen(newkey));
+											newkey_data, newkey_len);
 					break;
 				default:
 					break;

@@ -767,6 +767,21 @@ delete from db15_w_zset_pfx;
 
 select * from db15_w_zset_pfx;
 
+-- non-singleton zset table with a 3rd scores column: insert names only
+-- the key and value columns, leaving scores to be populated by Redis
+
+create foreign table db15_w_zset_pfx_scores(key text, val text[], scores numeric[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'w_zset_');
+
+insert into db15_w_zset_pfx_scores (key, val) values ('w_zset_a','{b,c,d}');
+
+select key, cardinality(val), cardinality(scores) from db15_w_zset_pfx_scores order by key;
+
+delete from db15_w_zset_pfx_scores;
+
+drop foreign table db15_w_zset_pfx_scores;
+
 -- non-singleton zset table keyset
 
 create foreign table db15_w_zset_kset(key text, val text[])

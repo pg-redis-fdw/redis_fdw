@@ -380,6 +380,8 @@ static redisReply *redis_command2_impl(redisContext *context,
 #define redis_command2(ctx, cmd, arg1, arg1_len, arg2, arg2_len) \
 	redis_command2_impl(ctx, cmd, sizeof(cmd) - 1, arg1, arg1_len, arg2, arg2_len)
 static inline redis_val_type classify_type(Oid typid);
+static inline bool redis_zset_has_scores_column(redis_table_type table_type,
+									const char *singleton_key, int natts);
 static void get_datum_as_string(Datum datum, redis_val_type valtype,
 						FmgrInfo *flinfo, const char **data, size_t *len);
 
@@ -1566,9 +1568,9 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	 * a parallel array of scores, alongside the usual key and members-array
 	 * columns.
 	 */
-	festate->with_scores = (festate->table_type == PG_REDIS_ZSET_TABLE &&
-							!festate->singleton_key &&
-							node->ss.ss_currentRelation->rd_att->natts == 3);
+	festate->with_scores = redis_zset_has_scores_column(festate->table_type,
+														 festate->singleton_key,
+														 node->ss.ss_currentRelation->rd_att->natts);
 
 	festate->qual_value = pushdown ? qual_value : NULL;
 
@@ -2953,12 +2955,19 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 						 errmsg("table has incorrect number of columns: %d for type %d", fmstate->p_nums, table_options.table_type)
 						 ));
 		}
-		else if (fmstate->p_nums != 2)
+		else
 		{
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("table has incorrect number of columns")
-					 ));
+			int			expected_cols;
+
+			expected_cols = redis_zset_has_scores_column(table_options.table_type,
+														  table_options.singleton_key,
+														  RelationGetDescr(rel)->natts) ? 3 : 2;
+
+			if (fmstate->p_nums != expected_cols)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("table has incorrect number of columns")
+						 ));
 		}
 	}
 	else if (op == CMD_UPDATE)
@@ -3150,6 +3159,21 @@ classify_type(Oid typid)
 		default:
 			return REDIS_VAL_OTHER;
 	}
+}
+
+/*
+ * redis_zset_has_scores_column
+ *		A non-singleton zset table may declare a 3rd column holding a
+ *		parallel array of member scores, alongside the usual key and
+ *		members-array columns.
+ */
+static inline bool
+redis_zset_has_scores_column(redis_table_type table_type,
+							  const char *singleton_key, int natts)
+{
+	return table_type == PG_REDIS_ZSET_TABLE &&
+		!singleton_key &&
+		natts == 3;
 }
 
 /*

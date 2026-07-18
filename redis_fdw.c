@@ -1257,6 +1257,34 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 
 	if (!table_options->database)
 		table_options->database = 0;
+
+	/*
+	 * Validate the declared column count against what this table type's
+	 * scan/modify code expects, before it's used to size any array. The
+	 * foreign table's relation is already open (and locked) by the caller
+	 * in every context redisGetOptions is invoked from, so this just
+	 * borrows that lock.
+	 */
+	{
+		Relation	rel = table_open(foreigntableid, NoLock);
+		int			natts = RelationGetDescr(rel)->natts;
+		bool		valid;
+
+		if (table_options->table_type == PG_REDIS_ZSET_TABLE)
+			valid = table_options->singleton_key ?
+				(natts == 1 || natts == 2) : (natts == 2 || natts == 3);
+		else if (table_options->table_type == PG_REDIS_HASH_TABLE)
+			valid = (natts == 2);
+		else	/* PG_REDIS_SCALAR_TABLE, PG_REDIS_SET_TABLE, PG_REDIS_LIST_TABLE */
+			valid = table_options->singleton_key ? (natts == 1) : (natts == 2);
+
+		table_close(rel, NoLock);
+
+		if (!valid)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("table has incorrect number of columns")));
+	}
 }
 
 /*

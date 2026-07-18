@@ -2864,7 +2864,6 @@ redisExecForeignInsert(EState *estate,
 	}
 	else /* if not a singleton key table */
 	{
-		char	   *valueval = NULL;
 		int			nitems;
 		Datum	   *elements;
 		bool	   *nulls;
@@ -2897,8 +2896,9 @@ redisExecForeignInsert(EState *estate,
 
 		/* make sure the key has the right prefix, if any */
 		if (fmstate->keyprefix &&
-			strncmp(key_data, fmstate->keyprefix,
-					fmstate->keyprefix_len) != 0)
+			(key_len < fmstate->keyprefix_len ||
+			 strncmp(key_data, fmstate->keyprefix,
+					 fmstate->keyprefix_len) != 0))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("key '%s' does not match table key prefix '%s'",
@@ -2929,7 +2929,6 @@ redisExecForeignInsert(EState *estate,
 
 		if (fmstate->table_type == PG_REDIS_SCALAR_TABLE)
 		{
-			/* valueval not needed - we use get_datum_as_string below */
 		}
 		else
 		{
@@ -3103,7 +3102,7 @@ redisExecForeignInsert(EState *estate,
 									keyval, strlen(keyval));
 			check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-						"could not add keyset element %s", valueval);
+						"could not add keyset element %s", keyval);
 			freeReplyObject(sreply);
 		}
 	}

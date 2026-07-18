@@ -958,16 +958,10 @@ insert into db15_w_nulls_multi values ('k', null);
 drop foreign table db15_w_nulls_hash;
 drop foreign table db15_w_nulls_zset;
 drop foreign table db15_w_nulls_multi;
--- Regression test for the connection cache (concache):
--- - a self-join forces two concurrently-open ForeignScans to share the same
---   cached connection (same connection options => same cache key); this
---   must not crash or corrupt results (guards against use-after-free /
---   double-free if a scan invalidates the shared connection while another
---   scan still holds it)
--- - ALTER SERVER must not crash the invalidation callback, and the
---   connection must keep working afterwards (even though the actual
---   address value here is unchanged, this exercises the FOREIGNSERVEROID
---   syscache invalidation path)
+-- a self-join opens two concurrent ForeignScans sharing the same cache key
+-- (same connection options); results must be correct regardless.
+-- ALTER SERVER (even a no-op value change) exercises the connection cache's
+-- invalidation path; queries against the table must keep working afterwards.
 
 create foreign table db15_cachetest(key text, value text)
        server localredis

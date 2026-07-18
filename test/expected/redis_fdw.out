@@ -1543,16 +1543,10 @@ drop foreign table db15_glob_star;
 drop foreign table db15_glob_quest;
 drop foreign table db15_glob_class;
 drop foreign table db15_glob_plain;
--- Regression test for the connection cache (concache):
--- - a self-join forces two concurrently-open ForeignScans to share the same
---   cached connection (same connection options => same cache key); this
---   must not crash or corrupt results (guards against use-after-free /
---   double-free if a scan invalidates the shared connection while another
---   scan still holds it)
--- - ALTER SERVER must not crash the invalidation callback, and the
---   connection must keep working afterwards (even though the actual
---   address value here is unchanged, this exercises the FOREIGNSERVEROID
---   syscache invalidation path)
+-- a self-join opens two concurrent ForeignScans sharing the same cache key
+-- (same connection options); results must be correct regardless.
+-- ALTER SERVER (even a no-op value change) exercises the connection cache's
+-- invalidation path; queries against the table must keep working afterwards.
 create foreign table db15_cachetest(key text, value text)
        server localredis
        options (database '15', tablekeyprefix 'cachetest_');

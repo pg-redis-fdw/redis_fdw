@@ -786,6 +786,49 @@ delete from db15_w_zset_pfx_scores;
 
 drop foreign table db15_w_zset_pfx_scores;
 
+-- a table declared with the wrong number of columns for its type/shape is
+-- rejected on first use, for every table type this FDW supports
+
+create foreign table db15_set_bad_shape(key text, value text, extra text)
+       server localredis
+       options (tabletype 'set', tablekeyprefix 'set_bad_', database '15');
+
+select * from db15_set_bad_shape;
+
+drop foreign table db15_set_bad_shape;
+
+create foreign table db15_list_bad_shape(key text, value text, extra text)
+       server localredis
+       options (tabletype 'list', tablekeyprefix 'list_bad_', database '15');
+
+select * from db15_list_bad_shape;
+
+drop foreign table db15_list_bad_shape;
+
+create foreign table db15_hash_bad_shape(key text, value text, extra text)
+       server localredis
+       options (tabletype 'hash', tablekeyprefix 'hash_bad_', database '15');
+
+select * from db15_hash_bad_shape;
+
+drop foreign table db15_hash_bad_shape;
+
+create foreign table db15_zset_bad_shape(key text, value text, extra text, extra2 text)
+       server localredis
+       options (tabletype 'zset', tablekeyprefix 'zset_bad_', database '15');
+
+select * from db15_zset_bad_shape;
+
+drop foreign table db15_zset_bad_shape;
+
+create foreign table db15_singleton_scalar_bad_shape(a text, b text)
+       server localredis
+       options (singleton_key 'bad_singleton', database '15');
+
+select * from db15_singleton_scalar_bad_shape;
+
+drop foreign table db15_singleton_scalar_bad_shape;
+
 -- non-singleton zset table keyset
 
 create foreign table db15_w_zset_kset(key text, val text[])

@@ -440,9 +440,8 @@ insert into db15_w_scalar_pfx values ('w_scalar_a','b'), ('w_scalar_c','d'),('w_
 
 insert into db15_w_scalar_pfx values ('x','y'); -- prefix error
 
--- regression test for an out-of-bounds heap read: a key that is a genuine
--- (but shorter) prefix of the table's configured key prefix must not be
--- compared past the key's own length
+-- a key that is a genuine (but shorter) prefix of the table's configured
+-- key prefix must still be rejected as a mismatch
 insert into db15_w_scalar_pfx values ('w','y'); -- prefix error, key shorter than prefix
 
 insert into db15_w_scalar_pfx values ('w_scalar_a','x'); -- dup error
@@ -472,9 +471,7 @@ delete from db15_w_scalar_pfx;
 
 select * from db15_w_scalar_pfx order by key;
 
--- regression test for a name-typed column: classify_type() must not treat
--- "name" as a varlena (it's a fixed 64-byte NUL-padded buffer, not one),
--- or reading/writing it reinterprets its raw bytes as a varlena header
+-- a name-typed key column round-trips correctly
 
 create foreign table db15_nametest(key name, val text)
        server localredis

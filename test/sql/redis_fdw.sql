@@ -440,6 +440,10 @@ delete from db15_w_1key_geo where value = 'Palermo2';
 select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
 from db15_w_1key_geo order by value;
 
+-- NULL coordinates are rejected, not silently stored as 0 (and not a crash)
+insert into db15_w_1key_geo (value, lat, long) values ('NullLat', NULL, 5);
+insert into db15_w_1key_geo (value, lat, long) values ('NullLong', 5, NULL);
+
 delete from db15_w_1key_geo;
 
 -- geo tables require singleton_key
@@ -485,6 +489,9 @@ insert into db15_w_1key_geo_ewkt (value, point) values ('Rome', 'SRID=3857;POINT
 
 -- malformed point text is rejected
 insert into db15_w_1key_geo_ewkt (value, point) values ('Bad', 'not a point');
+
+-- a NULL point is rejected (regression: previously a NULL-pointer crash)
+insert into db15_w_1key_geo_ewkt (value, point) values ('Null', NULL);
 
 delete from db15_w_1key_geo_ewkt where value = 'Messina';
 

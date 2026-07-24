@@ -707,6 +707,11 @@ from db15_w_1key_geo order by value;
  Catania2 | 42.0000 | 14.0000
 (1 row)
 
+-- NULL coordinates are rejected, not silently stored as 0 (and not a crash)
+insert into db15_w_1key_geo (value, lat, long) values ('NullLat', NULL, 5);
+ERROR:  cannot insert NULL coordinates into a Redis geo table
+insert into db15_w_1key_geo (value, lat, long) values ('NullLong', 5, NULL);
+ERROR:  cannot insert NULL coordinates into a Redis geo table
 delete from db15_w_1key_geo;
 -- geo tables require singleton_key
 create foreign table db15_geo_no_singleton(key text, lat double precision, long double precision)
@@ -760,6 +765,9 @@ ERROR:  unsupported SRID 3857 in geo point value: only 4326 is supported
 -- malformed point text is rejected
 insert into db15_w_1key_geo_ewkt (value, point) values ('Bad', 'not a point');
 ERROR:  invalid geo point value: "not a point"
+-- a NULL point is rejected (regression: previously a NULL-pointer crash)
+insert into db15_w_1key_geo_ewkt (value, point) values ('Null', NULL);
+ERROR:  cannot insert a NULL value into a Redis foreign table
 delete from db15_w_1key_geo_ewkt where value = 'Messina';
 -- update the whole point at once (partial-coordinate update, as with plain
 -- geo, isn't meaningful here since there's only one point column)

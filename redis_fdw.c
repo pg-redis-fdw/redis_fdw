@@ -2768,11 +2768,21 @@ redisExecForeignInsert(EState *estate,
 			(fmstate->table_type == PG_REDIS_GEO_TABLE && fmstate->geo_ewkt))
 		{
 			extra = slot_getattr(slot, 2, &isnull);	/* score / value / point */
+			if (isnull)
+				ereport(ERROR,
+						(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+						 errmsg("cannot insert a NULL value into a Redis foreign table")));
 		}
 		else if (fmstate->table_type == PG_REDIS_GEO_TABLE)
 		{
-			extra = slot_getattr(slot, 2, &isnull);	/* lat */
-			extra2 = slot_getattr(slot, 3, &isnull);	/* long */
+			bool		isnull2;
+
+			extra = slot_getattr(slot, 2, &isnull);		/* lat */
+			extra2 = slot_getattr(slot, 3, &isnull2);	/* long */
+			if (isnull || isnull2)
+				ereport(ERROR,
+						(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+						 errmsg("cannot insert NULL coordinates into a Redis geo table")));
 		}
 
 		switch (fmstate->table_type)

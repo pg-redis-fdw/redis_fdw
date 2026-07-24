@@ -291,6 +291,17 @@ update db15_w_1key_hash set key = 'w' where key = 'e';
 
 select * from db15_w_1key_hash order by key;
 
+-- a key-only UPDATE re-stores the existing value using its full Redis length,
+-- so a value containing an embedded NUL must survive byte-for-byte (copying it
+-- with pstrdup would truncate at the NUL while the length stayed full, reading
+-- past the buffer and corrupting the value).  Seed a binary value plus a
+-- pristine copy directly in Redis, rename the field via the FDW, then compare
+-- server-side.
+\! printf 'ab\000cdefghij' | redis-cli -n 15 -x hset w_1key_hash binkey
+\! printf 'ab\000cdefghij' | redis-cli -n 15 -x hset w_1key_hash binkey_orig
+update db15_w_1key_hash set key = 'binkey2' where key = 'binkey';
+\! redis-cli -n 15 eval "return (redis.call('HGET',KEYS[1],ARGV[1]) == redis.call('HGET',KEYS[1],ARGV[2])) and 'value preserved' or 'value CORRUPTED'" 1 w_1key_hash binkey2 binkey_orig
+
 -- singleton list
 
 create foreign table db15_w_1key_list(val text)

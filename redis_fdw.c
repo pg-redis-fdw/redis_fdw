@@ -3492,8 +3492,15 @@ redisExecForeignUpdate(EState *estate,
 							check_reply(ereply, context, RTYPE(REDIS_REPLY_STRING),
 									  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 										"getting score for key %s", keyval);
-							priority = pstrdup(ereply->str);
+							/*
+							 * Copy by length, not pstrdup: a Redis value is
+							 * binary and may contain NULs, which pstrdup would
+							 * truncate while priority_len kept the full length,
+							 * making ZADD read past the allocation.
+							 */
 							priority_len = ereply->len;
+							priority = palloc(priority_len);
+							memcpy(priority, ereply->str, priority_len);
 							freeReplyObject(ereply);
 						}
 						else
@@ -3535,8 +3542,15 @@ redisExecForeignUpdate(EState *estate,
 							check_reply(ereply, context, RTYPE(REDIS_REPLY_STRING),
 									  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 										"fetching value for key %s", keyval);
-							nval = pstrdup(ereply->str);
+							/*
+							 * Copy by length, not pstrdup: a Redis hash value
+							 * is binary and may contain NULs, which pstrdup
+							 * would truncate while nval_len kept the full
+							 * length, making HSET read past the allocation.
+							 */
 							nval_len = ereply->len;
+							nval = palloc(nval_len);
+							memcpy(nval, ereply->str, nval_len);
 							freeReplyObject(ereply);
 						}
 						else

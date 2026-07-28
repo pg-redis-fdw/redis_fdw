@@ -931,6 +931,34 @@ reset enable_nestloop;
 drop table joinupd_src;
 drop foreign table db15_joinupd;
 
+-- NULL key or value must be rejected with an error, not crash the backend.
+
+create foreign table db15_w_nulls_hash(key text, val text)
+       server localredis
+       options (singleton_key 'w_nulls_hash', tabletype 'hash', database '15');
+
+insert into db15_w_nulls_hash values (null, 'v');
+
+insert into db15_w_nulls_hash values ('k', null);
+
+create foreign table db15_w_nulls_zset(val text, score numeric)
+       server localredis
+       options (singleton_key 'w_nulls_zset', tabletype 'zset', database '15');
+
+insert into db15_w_nulls_zset values ('m', null);
+
+create foreign table db15_w_nulls_multi(key text, val text)
+       server localredis
+       options (tabletype 'hash', database '15');
+
+insert into db15_w_nulls_multi values (null, 'v');
+
+insert into db15_w_nulls_multi values ('k', null);
+
+drop foreign table db15_w_nulls_hash;
+drop foreign table db15_w_nulls_zset;
+drop foreign table db15_w_nulls_multi;
+
 -- all done, so now blow everything in the db away again
 
 \! redis-cli < test/sql/redis_clean

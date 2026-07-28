@@ -2113,6 +2113,11 @@ redisExecForeignInsert(EState *estate,
 #endif
 
 	key = slot_getattr(slot, 1, &isnull);
+	if (isnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("cannot insert NULL key into a Redis table")
+				 ));
 	keyval = OutputFunctionCall(&fmstate->p_flinfo[0], key);
 
 	if (fmstate->singleton_key)
@@ -2187,6 +2192,11 @@ redisExecForeignInsert(EState *estate,
 			Datum		extra;
 
 			extra = slot_getattr(slot, 2, &isnull);
+			if (isnull)
+				ereport(ERROR,
+						(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+						 errmsg("cannot insert NULL value into a Redis table")
+						 ));
 			extraval = OutputFunctionCall(&fmstate->p_flinfo[1], extra);
 		}
 

@@ -334,6 +334,12 @@ Limitations
   keys and then fetch each value. So, we get a list of keys to begin with,
   and then fetch whatever records still exist as we build the tuples.
 
+- Nothing written to Redis is transactional. A statement that fails partway
+  through may already have applied some of its writes, and neither the failed
+  statement nor a surrounding `ROLLBACK` undoes them. If a statement against a
+  Redis foreign table errors, treat the affected keys as being in an unknown
+  state and repair them explicitly.
+
 - We can only push down a single qual to Redis, which must use the
   `TEXTEQ` operator, and must be on the `key` column.
 

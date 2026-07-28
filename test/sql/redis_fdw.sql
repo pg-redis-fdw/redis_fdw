@@ -1023,6 +1023,49 @@ drop foreign table db15_glob_star;
 drop foreign table db15_glob_quest;
 drop foreign table db15_glob_class;
 drop foreign table db15_glob_plain;
+-- An aborted statement must not wedge the backend's Redis connection.
+-- The abort skips the executor End nodes, so anything the FDW expects those
+-- nodes to clean up is never cleaned up; a connection cache that relies on
+-- them will hand out a dead socket for the rest of the session.
+
+create foreign table db15_conntest(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'conntest_');
+
+insert into db15_conntest values ('conntest_a', 'notanumber');
+
+-- abort a statement partway through a scan
+select value::int from db15_conntest;
+
+-- Kill the backend's cached Redis connection from the server side. CLIENT
+-- KILL defaults to SKIPME yes, so redis-cli spares its own connection. Like
+-- the rest of this suite, this assumes redis-cli runs on the same host as
+-- the PostgreSQL server.
+\! redis-cli CLIENT KILL TYPE normal > /dev/null
+
+-- must reconnect rather than reuse the dead socket
+select value from db15_conntest;
+
+-- A connection lost mid-transaction is re-established without ending the
+-- transaction, and a subtransaction abort needs no special handling.
+begin;
+select value from db15_conntest;
+\! redis-cli CLIENT KILL TYPE normal > /dev/null
+savepoint s;
+-- the error text comes from hiredis and varies by version, so normalise it
+do $$
+begin
+  perform value from db15_conntest;
+  raise notice 'unexpectedly succeeded on a dead socket';
+exception when others then
+  raise notice 'connection loss detected';
+end
+$$;
+rollback to s;
+select value from db15_conntest;
+commit;
+
+drop foreign table db15_conntest;
 
 -- all done, so now blow everything in the db away again
 

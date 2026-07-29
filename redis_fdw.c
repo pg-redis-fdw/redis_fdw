@@ -270,6 +270,7 @@ static void redisGetOptions(Oid foreigntableid, redisTableOptions *options);
 static void redisGetQual(Node *node, TupleDesc tupdesc, char **key,
 						 char **value, bool *pushdown);
 static char *process_redis_array(redisReply *reply, redis_table_type type);
+static char *redis_escape_glob(const char *str);
 static void check_reply(redisReply *reply, redisContext *context,
 						int error_code, char *message, char *arg);
 
@@ -644,6 +645,34 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
  *		HLEN, LLEN, SCARD, ZCARD or DBSIZE Redis command
  *		returns baserel->rows
  */
+/*
+ * redis_escape_glob
+ *		Escape the Redis pattern metacharacters in a literal string, so that
+ *		it matches only itself when embedded in a KEYS or SCAN MATCH pattern.
+ *
+ *		Redis's matcher treats '*', '?' and '[' specially and uses '\' as its
+ *		escape character, so each of those has to be backslash-escaped. A
+ *		tablekeyprefix is a literal prefix rather than a pattern, so it must
+ *		be escaped before the trailing '*' is appended to it.
+ */
+static char *
+redis_escape_glob(const char *str)
+{
+	size_t		len = strlen(str);
+	char	   *result = palloc(len * 2 + 1);
+	char	   *dst = result;
+
+	while (*str)
+	{
+		if (*str == '*' || *str == '?' || *str == '[' || *str == '\\')
+			*dst++ = '\\';
+		*dst++ = *str++;
+	}
+	*dst = '\0';
+
+	return result;
+}
+
 static void
 redisGetForeignRelSize(PlannerInfo *root,
 					   RelOptInfo *baserel,
@@ -722,10 +751,11 @@ redisGetForeignRelSize(PlannerInfo *root,
 	if (table_options.keyprefix)
 	{
 		/* it's a pity there isn't an NKEYS command in Redis */
-		int			len = strlen(table_options.keyprefix) + 2;
+		char	   *escaped = redis_escape_glob(table_options.keyprefix);
+		int			len = strlen(escaped) + 2;
 		char	   *buff = palloc(len * sizeof(char));
 
-		snprintf(buff, len, "%s*", table_options.keyprefix);
+		snprintf(buff, len, "%s*", escaped);
 		reply = redisCommand(context, "KEYS %s", buff);
 	}
 	else
@@ -1164,7 +1194,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		{
 			festate->cursor_search_string = "SCAN %s MATCH %s*" COUNT;
 			reply = redisCommand(context, festate->cursor_search_string,
-								 ZERO, festate->keyprefix);
+								 ZERO, redis_escape_glob(festate->keyprefix));
 		}
 		else
 		{
@@ -1288,7 +1318,8 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 		{
 			creply = redisCommand(festate->context,
 								  festate->cursor_search_string,
-								  festate->cursor_id, festate->keyprefix);
+								  festate->cursor_id,
+								  redis_escape_glob(festate->keyprefix));
 		}
 		else
 		{

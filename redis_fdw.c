@@ -222,6 +222,10 @@ typedef struct RedisFdwModifyState
 	int			p_nums;
 	int			keyAttno;
 	Oid			array_elem_type;
+	bool		with_scores;	/* non-singleton zset table with a 3rd
+								 * scores-array column */
+	Oid			scores_elem_type;	/* element type of that scores array */
+	int			scores_pidx;	/* its index in p_flinfo/val_types, or -1 */
 	FmgrInfo   *p_flinfo;
 	redis_val_type *val_types;	/* column value type categories */
 } RedisFdwModifyState;
@@ -230,6 +234,21 @@ typedef struct RedisFdwModifyState
 #define ZERO "0"
 /* redis default is 10 - let's fetch 1000 at a time */
 #define COUNT " COUNT 1000"
+
+/*
+ * Prefix for the staging key a zset UPDATE rebuilds into before swapping it
+ * in with RENAME (see redisExecForeignUpdate).  The backend pid is folded
+ * into the key (built at the use site) so concurrent updates of the same
+ * row use different staging keys rather than racing to reuse one.
+ *
+ * The prefix goes in front rather than behind the real key name so it can
+ * never satisfy a tablekeyprefix- or tablekeyset-restricted scan for that
+ * key.  It is not hidden from a plain, unrestricted scan: a table with
+ * neither option walks the whole keyspace with SCAN, and the staging key is
+ * a real zset, so such a scan can return it as a row for the moment it
+ * exists.
+ */
+#define ZSET_REBUILD_PREFIX "\x01redis_fdw_zset_rebuild\x01"
 
 /*
  * Connection cache structures
@@ -2828,6 +2847,24 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 
 	array_elem_list = (List *) list_nth(fdw_private, 1);
 	fmstate->array_elem_type = list_nth_oid(array_elem_list, 0);
+	fmstate->with_scores =
+		redis_zset_has_scores_column(fmstate->table_type,
+									 fmstate->singleton_key,
+									 RelationGetDescr(rel)->natts);
+	fmstate->scores_elem_type = InvalidOid;
+	fmstate->scores_pidx = -1;
+
+	/*
+	 * The scores column's shape is known from the relation descriptor
+	 * alone, so check it here rather than per row: a scalar column would
+	 * otherwise reach DatumGetArrayTypeP() as though it were an array.
+	 */
+	if (fmstate->with_scores &&
+		TupleDescAttr(RelationGetDescr(rel), 2)->attndims == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("scores column must be an array")
+				 ));
 
 	fmstate->p_nums = 0;
 
@@ -2929,6 +2966,13 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 			fmstate->targetDims[fmstate->p_nums] = attr->attndims;
 			getTypeOutputInfo(elem, &typefnoid, &isvarlena);
 			fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
+
+			if (fmstate->with_scores && attnum == 3)
+			{
+				fmstate->scores_pidx = fmstate->p_nums;
+				fmstate->scores_elem_type = elem;
+			}
+
 			fmstate->p_nums++;
 		}
 	}
@@ -3396,6 +3440,10 @@ redisExecForeignInsert(EState *estate,
 		redis_val_type elem_valtype;
 		bool		is_array = fmstate->array_elem_type != InvalidOid;
 		Datum		value = slot_getattr(slot, 2, &isnull);
+		Datum	   *score_elements = NULL;
+		bool	   *score_nulls = NULL;
+		int			nscores = 0;
+		redis_val_type score_valtype = REDIS_VAL_OTHER;
 
 		/* For non-singleton, get keyval for prefix checks and error messages */
 		keyval = OutputFunctionCall(&fmstate->p_flinfo[0], key);
@@ -3486,6 +3534,44 @@ redisExecForeignInsert(EState *estate,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot insert NULL into a Redis table")
 							 ));
+			}
+
+			if (fmstate->with_scores)
+			{
+				bool		snull;
+				Datum		sval = slot_getattr(slot, 3, &snull);
+				int16		stlen;
+				bool		stbyval;
+				char		stalign;
+				int			si;
+
+				if (snull)
+					ereport(ERROR,
+							(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+							 errmsg("cannot insert NULL into a Redis table"),
+							 errhint("A zset table's members and scores columns are written as a pair.")));
+
+				get_typlenbyvalalign(fmstate->scores_elem_type,
+									 &stlen, &stbyval, &stalign);
+				deconstruct_array(DatumGetArrayTypeP(sval),
+								  fmstate->scores_elem_type, stlen, stbyval,
+								  stalign, &score_elements, &score_nulls,
+								  &nscores);
+
+				if (nscores != nitems)
+					ereport(ERROR,
+							(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+							 errmsg("members and scores arrays must have the same length"),
+							 errdetail("members has %d elements, scores has %d",
+									   nitems, nscores)));
+
+				for (si = 0; si < nscores; si++)
+					if (score_nulls[si])
+						ereport(ERROR,
+								(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+								 errmsg("cannot insert NULL into a Redis table")));
+
+				score_valtype = classify_type(fmstate->scores_elem_type);
 			}
 		}
 
@@ -3589,24 +3675,55 @@ redisExecForeignInsert(EState *estate,
 					int			i;
 					int			ibuff_len;
 					char		ibuff[100];
+					int			zargc = 2 + 2 * nitems;
+					const char **zargv = (const char **) palloc(sizeof(char *) * zargc);
+					size_t	   *zargvlen = (size_t *) palloc(sizeof(size_t) * zargc);
+
+					zargv[0] = "ZADD";
+					zargvlen[0] = 4;
+					zargv[1] = key_data;
+					zargvlen[1] = key_len;
 
 					for (i = 0; i < nitems; i++)
 					{
 						const char *data;
 						size_t		len;
+						const char *score_data;
+						size_t		score_len;
 
-						ibuff_len = sprintf(ibuff, "%d", i);
+						if (fmstate->with_scores)
+							get_datum_as_string(score_elements[i], score_valtype,
+												&fmstate->p_flinfo[fmstate->scores_pidx],
+												&score_data, &score_len);
+						else
+						{
+							ibuff_len = sprintf(ibuff, "%d", i);
+							score_data = pnstrdup(ibuff, ibuff_len);
+							score_len = ibuff_len;
+						}
+
 						/* score comes BEFORE value in ZADD */
 						get_datum_as_string(elements[i], elem_valtype,
 											&fmstate->p_flinfo[1], &data, &len);
-						sreply = redis_command(context, "ZADD",
-											   key_data, key_len,
-											   ibuff, ibuff_len, data, len);
-						check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
-									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add zset member", NULL);
-						freeReplyObject(sreply);
+
+						zargv[2 + 2 * i] = score_data;
+						zargvlen[2 + 2 * i] = score_len;
+						zargv[2 + 2 * i + 1] = data;
+						zargvlen[2 + 2 * i + 1] = len;
 					}
+
+					/*
+					 * All members go in a single ZADD: Redis parses every
+					 * score before adding any member, so an invalid score
+					 * fails the whole command and the key is never created,
+					 * instead of leaving a half-built key behind for the
+					 * retry to trip over.
+					 */
+					sreply = redisCommandArgv(context, zargc, zargv, zargvlen);
+					check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
+								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+								"could not add zset members", NULL);
+					freeReplyObject(sreply);
 				}
 				break;
 			default:
@@ -3759,6 +3876,12 @@ redisExecForeignUpdate(EState *estate,
 	/* For array updates */
 	Datum	   *array_elems = NULL;
 	redis_val_type array_elem_valtype = REDIS_VAL_OTHER;
+	bool		saw_members = false;
+	bool		saw_scores = false;
+	Datum	   *score_elements = NULL;
+	bool	   *score_nulls = NULL;
+	int			nscores = 0;
+	redis_val_type score_valtype = REDIS_VAL_OTHER;
 
 #ifdef DEBUG
 	elog(NOTICE, "redisExecForeignUpdate");
@@ -3779,6 +3902,33 @@ redisExecForeignUpdate(EState *estate,
 	newkey_len = key_len;
 
 	Assert(keyval != NULL);
+
+	if (fmstate->with_scores)
+	{
+		ListCell   *slc;
+
+		foreach(slc, fmstate->target_attrs)
+		{
+			int			a = lfirst_int(slc);
+
+			if (a == 2)
+				saw_members = true;
+			else if (a == 3)
+				saw_scores = true;
+		}
+
+		if (saw_members != saw_scores)
+		{
+			char	   *membname = NameStr(TupleDescAttr(RelationGetDescr(fmstate->rel), 1)->attname);
+			char	   *scorename = NameStr(TupleDescAttr(RelationGetDescr(fmstate->rel), 2)->attname);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("updating \"%s\" or \"%s\" requires setting both",
+							membname, scorename),
+					 errhint("A zset table's members and scores columns are written as a pair.")));
+		}
+	}
 
 	/* extract the updated values */
 	foreach(lc, fmstate->target_attrs)
@@ -3836,6 +3986,20 @@ redisExecForeignUpdate(EState *estate,
 				newval_len = strlen(newval);
 			}
 		}
+		else if (fmstate->with_scores && attnum == 3)
+		{
+			int16		stlen;
+			bool		stbyval;
+			char		stalign;
+
+			get_typlenbyvalalign(fmstate->scores_elem_type,
+								 &stlen, &stbyval, &stalign);
+			deconstruct_array(DatumGetArrayTypeP(datum),
+							  fmstate->scores_elem_type, stlen, stbyval,
+							  stalign, &score_elements, &score_nulls,
+							  &nscores);
+			score_valtype = classify_type(fmstate->scores_elem_type);
+		}
 		else
 		{
 			/*
@@ -3885,6 +4049,13 @@ redisExecForeignUpdate(EState *estate,
 
 		flslot++;
 	}
+
+	if (fmstate->with_scores && saw_scores && nscores != nitems)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("members and scores arrays must have the same length"),
+				 errdetail("members has %d elements, scores has %d",
+						   nitems, nscores)));
 
 	/* now we have all the data we need */
 
@@ -4252,7 +4423,102 @@ redisExecForeignUpdate(EState *estate,
 		freeReplyObject(ereply);
 	}
 
-	if (array_elems)
+	if (array_elems && fmstate->table_type == PG_REDIS_ZSET_TABLE)
+	{
+		/*
+		 * A zset rebuild cannot use the DEL-then-repopulate approach below:
+		 * unlike SADD/RPUSH/HSET, ZADD can reject one of the caller's own
+		 * arguments (an invalid score), and by that point the DEL would
+		 * already have destroyed the row it was rebuilding.  Build the new
+		 * contents in a private staging key instead, with a single ZADD --
+		 * Redis parses every score before touching the object, so a bad
+		 * score fails the whole command and never even reaches the staging
+		 * key -- and only swap it in with RENAME once that succeeds.
+		 * RENAME replaces the destination atomically, so this never runs a
+		 * command against newkey that could fail because of the caller's
+		 * data.
+		 */
+		int			i;
+		int			ibuff_len;
+		char		ibuff[100];
+		char		pidbuf[24];
+		int			pidlen;
+		char	   *stagingkey;
+		size_t		stagingkey_len;
+		int			zargc = 2 + 2 * nitems;
+		const char **zargv = (const char **) palloc(sizeof(char *) * zargc);
+		size_t	   *zargvlen = (size_t *) palloc(sizeof(size_t) * zargc);
+
+		Assert(!fmstate->singleton_key);
+
+		/*
+		 * Fold the backend pid into the staging key: without it, two
+		 * backends updating the same row would share one staging key, and
+		 * whichever ZADD ran last would win the RENAME with the other
+		 * backend's contents instead of its own.
+		 */
+		pidlen = snprintf(pidbuf, sizeof(pidbuf), "%d\x01", (int) MyProcPid);
+
+		stagingkey_len = strlen(ZSET_REBUILD_PREFIX) + pidlen + newkey_len;
+		stagingkey = palloc(stagingkey_len);
+		memcpy(stagingkey, ZSET_REBUILD_PREFIX, strlen(ZSET_REBUILD_PREFIX));
+		memcpy(stagingkey + strlen(ZSET_REBUILD_PREFIX), pidbuf, pidlen);
+		memcpy(stagingkey + strlen(ZSET_REBUILD_PREFIX) + pidlen, newkey_data, newkey_len);
+
+		/* clear any staging key a previous failed attempt left behind */
+		ereply = redis_command1(context, "DEL", stagingkey, stagingkey_len);
+		check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"could not clear staging key for %s", newkey);
+		freeReplyObject(ereply);
+
+		zargv[0] = "ZADD";
+		zargvlen[0] = 4;
+		zargv[1] = stagingkey;
+		zargvlen[1] = stagingkey_len;
+
+		for (i = 0; i < nitems; i++)
+		{
+			const char *data;
+			size_t		len;
+			const char *score_data;
+			size_t		score_len;
+
+			if (fmstate->with_scores)
+				get_datum_as_string(score_elements[i], score_valtype,
+									&fmstate->p_flinfo[fmstate->scores_pidx],
+									&score_data, &score_len);
+			else
+			{
+				ibuff_len = sprintf(ibuff, "%d", i);
+				score_data = pnstrdup(ibuff, ibuff_len);
+				score_len = ibuff_len;
+			}
+
+			/* score comes BEFORE value in ZADD */
+			get_datum_as_string(array_elems[i], array_elem_valtype,
+								&fmstate->p_flinfo[1], &data, &len);
+
+			zargv[2 + 2 * i] = score_data;
+			zargvlen[2 + 2 * i] = score_len;
+			zargv[2 + 2 * i + 1] = data;
+			zargvlen[2 + 2 * i + 1] = len;
+		}
+
+		ereply = redisCommandArgv(context, zargc, zargv, zargvlen);
+		check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"could not add zset members", NULL);
+		freeReplyObject(ereply);
+
+		ereply = redis_command2(context, "RENAME", stagingkey, stagingkey_len,
+								newkey_data, newkey_len);
+		check_reply(ereply, context, RTYPE(REDIS_REPLY_STATUS),
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"could not replace key %s", newkey);
+		freeReplyObject(ereply);
+	}
+	else if (array_elems)
 	{
 		Assert(!fmstate->singleton_key);
 
@@ -4341,31 +4607,6 @@ redisExecForeignUpdate(EState *estate,
 						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add hash field", NULL);
-						freeReplyObject(ereply);
-					}
-				}
-				break;
-			case PG_REDIS_ZSET_TABLE:
-				{
-					int			i;
-					int			ibuff_len;
-					char		ibuff[100];
-
-					for (i = 0; i < nitems; i++)
-					{
-						const char *data;
-						size_t		len;
-
-						ibuff_len = sprintf(ibuff, "%d", i);
-						/* score comes BEFORE value in ZADD */
-						get_datum_as_string(array_elems[i], array_elem_valtype,
-											&fmstate->p_flinfo[1], &data, &len);
-						ereply = redis_command(context, "ZADD",
-											   newkey_data, newkey_len,
-											   ibuff, ibuff_len, data, len);
-						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add zset member", NULL);
 						freeReplyObject(ereply);
 					}
 				}

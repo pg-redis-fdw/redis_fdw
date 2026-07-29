@@ -767,16 +767,20 @@ delete from db15_w_zset_pfx;
 
 select * from db15_w_zset_pfx;
 
--- non-singleton zset table with a 3rd scores column: insert names only
--- the key and value columns, leaving scores to be populated by Redis
+-- a three-column zset table requires the scores column on INSERT, and a
+-- tablekeyprefix does not change that
 
 create foreign table db15_w_zset_pfx_scores(key text, val text[], scores numeric[])
        server localredis
        options (database '15', tabletype 'zset', tablekeyprefix 'w_zset_');
 
-insert into db15_w_zset_pfx_scores (key, val) values ('w_zset_a','{b,c,d}');
+insert into db15_w_zset_pfx_scores (key, val, scores) values ('w_zset_a','{b,c,d}','{1,2,3}');
 
-select key, cardinality(val), cardinality(scores) from db15_w_zset_pfx_scores order by key;
+select key, val, scores from db15_w_zset_pfx_scores order by key;
+
+-- the "set both together" error names this table's own columns, not the
+-- generic "members"/"scores"
+update db15_w_zset_pfx_scores set val = '{b,c,e}' where key = 'w_zset_a';
 
 delete from db15_w_zset_pfx_scores;
 
@@ -1275,6 +1279,125 @@ drop foreign table db15_bcol_list_arr;
 drop foreign table db15_bcol_sing_set;
 drop foreign table db15_bcol_sing_list;
 drop foreign table db15_bcol_scalar;
+-- Writable zset scores. The write path used to ignore the scores column and
+-- store the array index as the score, so an INSERT silently discarded the
+-- supplied scores and an UPDATE of the scores column wrote the score values
+-- as members.
+
+create foreign table db15_zs3(key text, members text[], scores text[])
+       server localredis
+       options (database '15', tabletype 'zset');
+
+-- INSERT must store the supplied scores, not 0,1,2
+insert into db15_zs3 values ('zs3', '{a,b,c}', '{10,20,30}');
+
+select * from db15_zs3 where key = 'zs3';
+
+-- UPDATE setting both arrays rewrites members and scores together
+update db15_zs3 set members = '{a,b,d}', scores = '{11,21,41}' where key = 'zs3';
+
+select * from db15_zs3 where key = 'zs3';
+
+-- a rename touches neither array and stays legal
+update db15_zs3 set key = 'zs3renamed' where key = 'zs3';
+
+select * from db15_zs3 where key = 'zs3renamed';
+
+-- setting only one of the pair is rejected
+update db15_zs3 set members = '{x,y,z}' where key = 'zs3renamed';
+
+update db15_zs3 set scores = '{1,2,3}' where key = 'zs3renamed';
+
+-- and the rejected updates must leave the key untouched, since the update
+-- path only replaces the key once the new contents are known to be valid
+select * from db15_zs3 where key = 'zs3renamed';
+
+-- mismatched array lengths are rejected, on UPDATE and on INSERT
+update db15_zs3 set members = '{a,b}', scores = '{1,2,3}' where key = 'zs3renamed';
+
+select * from db15_zs3 where key = 'zs3renamed';
+
+-- an invalid score is rejected by Redis itself, not by anything client
+-- side, so it is caught deep inside the rebuild; it must still leave the
+-- key exactly as it was rather than destroying part of the row
+update db15_zs3 set members = '{a,b,d}', scores = '{1,abc,3}' where key = 'zs3renamed';
+
+select * from db15_zs3 where key = 'zs3renamed';
+
+-- NaN is likewise rejected by Redis, and likewise must not touch the row
+update db15_zs3 set members = '{a,b,d}', scores = '{1,NaN,3}' where key = 'zs3renamed';
+
+select * from db15_zs3 where key = 'zs3renamed';
+
+insert into db15_zs3 values ('zs3bad', '{a,b,c}', '{1,2}');
+
+-- infinite scores round-trip; Redis accepts the spelling PostgreSQL emits
+insert into db15_zs3 values ('zs3inf', '{lo,mid,hi}', '{-Infinity,5,Infinity}');
+
+select * from db15_zs3 where key = 'zs3inf';
+
+-- an INSERT that omits the scores column is rejected rather than falling
+-- back to positional scores
+insert into db15_zs3 (key, members) values ('zs3partial', '{a,b}');
+
+-- a scores column that isn't an array is rejected outright, not
+-- reinterpreted as an array datum
+create foreign table db15_zsbad(key text, members text[], scores text)
+       server localredis
+       options (database '15', tabletype 'zset');
+
+insert into db15_zsbad values ('zsbadkey', '{a,b,c}', '{1,2,3}');
+
+drop foreign table db15_zsbad;
+
+-- a numeric[] scores column exercises a non-text output function on
+-- UPDATE, not just INSERT; renaming the key in the same statement that
+-- sets both arrays shifts scores_pidx from 2 to 3
+create foreign table db15_zsnum(key text, members text[], scores numeric[])
+       server localredis
+       options (database '15', tabletype 'zset');
+
+insert into db15_zsnum values ('zsnum', '{a,b,c}', '{1,2,3}');
+
+update db15_zsnum set key = 'zsnumrenamed', members = '{a,b,d}', scores = '{4,5,6}' where key = 'zsnum';
+
+select * from db15_zsnum where key = 'zsnumrenamed';
+
+drop foreign table db15_zsnum;
+
+-- a two-column non-singleton zset is unaffected: members-only UPDATE is
+-- still allowed and scores are still positional
+create foreign table db15_zs2(key text, members text[])
+       server localredis
+       options (database '15', tabletype 'zset');
+
+insert into db15_zs2 values ('zs2', '{p,q,r}');
+
+update db15_zs2 set members = '{p,q,s}' where key = 'zs2';
+
+select * from db15_zs2 where key = 'zs2';
+
+\! redis-cli -n 15 zrange zs2 0 -1 withscores
+
+-- and a singleton zset is unaffected: its score column stays writable on
+-- its own
+\! redis-cli -n 15 zadd zs1 10 a 20 b > /dev/null
+
+create foreign table db15_szs(value text, score numeric)
+       server localredis
+       options (database '15', tabletype 'zset', singleton_key 'zs1');
+
+insert into db15_szs values ('c', 99);
+
+update db15_szs set score = 55 where value = 'a';
+
+update db15_szs set value = 'bb' where value = 'b';
+
+select * from db15_szs order by score;
+
+drop foreign table db15_zs3;
+drop foreign table db15_zs2;
+drop foreign table db15_szs;
 
 -- all done, so now blow everything in the db away again
 

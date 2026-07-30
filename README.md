@@ -56,7 +56,7 @@ Features
 | Scalar (non-singleton) | value | Yes |
 | Hash (singleton) | value | Yes |
 | Hash (singleton) | key/field | No |
-| Hash (non-singleton) | value array | No |
+| Hash (non-singleton) | value array | Yes (`bytea[]`) |
 | Set (singleton) | member | Yes |
 | Set (non-singleton) | value array | Yes (`bytea[]`) |
 | Zset (singleton) | member | Yes |
@@ -420,7 +420,8 @@ Limitations
 
 ### Binary data (bytea)
 - `bytea` is not supported for hash field/key columns (only hash value columns).
-- Non-singleton hash tables do not support `bytea[]` array columns.
+- A non-singleton collection table (hash, list, set, zset) must declare its
+  value column as an array type; a scalar `bytea` value column is rejected.
 
 ### Other
 - Redis has acquired cursors in 2.8+. This is used in all the

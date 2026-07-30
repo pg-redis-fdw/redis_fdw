@@ -1168,6 +1168,82 @@ drop server aclsrv cascade;
 drop server aclbad cascade;
 
 \! redis-cli ACL DELUSER fdwtest > /dev/null
+-- A collection table stores its members in an array-typed value column. A
+-- scalar bytea column cannot hold them: unlike scalar text, which yields a
+-- PostgreSQL array literal that casts back to an array, bytea has no array
+-- literal form. The write path already refuses this shape; the read path
+-- must too, rather than silently returning an empty bytea.
+
+\! redis-cli -n 15 rpush bcol_list a b c > /dev/null
+\! redis-cli -n 15 sadd  bcol_set  x y   > /dev/null
+\! redis-cli -n 15 hset  bcol_hash f1 v1 > /dev/null
+\! redis-cli -n 15 zadd  bcol_zset 1 m1  > /dev/null
+
+create foreign table db15_bcol_list(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'list', tablekeyprefix 'bcol_list');
+
+select * from db15_bcol_list;
+
+-- the check must sit after the EXPLAIN early return: planning must not error
+explain (costs off) select * from db15_bcol_list;
+
+create foreign table db15_bcol_set(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'set', tablekeyprefix 'bcol_set');
+
+select * from db15_bcol_set;
+
+create foreign table db15_bcol_hash(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'hash', tablekeyprefix 'bcol_hash');
+
+select * from db15_bcol_hash;
+
+create foreign table db15_bcol_zset(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'bcol_zset');
+
+select * from db15_bcol_zset;
+
+-- bytea[] on the same table is the correct shape and must keep working
+create foreign table db15_bcol_list_arr(key text, value bytea[])
+       server localredis
+       options (database '15', tabletype 'list', tablekeyprefix 'bcol_list');
+
+select key, value from db15_bcol_list_arr;
+
+-- a singleton collection with a scalar bytea column is the feature's main
+-- use case and must keep working
+create foreign table db15_bcol_sing_set(member bytea)
+       server localredis
+       options (database '15', tabletype 'set', singleton_key 'bcol_set');
+
+select member from db15_bcol_sing_set order by member;
+
+create foreign table db15_bcol_sing_list(member bytea)
+       server localredis
+       options (database '15', tabletype 'list', singleton_key 'bcol_list');
+
+select member from db15_bcol_sing_list;
+
+-- a scalar table with a bytea value column must keep working
+\! redis-cli -n 15 set bcol_scalar_k hello > /dev/null
+
+create foreign table db15_bcol_scalar(key text, value bytea)
+       server localredis
+       options (database '15', tablekeyprefix 'bcol_scalar');
+
+select key, value from db15_bcol_scalar;
+
+drop foreign table db15_bcol_list;
+drop foreign table db15_bcol_set;
+drop foreign table db15_bcol_hash;
+drop foreign table db15_bcol_zset;
+drop foreign table db15_bcol_list_arr;
+drop foreign table db15_bcol_sing_set;
+drop foreign table db15_bcol_sing_list;
+drop foreign table db15_bcol_scalar;
 
 -- all done, so now blow everything in the db away again
 

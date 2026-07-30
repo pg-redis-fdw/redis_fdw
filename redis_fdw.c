@@ -1563,6 +1563,48 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
+	/* Store the additional state info */
+	festate->attinmeta =
+		TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
+
+	/* Cache tuple descriptor and build val_types array for type handling */
+	festate->tupdesc = node->ss.ss_currentRelation->rd_att;
+	festate->natts = festate->tupdesc->natts;
+	festate->val_types = (redis_val_type *) palloc0(sizeof(redis_val_type) * festate->natts);
+	for (int i = 0; i < festate->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, i);
+		festate->val_types[i] = classify_type(attr->atttypid);
+	}
+
+	/* Get array element type for value column (column 2) if it's an array */
+	festate->array_elem_type = InvalidOid;
+	if (festate->natts >= 2)
+	{
+		Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, 1);
+		festate->array_elem_type = get_element_type(attr->atttypid);
+	}
+
+	/*
+	 * A collection table keeps its members in an array-typed value column. A
+	 * scalar bytea column cannot represent them: scalar text works only
+	 * because what it yields is a PostgreSQL array literal, and bytea has no
+	 * array literal form. Reject the declaration rather than returning an
+	 * empty bytea; the modify path already refuses this shape. The last
+	 * conjunct is redundant once val_types[1] is REDIS_VAL_BYTEA -- bytea
+	 * never has an element type -- but it is kept to mirror the has_bytea /
+	 * has_array pairing in redisIterateForeignScanMulti, belt and braces.
+	 */
+	if (!festate->singleton_key &&
+		festate->table_type != PG_REDIS_SCALAR_TABLE &&
+		festate->natts >= 2 &&
+		festate->val_types[1] == REDIS_VAL_BYTEA &&
+		festate->array_elem_type == InvalidOid)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("bytea value column requires an array type for this Redis table"),
+				 errhint("Declare the value column as bytea[] instead.")));
+
 	/*
 	 * We're going to use the current scan-lived context to
 	 * store the pstrduped cusrsor id.
@@ -1694,28 +1736,6 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
 				 errmsg("failed somehow: %s", err)
 				 ));
-	}
-
-	/* Store the additional state info */
-	festate->attinmeta =
-		TupleDescGetAttInMetadata(node->ss.ss_currentRelation->rd_att);
-
-	/* Cache tuple descriptor and build val_types array for type handling */
-	festate->tupdesc = node->ss.ss_currentRelation->rd_att;
-	festate->natts = festate->tupdesc->natts;
-	festate->val_types = (redis_val_type *) palloc0(sizeof(redis_val_type) * festate->natts);
-	for (int i = 0; i < festate->natts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, i);
-		festate->val_types[i] = classify_type(attr->atttypid);
-	}
-
-	/* Get array element type for value column (column 2) if it's an array */
-	festate->array_elem_type = InvalidOid;
-	if (festate->natts >= 2)
-	{
-		Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, 1);
-		festate->array_elem_type = get_element_type(attr->atttypid);
 	}
 
 	if (festate->singleton_key)

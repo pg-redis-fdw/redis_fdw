@@ -3616,8 +3616,6 @@ redisExecForeignUpdate(EState *estate,
 	/* For bytea support */
 	bool		value_is_bytea = false;
 	Datum		bytea_datum = 0;
-	/* For old key bytea (SET/ZSET member being replaced) */
-	bool		old_key_is_bytea = false;
 	/* For array updates */
 	Datum	   *array_elems = NULL;
 	redis_val_type array_elem_valtype = REDIS_VAL_OTHER;
@@ -3635,17 +3633,6 @@ redisExecForeignUpdate(EState *estate,
 	get_datum_as_string(datum, fmstate->val_types[0],
 						&fmstate->p_flinfo[0], &key_data, &key_len);
 	keyval = OutputFunctionCall(&fmstate->p_flinfo[0], datum);
-
-	/*
-	 * For singleton set/zset tables with bytea members, mark old key as bytea.
-	 */
-	if (fmstate->singleton_key &&
-		(fmstate->table_type == PG_REDIS_SET_TABLE ||
-		 fmstate->table_type == PG_REDIS_ZSET_TABLE) &&
-		fmstate->val_types[0] == REDIS_VAL_BYTEA)
-	{
-		old_key_is_bytea = true;
-	}
 
 	newkey = keyval;
 	newkey_data = key_data;
@@ -4094,22 +4081,9 @@ redisExecForeignUpdate(EState *estate,
 		{
 			if (fmstate->table_type == PG_REDIS_ZSET_TABLE)
 			{
-				const char *member_data;
-				size_t		member_len;
-
-				if (old_key_is_bytea)
-				{
-					member_data = key_data;
-					member_len = key_len;
-				}
-				else
-				{
-					member_data = key_data;
-					member_len = key_len;
-				}
 				ereply = redis_command(context, "ZADD",
 									   fmstate->singleton_key, fmstate->singleton_key_len,
-									   newval, newval_len, member_data, member_len);
+									   newval, newval_len, key_data, key_len);
 			}
 			else if (fmstate->table_type == PG_REDIS_HASH_TABLE)
 			{

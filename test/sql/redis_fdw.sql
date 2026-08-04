@@ -829,6 +829,46 @@ select * from db15_singleton_scalar_bad_shape;
 
 drop foreign table db15_singleton_scalar_bad_shape;
 
+-- a dropped column must not count toward the declared column count: adding a
+-- column and dropping it again leaves the table as valid as it started
+
+create foreign table db15_hash_dropped(key text, value text)
+       server localredis
+       options (tabletype 'hash', tablekeyprefix 'hash_drop_', database '15');
+
+alter foreign table db15_hash_dropped add column extra text;
+alter foreign table db15_hash_dropped drop column extra;
+
+select * from db15_hash_dropped;
+
+drop foreign table db15_hash_dropped;
+
+-- but dropping a column the table type does need is an error, not a table that
+-- silently reports NULL for the column that went missing
+
+create foreign table db15_hash_lost_value(key text, value text)
+       server localredis
+       options (tabletype 'hash', tablekeyprefix 'hash_lost_', database '15');
+
+alter foreign table db15_hash_lost_value drop column value;
+
+select * from db15_hash_lost_value;
+
+drop foreign table db15_hash_lost_value;
+
+-- a dropped column ahead of a live one leaves that live column at a position
+-- past the end of the values array the scan builds, so it is rejected as well
+
+create foreign table db15_hash_middrop(key text, mid text, value text)
+       server localredis
+       options (tabletype 'hash', tablekeyprefix 'hash_mid_', database '15');
+
+alter foreign table db15_hash_middrop drop column mid;
+
+select * from db15_hash_middrop;
+
+drop foreign table db15_hash_middrop;
+
 -- non-singleton zset table keyset
 
 create foreign table db15_w_zset_kset(key text, val text[])

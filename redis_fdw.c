@@ -1264,11 +1264,40 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 	 * foreign table's relation is already open (and locked) by the caller
 	 * in every context redisGetOptions is invoked from, so this just
 	 * borrows that lock.
+	 *
+	 * Dropped columns are excluded from the count: ALTER TABLE leaves the
+	 * attribute in the tuple descriptor, and counting it would reject a
+	 * table that is once again the right shape after a column was added and
+	 * dropped again.
+	 *
+	 * They can't simply be ignored, though. The scan fills values[] by
+	 * position - values[0] is the key, values[1] the data - and
+	 * BuildTupleFromCStrings indexes it by attribute number, skipping the
+	 * dropped ones. A dropped column ahead of a live one therefore pushes
+	 * that live column's index past the end of the array the scan
+	 * allocated, which is the same overrun this check exists to prevent. So
+	 * require the live columns to be the leading ones: trailing dropped
+	 * attributes are harmless, interleaved ones are not.
 	 */
 	{
 		Relation	rel = table_open(foreigntableid, NoLock);
-		int			natts = RelationGetDescr(rel)->natts;
+		TupleDesc	tupdesc = RelationGetDescr(rel);
+		int			natts = 0;		/* live columns only */
+		bool		seen_dropped = false;
+		bool		leading = true;
 		bool		valid;
+
+		for (int i = 0; i < tupdesc->natts; i++)
+		{
+			if (TupleDescAttr(tupdesc, i)->attisdropped)
+				seen_dropped = true;
+			else
+			{
+				natts++;
+				if (seen_dropped)
+					leading = false;
+			}
+		}
 
 		if (table_options->table_type == PG_REDIS_ZSET_TABLE)
 			valid = table_options->singleton_key ?
@@ -1284,6 +1313,11 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("table has incorrect number of columns")));
+
+		if (!leading)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("table has a dropped column among the columns this table type uses")));
 	}
 }
 

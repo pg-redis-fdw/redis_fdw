@@ -20,10 +20,19 @@ OBJS = redis_fdw.o
 EXTENSION = redis_fdw
 DATA = redis_fdw--1.0.sql redis_fdw--2.0.sql redis_fdw--1.0--2.0.sql
 
-REGRESS = redis_fdw
-REGRESS_OPTS = --inputdir=test --outputdir=test \
-      --load-extension=hstore \
-	  --load-extension=$(EXTENSION)
+ifdef ENABLE_GIS
+override PG_CFLAGS += -DREDIS_FDW_GIS_ENABLE
+GISTEST=postgis
+else
+GISTEST=nogis
+endif
+
+ifndef REGRESS
+REGRESS = redis_fdw $(GISTEST)
+#encodings # future test modules
+endif
+
+REGRESS_OPTS = --encoding=utf8 --inputdir=test --outputdir=test
 
 EXTRA_CLEAN = sql/redis_fdw.sql expected/redis_fdw.out
 

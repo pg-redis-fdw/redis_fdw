@@ -1,4 +1,3 @@
 select 15
 
 flushdb
-

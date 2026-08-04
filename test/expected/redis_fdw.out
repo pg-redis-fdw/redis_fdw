@@ -745,6 +745,18 @@ from db15_w_1key_geo order by value;
  Palermo2 | 40.0000 | 13.3614
 (2 rows)
 
+-- a rename whose coordinates Redis rejects must leave the old member alone
+-- rather than deleting it on the way to a failed add
+update db15_w_1key_geo set value = 'Catania3', lat = 99 where value = 'Catania2';
+ERROR:  setting element Catania3: ERR invalid longitude,latitude pair 14.000002,99.000000
+select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
+from db15_w_1key_geo order by value;
+  value   |   lat   |  long   
+----------+---------+---------
+ Catania2 | 42.0000 | 14.0000
+ Palermo2 | 40.0000 | 13.3614
+(2 rows)
+
 delete from db15_w_1key_geo where value = 'Palermo2';
 select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
 from db15_w_1key_geo order by value;

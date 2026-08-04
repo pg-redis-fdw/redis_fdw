@@ -4769,13 +4769,17 @@ redisExecForeignUpdate(EState *estate,
 													  &newlat, &newlat_len,
 													  &newlong, &newlong_len);
 
-						ereply = redis_command(context, "ZREM",
-											   fmstate->singleton_key, fmstate->singleton_key_len,
-											   NULL, 0, key_data, key_len);
-						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"removing set element %s", keyval);
-						freeReplyObject(ereply);
+						/*
+						 * Add the new member before removing the old one.
+						 * Redis gives us no transaction to roll back, so if
+						 * GEOADD rejects the coordinates the ZREM must not
+						 * already have happened - otherwise a failed UPDATE
+						 * silently deletes the row. The reverse order is
+						 * safe: the new member is known to differ from the
+						 * old one, and to not exist yet, because we only get
+						 * here after the key comparison and the ZRANK
+						 * duplicate check above.
+						 */
 
 						/* GEOADD key longitude latitude member */
 						argv[0] = "GEOADD";
@@ -4792,6 +4796,14 @@ redisExecForeignUpdate(EState *estate,
 						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"setting element %s", newkey);
+						freeReplyObject(ereply);
+
+						ereply = redis_command(context, "ZREM",
+											   fmstate->singleton_key, fmstate->singleton_key_len,
+											   NULL, 0, key_data, key_len);
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"removing set element %s", keyval);
 						freeReplyObject(ereply);
 					}
 					break;

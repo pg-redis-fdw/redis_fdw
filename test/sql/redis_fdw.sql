@@ -462,6 +462,13 @@ update db15_w_1key_geo set value = 'Catania2', lat = 42 where value = 'Catania';
 select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
 from db15_w_1key_geo order by value;
 
+-- a rename whose coordinates Redis rejects must leave the old member alone
+-- rather than deleting it on the way to a failed add
+update db15_w_1key_geo set value = 'Catania3', lat = 99 where value = 'Catania2';
+
+select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long
+from db15_w_1key_geo order by value;
+
 delete from db15_w_1key_geo where value = 'Palermo2';
 
 select value, round(lat::numeric, 4) as lat, round(long::numeric, 4) as long

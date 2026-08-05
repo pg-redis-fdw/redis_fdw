@@ -1109,25 +1109,9 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 
 			sreply = redisCommand(context, "SISMEMBER %s %s",
 								  festate->keyset, qual_value);
-			if (!sreply)
-			{
-				redisFree(festate->context);
-				ereport(ERROR,
-						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-						 errmsg("failed to list keys: %s", context->errstr)
-						 ));
-			}
-			if (sreply->type == REDIS_REPLY_ERROR)
-			{
-				char	   *err = pstrdup(sreply->str);
-
-				freeReplyObject(sreply);
-				ereport(ERROR,
-						(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-						 errmsg("failed to list keys: %s", err)
-						 ));
-
-			}
+			check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
+						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+						"failed to list keys", NULL);
 
 			if (sreply->integer != 1)
 				festate->row = -1;
@@ -2114,11 +2098,13 @@ check_reply(redisReply *reply, redisContext *context, int allowed,
 	{
 		err = pstrdup(reply->str);
 		freeReplyObject(reply);
+		redisFree(context);
 	}
 	else if (allowed != RTYPE_ANY && (allowed & RTYPE(reply->type)) == 0)
 	{
 		err = psprintf("unexpected reply type %d", reply->type);
 		freeReplyObject(reply);
+		redisFree(context);
 	}
 	else
 		return;

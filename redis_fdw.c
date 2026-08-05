@@ -1201,6 +1201,9 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		 */
 
 		reply = redisCommand(context, "EXISTS %s", qual_value);
+		check_reply(reply, context, RTYPE(REDIS_REPLY_INTEGER),
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"failed to check key existence for %s", qual_value);
 		if (reply->integer == 0)
 			festate->row = -1;
 
@@ -2736,10 +2739,10 @@ redisExecForeignUpdate(EState *estate,
 		if (!fmstate->singleton_key)
 		{
 			ereply = redisCommand(context, "EXISTS %s", newkey);
-			ok = ereply->type == REDIS_REPLY_INTEGER && ereply->integer == 0;
 			check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failed checking key existence %s", newkey);
+			ok = ereply->type == REDIS_REPLY_INTEGER && ereply->integer == 0;
 		}
 		else
 		{
@@ -2762,15 +2765,15 @@ redisExecForeignUpdate(EState *estate,
 			}
 			if (fmstate->table_type != PG_REDIS_SCALAR_TABLE)
 			{
+				check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER) | RTYPE(REDIS_REPLY_NIL),
+							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+							"failed checking key existence %s", keyval);
+
 				if (fmstate->table_type != PG_REDIS_ZSET_TABLE)
 					ok = ereply->type == REDIS_REPLY_INTEGER &&
 						ereply->integer == 0;
 				else
 					ok = ereply->type == REDIS_REPLY_NIL;
-
-				check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER) | RTYPE(REDIS_REPLY_NIL),
-							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-							"failed checking key existence %s", keyval);
 			}
 		}
 

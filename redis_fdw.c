@@ -2446,9 +2446,37 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 		/*
 		 * GEOSEARCH ... WITHCOORD replies with one entry per member:
 		 * [member, [longitude, latitude]]
+		 *
+		 * Verify that shape before indexing into it. check_reply only
+		 * rejects a NULL reply and REDIS_REPLY_ERROR, so nothing has
+		 * established it yet, and a reply element that isn't an array has
+		 * element == NULL - an unchecked entry->element[1] would
+		 * dereference NULL and crash the backend instead of raising an
+		 * error. The tests are ordered so that || short-circuits each
+		 * arity check before the index that depends on it.
+		 *
+		 * Requiring strings at the leaves assumes RESP2, which is what we
+		 * get because we never send HELLO 3. Under RESP3 the coordinates
+		 * come back as REDIS_REPLY_DOUBLE and this test has to widen.
 		 */
 		redisReply *entry = festate->reply->element[festate->row];
-		redisReply *coord = entry->element[1];
+		redisReply *coord;
+
+		if (entry->type != REDIS_REPLY_ARRAY || entry->elements != 2 ||
+			entry->element[0]->type != REDIS_REPLY_STRING ||
+			entry->element[1]->type != REDIS_REPLY_ARRAY ||
+			entry->element[1]->elements != 2 ||
+			entry->element[1]->element[0]->type != REDIS_REPLY_STRING ||
+			entry->element[1]->element[1]->type != REDIS_REPLY_STRING)
+		{
+			freeReplyObject(festate->reply);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+					 errmsg("unexpected reply shape from GEOSEARCH for key %s",
+							festate->singleton_key)));
+		}
+
+		coord = entry->element[1];
 
 		found = true;
 		key = entry->element[0]->str;
@@ -4140,13 +4168,41 @@ redis_geo_fill_missing_coords(redisContext *context, RedisFdwModifyState *fmstat
 				ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 				"getting position for key %s", keyval);
 
-	pos = posreply->element[0];
-	if (pos->type != REDIS_REPLY_ARRAY)
+	/*
+	 * check_reply only rejects a NULL reply and REDIS_REPLY_ERROR, so the
+	 * shape is still unverified: GEOPOS answers with an array carrying one
+	 * entry per member asked about.
+	 */
+	if (posreply->type != REDIS_REPLY_ARRAY || posreply->elements < 1)
 	{
 		freeReplyObject(posreply);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+				 errmsg("unexpected reply shape from GEOPOS for key %s", keyval)));
+	}
+
+	pos = posreply->element[0];
+	if (pos->type != REDIS_REPLY_ARRAY)
+	{
+		/* a nil entry means the member is no longer in the index */
+		freeReplyObject(posreply);
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 				 errmsg("could not find current position for key %s", keyval)));
+	}
+
+	/*
+	 * RESP2 returns the coordinates as strings; see the GEOSEARCH path in
+	 * redisIterateForeignScan for why that assumption is safe here.
+	 */
+	if (pos->elements != 2 ||
+		pos->element[0]->type != REDIS_REPLY_STRING ||
+		pos->element[1]->type != REDIS_REPLY_STRING)
+	{
+		freeReplyObject(posreply);
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+				 errmsg("unexpected reply shape from GEOPOS for key %s", keyval)));
 	}
 
 	if (!*lon)

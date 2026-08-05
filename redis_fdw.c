@@ -738,14 +738,9 @@ redisGetForeignRelSize(PlannerInfo *root,
 	{
 		reply = redisCommand(context, "AUTH %s", table_options.password);
 
-		if (!reply)
-		{
-			redisFree(context);
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-					 errmsg("failed to authenticate to redis: %d",
-							context->err)));
-		}
+		check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
+					ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+					"failed to authenticate to redis", NULL);
 
 		freeReplyObject(reply);
 	}
@@ -1000,14 +995,9 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	{
 		reply = redisCommand(context, "AUTH %s", table_options.password);
 
-		if (!reply)
-		{
-			redisFree(context);
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-			   errmsg("failed to authenticate to redis: %s", context->errstr)
-					 ));
-		}
+		check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
+					ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+					"failed to authenticate to redis", NULL);
 
 		freeReplyObject(reply);
 	}
@@ -1068,6 +1058,8 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->mctxt = CurrentMemoryContext;
 
 	/* Execute the query */
+	reply = NULL;
+
 	if (festate->singleton_key)
 	{
 		/*
@@ -2086,14 +2078,9 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	{
 		reply = redisCommand(context, "AUTH %s", table_options.password);
 
-		if (!reply)
-		{
-			redisFree(context);
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-			   errmsg("failed to authenticate to redis: %s", context->errstr)
-					 ));
-		}
+		check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
+					ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+					"failed to authenticate to redis", NULL);
 
 		freeReplyObject(reply);
 	}

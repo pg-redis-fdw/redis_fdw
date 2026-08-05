@@ -281,8 +281,20 @@ static void redisGetQual(Node *node, TupleDesc tupdesc, char **key,
 						 char **value, bool *pushdown);
 static char *process_redis_array(redisReply *reply, redis_table_type type);
 static char *redis_escape_glob(const char *str);
+
+/*
+ * Allowed-reply-type mask for check_reply. Every caller states the type(s)
+ * the command it issued is contracted to return, so that a reply which is
+ * well-formed but of the wrong shape is rejected before anything indexes
+ * into it. RTYPE_ANY is for genuinely unconstrained replies - not for
+ * "we don't read this one yet", since the reply a caller ignores today is
+ * the one it dereferences tomorrow.
+ */
+#define RTYPE(t)	(1 << (t))
+#define RTYPE_ANY	0
+
 static void check_reply(redisReply *reply, redisContext *context,
-						int error_code, char *message, char *arg);
+						int allowed, int error_code, char *message, char *arg);
 
 /*
  * Name we will use for the junk attribute that holds the redis key
@@ -2104,7 +2116,8 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	/* Select the appropriate database */
 	reply = redisCommand(context, "SELECT %d", table_options.database);
 
-	check_reply(reply, context, ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+	check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
+				ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
 				"failed to select database", NULL);
 
 	freeReplyObject(reply);
@@ -2113,7 +2126,8 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 }
 
 static void
-check_reply(redisReply *reply, redisContext *context, int error_code, char *message, char *arg)
+check_reply(redisReply *reply, redisContext *context, int allowed,
+			int error_code, char *message, char *arg)
 {
 	char	   *err;
 	char	   *xmessage;
@@ -2127,6 +2141,11 @@ check_reply(redisReply *reply, redisContext *context, int error_code, char *mess
 	else if (reply->type == REDIS_REPLY_ERROR)
 	{
 		err = pstrdup(reply->str);
+		freeReplyObject(reply);
+	}
+	else if (allowed != RTYPE_ANY && (allowed & RTYPE(reply->type)) == 0)
+	{
+		err = psprintf("unexpected reply type %d", reply->type);
 		freeReplyObject(reply);
 	}
 	else
@@ -2223,7 +2242,8 @@ redisExecForeignInsert(EState *estate,
 		{
 			bool		ok = true;
 
-			check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+			check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER) | RTYPE(REDIS_REPLY_NIL),
+						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failed checking key existence", NULL);
 
 			if (fmstate->table_type != PG_REDIS_ZSET_TABLE)
@@ -2293,7 +2313,8 @@ redisExecForeignInsert(EState *estate,
 						 ));
 		}
 
-		check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+		check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER) | RTYPE(REDIS_REPLY_STATUS),
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"cannot insert value for key %s", keyval);
 		freeReplyObject(sreply);
 	}
@@ -2339,7 +2360,8 @@ redisExecForeignInsert(EState *estate,
 		/* Check if key is there using EXISTS  */
 		sreply = redisCommand(context, "EXISTS %s",		/* 1 or 0 */
 							  keyval);
-		check_reply(sreply, context, ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+		check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"failed checking key existence", NULL);
 
 		if (sreply->type != REDIS_REPLY_INTEGER || sreply->integer != 0)
@@ -2398,7 +2420,7 @@ redisExecForeignInsert(EState *estate,
 			case PG_REDIS_SCALAR_TABLE:
 				sreply = redisCommand(context, "SET %s %s",
 									  keyval, valueval);
-				check_reply(sreply, context,
+				check_reply(sreply, context, RTYPE(REDIS_REPLY_STATUS),
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"could not add key %s", keyval);
 				freeReplyObject(sreply);
@@ -2413,7 +2435,7 @@ redisExecForeignInsert(EState *estate,
 													  elements[i]);
 						sreply = redisCommand(context, "SADD %s %s",
 											  keyval, valueval);
-						check_reply(sreply, context,
+						check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add set member %s", valueval);
 						freeReplyObject(sreply);
@@ -2430,7 +2452,7 @@ redisExecForeignInsert(EState *estate,
 													  elements[i]);
 						sreply = redisCommand(context, "RPUSH %s %s",
 											  keyval, valueval);
-						check_reply(sreply, context,
+						check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add value %s", valueval);
 					}
@@ -2450,7 +2472,7 @@ redisExecForeignInsert(EState *estate,
 												elements[i + 1]);
 						sreply = redisCommand(context, "HSET %s %s %s",
 											  keyval, hk, hv);
-						check_reply(sreply, context,
+						check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add key %s", hk);
 						freeReplyObject(sreply);
@@ -2474,7 +2496,7 @@ redisExecForeignInsert(EState *estate,
 						 */
 						sreply = redisCommand(context, "ZADD %s %s %s",
 											  keyval, ibuff, valueval);
-						check_reply(sreply, context,
+						check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add key %s", valueval);
 						freeReplyObject(sreply);
@@ -2494,7 +2516,7 @@ redisExecForeignInsert(EState *estate,
 		{
 			sreply = redisCommand(context, "SADD %s %s",
 								  fmstate->keyset, keyval);
-			check_reply(sreply, context,
+			check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"could not add keyset element %s", valueval);
 			freeReplyObject(sreply);
@@ -2568,7 +2590,7 @@ redisExecForeignDelete(EState *estate,
 		reply = redisCommand(context, "DEL %s", keyval);
 	}
 
-	check_reply(reply, context,
+	check_reply(reply, context, RTYPE(REDIS_REPLY_INTEGER),
 				ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 				"failed to delete key %s", keyval);
 	freeReplyObject(reply);
@@ -2578,7 +2600,7 @@ redisExecForeignDelete(EState *estate,
 		reply = redisCommand(context, "SREM %s %s",
 							 fmstate->keyset, keyval);
 
-		check_reply(reply, context,
+		check_reply(reply, context, RTYPE(REDIS_REPLY_INTEGER),
 					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"failed to delete keyset element %s", keyval);
 		freeReplyObject(reply);
@@ -2715,7 +2737,7 @@ redisExecForeignUpdate(EState *estate,
 		{
 			ereply = redisCommand(context, "EXISTS %s", newkey);
 			ok = ereply->type == REDIS_REPLY_INTEGER && ereply->integer == 0;
-			check_reply(ereply, context,
+			check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failed checking key existence %s", newkey);
 		}
@@ -2746,7 +2768,7 @@ redisExecForeignUpdate(EState *estate,
 				else
 					ok = ereply->type == REDIS_REPLY_NIL;
 
-				check_reply(ereply, context,
+				check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER) | RTYPE(REDIS_REPLY_NIL),
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"failed checking key existence %s", keyval);
 			}
@@ -2770,7 +2792,7 @@ redisExecForeignUpdate(EState *estate,
 
 			ereply = redisCommand(context, "RENAME %s %s", keyval, newkey);
 
-			check_reply(ereply, context,
+			check_reply(ereply, context, RTYPE(REDIS_REPLY_STATUS),
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failure renaming key %s", keyval);
 			freeReplyObject(ereply);
@@ -2779,7 +2801,7 @@ redisExecForeignUpdate(EState *estate,
 			{
 				ereply = redisCommand(context, "SET %s %s", newkey, newval);
 
-				check_reply(ereply, context,
+				check_reply(ereply, context, RTYPE(REDIS_REPLY_STATUS),
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"upating key %s", newkey);
 				freeReplyObject(ereply);
@@ -2789,7 +2811,7 @@ redisExecForeignUpdate(EState *estate,
 			{
 				ereply = redisCommand(context, "SREM %s %s", fmstate->keyset,
 									  keyval);
-				check_reply(ereply, context,
+				check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"deleting keyset element %s", keyval);
 				freeReplyObject(ereply);
@@ -2797,7 +2819,7 @@ redisExecForeignUpdate(EState *estate,
 				ereply = redisCommand(context, "SADD %s %s", fmstate->keyset,
 									  newkey);
 
-				check_reply(ereply, context,
+				check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"adding keyset element %s", newkey);
 				freeReplyObject(ereply);			}
@@ -2809,7 +2831,7 @@ redisExecForeignUpdate(EState *estate,
 				case PG_REDIS_SCALAR_TABLE:
 					ereply = redisCommand(context, "SET %s %s",
 										  fmstate->singleton_key, newkey);
-					check_reply(ereply, context,
+					check_reply(ereply, context, RTYPE(REDIS_REPLY_STATUS),
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"setting value %s", newkey);
 					freeReplyObject(ereply);
@@ -2817,13 +2839,13 @@ redisExecForeignUpdate(EState *estate,
 				case PG_REDIS_SET_TABLE:
 					ereply = redisCommand(context, "SREM %s %s",
 										  fmstate->singleton_key, keyval);
-					check_reply(ereply, context,
+					check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"removing value %s", keyval);
 					freeReplyObject(ereply);
 					ereply = redisCommand(context, "SADD %s %s",
 										  fmstate->singleton_key, newkey);
-					check_reply(ereply, context,
+					check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"setting value %s", newkey);
 					freeReplyObject(ereply);
@@ -2837,7 +2859,7 @@ redisExecForeignUpdate(EState *estate,
 							ereply = redisCommand(context, "ZSCORE %s %s",
 												  fmstate->singleton_key,
 												  keyval);
-							check_reply(ereply, context,
+							check_reply(ereply, context, RTYPE(REDIS_REPLY_STRING),
 									  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 										"getting score for key %s", keyval);
 							priority = pstrdup(ereply->str);
@@ -2845,7 +2867,7 @@ redisExecForeignUpdate(EState *estate,
 						}
 						ereply = redisCommand(context, "ZREM %s %s",
 											  fmstate->singleton_key, keyval);
-						check_reply(ereply, context,
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"removing set element %s", keyval);
 						freeReplyObject(ereply);
@@ -2853,7 +2875,7 @@ redisExecForeignUpdate(EState *estate,
 						ereply = redisCommand(context, "ZADD %s %s %s",
 											  fmstate->singleton_key,
 											  priority, newkey);
-						check_reply(ereply, context,
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"setting element %s", newkey);
 						freeReplyObject(ereply);
@@ -2868,7 +2890,7 @@ redisExecForeignUpdate(EState *estate,
 							ereply = redisCommand(context, "HGET %s %s",
 												  fmstate->singleton_key,
 												  keyval);
-							check_reply(ereply, context,
+							check_reply(ereply, context, RTYPE(REDIS_REPLY_STRING),
 									  ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 										"fetching vcalue for key %s", keyval);
 							nval = pstrdup(ereply->str);
@@ -2876,7 +2898,7 @@ redisExecForeignUpdate(EState *estate,
 						}
 						ereply = redisCommand(context, "HDEL %s %s",
 											  fmstate->singleton_key, keyval);
-						check_reply(ereply, context,
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"removing hash element %s", keyval);
 						freeReplyObject(ereply);
@@ -2884,7 +2906,7 @@ redisExecForeignUpdate(EState *estate,
 						ereply = redisCommand(context, "HSET %s %s %s",
 											  fmstate->singleton_key, newkey,
 											  nval);
-						check_reply(ereply, context,
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"adding hash element %s", newkey);
 						freeReplyObject(ereply);
@@ -2914,7 +2936,7 @@ redisExecForeignUpdate(EState *estate,
 				elog(ERROR, "impossible update");		/* should not happen */
 		}
 
-		check_reply(ereply, context,
+		check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER) | RTYPE(REDIS_REPLY_STATUS),
 					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"setting key %s", keyval);
 		freeReplyObject(ereply);
@@ -2926,7 +2948,7 @@ redisExecForeignUpdate(EState *estate,
 		Assert(!fmstate->singleton_key);
 
 		ereply = redisCommand(context, "DEL %s ", newkey);
-		check_reply(ereply, context,
+		check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"could not delete key %s", newkey);
 		freeReplyObject(ereply);
@@ -2941,7 +2963,7 @@ redisExecForeignUpdate(EState *estate,
 					{
 						ereply = redisCommand(context, "SADD %s %s",
 											  newkey, array_vals[i]);
-						check_reply(ereply, context,
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add element %s", array_vals[i]);
 						freeReplyObject(ereply);
@@ -2956,7 +2978,7 @@ redisExecForeignUpdate(EState *estate,
 					{
 						ereply = redisCommand(context, "RPUSH %s %s",
 											  newkey, array_vals[i]);
-						check_reply(ereply, context,
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add value %s", array_vals[i]);
 						freeReplyObject(ereply);
@@ -2975,7 +2997,7 @@ redisExecForeignUpdate(EState *estate,
 						hv = array_vals[i + 1];
 						ereply = redisCommand(context, "HSET %s %s %s",
 											  newkey, hk, hv);
-						check_reply(ereply, context,
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add key %s", hk);
 						freeReplyObject(ereply);
@@ -2999,7 +3021,7 @@ redisExecForeignUpdate(EState *estate,
 						 */
 						ereply = redisCommand(context, "ZADD %s %s %s",
 											  newkey, ibuff, zval);
-						check_reply(ereply, context,
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add key %s", zval);
 						freeReplyObject(ereply);

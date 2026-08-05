@@ -147,7 +147,17 @@ typedef struct RedisFdwExecutionState
 {
 	AttInMetadata *attinmeta;
 	redisContext *context;
+
+	/*
+	 * reply is what the scan iterates over; owned_reply is what has to be
+	 * handed back to hiredis. They are the same object for a singleton key,
+	 * but a cursor scan replies with [cursor, [keys...]] and only the second
+	 * element is iterated, so reply points into owned_reply there. Always
+	 * free owned_reply - freeing reply would ask hiredis to release a subtree
+	 * its parent still points at, and would leak the parent.
+	 */
 	redisReply *reply;
+	redisReply *owned_reply;
 	long long	row;
 	char	   *address;
 	int			port;
@@ -1067,6 +1077,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	node->fdw_state = (void *) festate;
 	festate->context = context;
 	festate->reply = NULL;
+	festate->owned_reply = NULL;
 	festate->row = 0;
 	festate->address = table_options.address;
 	festate->port = table_options.port;
@@ -1162,6 +1173,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 			if (sreply->integer != 1)
 				festate->row = -1;
 
+			freeReplyObject(sreply);
 		}
 		else if (festate->keyprefix)
 		{
@@ -1228,6 +1240,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 
 	if (festate->singleton_key)
 	{
+		festate->owned_reply = reply;
 		festate->reply = reply;
 	}
 	else if (festate->row > -1 && festate->qual_value == NULL)
@@ -1243,14 +1256,27 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		}
 		else
 		{
+			int			replytype = cursor->type;
+
+			freeReplyObject(reply);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-					 errmsg("wrong reply type %d", cursor->type)
+					 errmsg("wrong reply type %d", replytype)
 					 ));
 		}
 
 		/* for cursors, this is the list of elements */
+		festate->owned_reply = reply;
 		festate->reply = reply->element[1];
+	}
+	else
+	{
+		/*
+		 * A qual we checked with EXISTS, or a qual that failed the keyset or
+		 * keyprefix test. Either way nothing iterates this reply, so it has
+		 * to be released here rather than at the end of the scan.
+		 */
+		freeReplyObject(reply);
 	}
 }
 
@@ -1370,6 +1396,9 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 					 ));
 		}
 
+		/* the previous batch's reply is finished with */
+		freeReplyObject(festate->owned_reply);
+		festate->owned_reply = creply;
 		festate->reply = creply->element[1];
 		festate->row = 0;
 	}
@@ -1419,7 +1448,7 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 
 			if (!reply)
 			{
-				freeReplyObject(festate->reply);
+				freeReplyObject(festate->owned_reply);
 				redisFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 						 errmsg("failed to get the value for key \"%s\": %s",
@@ -1526,7 +1555,7 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 				break;
 
 			case REDIS_REPLY_ARRAY:
-				freeReplyObject(festate->reply);
+				freeReplyObject(festate->owned_reply);
 				redisFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 								errmsg("not expecting an array for a singleton scalar table")));
@@ -1551,7 +1580,7 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 				break;
 
 			case REDIS_REPLY_ARRAY:
-				freeReplyObject(festate->reply);
+				freeReplyObject(festate->owned_reply);
 				redisFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 								errmsg("not expecting an array for a single hash property: %s", festate->qual_value)));
@@ -1581,7 +1610,7 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 					break;
 
 				case REDIS_REPLY_ARRAY:
-					freeReplyObject(festate->reply);
+					freeReplyObject(festate->owned_reply);
 					redisFree(festate->context);
 					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 									errmsg("not expecting array for a hash value or zset score")
@@ -1622,8 +1651,8 @@ redisEndForeignScan(ForeignScanState *node)
 	/* if festate is NULL, we are in EXPLAIN; nothing to do */
 	if (festate)
 	{
-		if (festate->reply)
-			freeReplyObject(festate->reply);
+		if (festate->owned_reply)
+			freeReplyObject(festate->owned_reply);
 
 		if (festate->context)
 			redisFree(festate->context);

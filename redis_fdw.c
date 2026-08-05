@@ -1231,7 +1231,25 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	}
 	else if (festate->row > -1 && festate->qual_value == NULL)
 	{
-		redisReply *cursor = reply->element[0];
+		redisReply *cursor;
+
+		/*
+		 * SCAN and SSCAN answer with [cursor, [keys...]]. Verify that before
+		 * indexing into it: a reply that is not an array has element == NULL,
+		 * so reply->element[0] would dereference NULL rather than raise an
+		 * error. The type mask cannot express the element count, so the arity
+		 * is checked here.
+		 */
+		if (reply->type != REDIS_REPLY_ARRAY || reply->elements != 2)
+		{
+			freeReplyObject(reply);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+					 errmsg("unexpected reply shape from %s",
+							festate->cursor_search_string)));
+		}
+
+		cursor = reply->element[0];
 
 		if (cursor->type == REDIS_REPLY_STRING)
 		{
@@ -1358,6 +1376,15 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
 					 errmsg("failed somehow: %s", err)
 					 ));
+		}
+
+		if (creply->type != REDIS_REPLY_ARRAY || creply->elements != 2)
+		{
+			freeReplyObject(creply);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+					 errmsg("unexpected reply shape from %s",
+							festate->cursor_search_string)));
 		}
 
 		cursor = creply->element[0];

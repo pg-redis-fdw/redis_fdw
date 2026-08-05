@@ -753,15 +753,11 @@ redisGetForeignRelSize(PlannerInfo *root,
 	/* Select the appropriate database */
 	reply = redisCommand(context, "SELECT %d", table_options.database);
 
-	if (!reply)
-	{
-		redisFree(context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to select database %d: %d",
-						table_options.database, context->err)
-				 ));
-	}
+	check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
+				ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+				"failed to select database", NULL);
+
+	freeReplyObject(reply);
 
 	/* Execute a query to get the table size */
 #if 0
@@ -814,20 +810,10 @@ redisGetForeignRelSize(PlannerInfo *root,
 		reply = redisCommand(context, "DBSIZE");
 	}
 
-	if (!reply)
-	{
-		redisFree(context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to get the database size: %d", context->err)
-				 ));
-	}
+	check_reply(reply, context, RTYPE(REDIS_REPLY_INTEGER),
+				ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+				"failed to get the database size", NULL);
 
-#if 0
-	if (reply->type == REDIS_REPLY_ARRAY)
-		baserel->rows = reply->elements;
-	else
-#endif
 	if (table_options.keyprefix)
 		baserel->rows = reply->integer / 20;
 	else
@@ -959,24 +945,9 @@ redisExplainForeignScan(ForeignScanState *node, ExplainState *es)
 		reply = redisCommand(festate->context, "DBSIZE");
 	}
 
-	if (!reply)
-	{
-		redisFree(festate->context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-			errmsg("failed to get the table size: %d", festate->context->err)
-				 ));
-	}
-
-	if (reply->type == REDIS_REPLY_ERROR)
-	{
-		char	   *err = pstrdup(reply->str);
-
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to get the table size: %s", err)
-				 ));
-	}
+	check_reply(reply, festate->context, RTYPE(REDIS_REPLY_INTEGER),
+				ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+				"failed to get the table size", NULL);
 
 	ExplainPropertyInteger("Foreign Redis Table Size", "b",
 						festate->keyprefix ? reply->integer / 20 :

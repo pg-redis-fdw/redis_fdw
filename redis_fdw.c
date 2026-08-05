@@ -758,6 +758,7 @@ redisGetForeignRelSize(PlannerInfo *root,
 				"failed to select database", NULL);
 
 	freeReplyObject(reply);
+	reply = NULL;
 
 	/* Execute a query to get the table size */
 #if 0
@@ -1014,26 +1015,9 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	/* Select the appropriate database */
 	reply = redisCommand(context, "SELECT %d", table_options.database);
 
-	if (!reply)
-	{
-		redisFree(context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to select database %d: %s",
-						table_options.database, context->errstr)
-				 ));
-	}
-
-	if (reply->type == REDIS_REPLY_ERROR)
-	{
-		char	   *err = pstrdup(reply->str);
-
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to select database %d: %s",
-						table_options.database, err)
-				 ));
-	}
+	check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
+				ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
+				"failed to select database", NULL);
 
 	freeReplyObject(reply);
 

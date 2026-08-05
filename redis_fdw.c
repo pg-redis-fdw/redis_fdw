@@ -2767,19 +2767,29 @@ redisExecForeignUpdate(EState *estate,
 
 			if (fmstate->keyset)
 			{
-				ereply = redisCommand(context, "SREM %s %s", fmstate->keyset,
-									  keyval);
-				check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-							"deleting keyset element %s", keyval);
-				freeReplyObject(ereply);
-
+				/*
+				 * Add the new element before removing the old one. Redis
+				 * gives us nothing to roll back with, so if the add fails
+				 * the remove must not already have happened - otherwise a
+				 * failed UPDATE drops the key from the keyset and the row
+				 * disappears. The reverse order is safe: the new key differs
+				 * from the old one and is known not to be present, because
+				 * we only reach here past the key comparison and the
+				 * duplicate check.
+				 */
 				ereply = redisCommand(context, "SADD %s %s", fmstate->keyset,
 									  newkey);
 
 				check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"adding keyset element %s", newkey);
+				freeReplyObject(ereply);
+
+				ereply = redisCommand(context, "SREM %s %s", fmstate->keyset,
+									  keyval);
+				check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+							"deleting keyset element %s", keyval);
 				freeReplyObject(ereply);			}
 		}
 		else	/* is a singleton */
@@ -2795,17 +2805,18 @@ redisExecForeignUpdate(EState *estate,
 					freeReplyObject(ereply);
 					break;
 				case PG_REDIS_SET_TABLE:
-					ereply = redisCommand(context, "SREM %s %s",
-										  fmstate->singleton_key, keyval);
-					check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-								"removing value %s", keyval);
-					freeReplyObject(ereply);
+					/* add before removing - see the keyset case above */
 					ereply = redisCommand(context, "SADD %s %s",
 										  fmstate->singleton_key, newkey);
 					check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 								"setting value %s", newkey);
+					freeReplyObject(ereply);
+					ereply = redisCommand(context, "SREM %s %s",
+										  fmstate->singleton_key, keyval);
+					check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+								"removing value %s", keyval);
 					freeReplyObject(ereply);
 					break;
 				case PG_REDIS_ZSET_TABLE:
@@ -2823,19 +2834,25 @@ redisExecForeignUpdate(EState *estate,
 							priority = pstrdup(ereply->str);
 							freeReplyObject(ereply);
 						}
-						ereply = redisCommand(context, "ZREM %s %s",
-											  fmstate->singleton_key, keyval);
-						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"removing set element %s", keyval);
-						freeReplyObject(ereply);
-
+						/*
+						 * Add before removing - see the keyset case above.
+						 * The score was read from the old member further up,
+						 * so it is already in hand and the add cannot need
+						 * the old member to still exist.
+						 */
 						ereply = redisCommand(context, "ZADD %s %s %s",
 											  fmstate->singleton_key,
 											  priority, newkey);
 						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"setting element %s", newkey);
+						freeReplyObject(ereply);
+
+						ereply = redisCommand(context, "ZREM %s %s",
+											  fmstate->singleton_key, keyval);
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"removing set element %s", keyval);
 						freeReplyObject(ereply);
 					}
 					break;

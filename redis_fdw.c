@@ -35,6 +35,7 @@
 #include "access/reloptions.h"
 #include "access/sysattr.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_user_mapping.h"
@@ -53,6 +54,7 @@
 #include "nodes/pathnodes.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
+#include "nodes/pg_list.h"
 #include "optimizer/appendinfo.h"
 #if PG_VERSION_NUM >= 160000
 #include "optimizer/inherit.h"
@@ -65,8 +67,12 @@
 #include "storage/fd.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
+#include "storage/ipc.h"
 
 PG_MODULE_MAGIC;
 
@@ -200,6 +206,39 @@ typedef struct RedisFdwModifyState
 #define COUNT " COUNT 1000"
 
 /*
+ * Connection cache structures
+ */
+#define REDIS_CONN_CACHE_SIZE 32
+
+typedef struct RedisConnCacheKey
+{
+	char		address[256];
+	int			port;
+	char		password[256];
+	int			database;
+} RedisConnCacheKey;
+
+typedef struct RedisConnCacheEntry
+{
+	RedisConnCacheKey key;		/* Must be first for hash lookup */
+	redisContext *context;
+	bool		used_in_xact;	/* checked out in the current transaction */
+	bool		invalidated;	/* discard at end of transaction */
+} RedisConnCacheEntry;
+
+/* Connection cache - shared within backend */
+static HTAB *RedisConnCache = NULL;
+static bool RedisConnCacheInitialized = false;
+
+/*
+ * Connections discarded because their socket failed. Freeing one at the point
+ * of discard would leave a concurrent holder with a dangling pointer -- two
+ * scans in one query can share a cache entry -- so the redisFree is deferred
+ * to end of transaction, by which time no executor state holds a reference.
+ */
+static List *RedisDeadContexts = NIL;
+
+/*
  * SQL functions
  */
 extern Datum redis_fdw_handler(PG_FUNCTION_ARGS);
@@ -296,6 +335,18 @@ static char *redis_escape_glob(const char *str);
 static void check_reply(redisReply *reply, redisContext *context,
 						int allowed, int error_code, char *message, char *arg);
 
+/* Connection cache functions */
+static void redis_conn_cache_init(void);
+static void redis_conn_cache_cleanup(int code, Datum arg);
+static void redis_conn_cache_invalidate_callback(Datum arg, int cacheid, uint32 hashvalue);
+static void redis_build_cache_key(RedisConnCacheKey *key, redisTableOptions *options);
+static bool redis_validate_connection(redisContext *context);
+static redisContext *redis_get_connection(redisTableOptions *options);
+static RedisConnCacheEntry *redis_find_cache_entry(redisContext *context);
+static void redis_discard_connection(redisContext *context);
+static void redis_conn_cache_end_xact(void);
+static void redis_xact_callback(XactEvent event, void *arg);
+
 /*
  * Name we will use for the junk attribute that holds the redis key
  * for update and delete operations.
@@ -337,6 +388,431 @@ redis_fdw_handler(PG_FUNCTION_ARGS)
 	fdwroutine->AddForeignUpdateTargets = redisAddForeignUpdateTargets; /* U D */
 
 	PG_RETURN_POINTER(fdwroutine);
+}
+
+/*
+ * redis_conn_cache_init
+ *		Initialize the connection cache hash table.
+ */
+static void
+redis_conn_cache_init(void)
+{
+	HASHCTL		hash_ctl;
+
+	if (RedisConnCacheInitialized)
+		return;
+
+	memset(&hash_ctl, 0, sizeof(hash_ctl));
+	hash_ctl.keysize = sizeof(RedisConnCacheKey);
+	hash_ctl.entrysize = sizeof(RedisConnCacheEntry);
+	hash_ctl.hcxt = CacheMemoryContext;
+
+	RedisConnCache = hash_create("redis_fdw connection cache",
+								 REDIS_CONN_CACHE_SIZE,
+								 &hash_ctl,
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	on_proc_exit(redis_conn_cache_cleanup, 0);
+
+	RedisConnCacheInitialized = true;
+}
+
+/*
+ * redis_conn_cache_cleanup
+ *		Clean up all cached connections on backend exit.
+ */
+static void
+redis_conn_cache_cleanup(int code, Datum arg)
+{
+	ListCell   *lc;
+
+	if (RedisConnCacheInitialized && RedisConnCache)
+	{
+		HASH_SEQ_STATUS scan;
+		RedisConnCacheEntry *entry;
+
+		hash_seq_init(&scan, RedisConnCache);
+		while ((entry = hash_seq_search(&scan)) != NULL)
+		{
+			if (entry->context)
+			{
+				redisFree(entry->context);
+				entry->context = NULL;
+			}
+		}
+	}
+
+	foreach(lc, RedisDeadContexts)
+		redisFree((redisContext *) lfirst(lc));
+
+	RedisDeadContexts = NIL;
+}
+
+/*
+ * redis_conn_cache_invalidate_callback
+ *		Syscache callback for FOREIGNSERVEROID/USERMAPPINGOID.
+ *
+ *		This is not what makes an option change take effect. The cache is
+ *		keyed by the connection option values themselves, so an ALTER SERVER
+ *		or ALTER USER MAPPING that changes any of them produces a different
+ *		key: the next lookup misses and connects to the new target whether
+ *		or not this callback ran. Correctness does not depend on it.
+ *
+ *		What it does is reclaim the superseded entry. Without it the old key
+ *		keeps its context - and its socket - for the life of the backend,
+ *		because nothing will ever look that key up again. Marking every
+ *		entry invalidated is blunt, and it fires for changes to any foreign
+ *		server or user mapping in the database, including those belonging to
+ *		other FDWs; that is acceptable only because this cache is
+ *		per-backend, small, and cheap to repopulate.
+ *
+ *		An entry in use in the current transaction is not disturbed here -
+ *		redis_conn_cache_end_xact() drops it at end of transaction.
+ */
+static void
+redis_conn_cache_invalidate_callback(Datum arg, int cacheid, uint32 hashvalue)
+{
+	HASH_SEQ_STATUS scan;
+	RedisConnCacheEntry *entry;
+
+	if (!RedisConnCacheInitialized || !RedisConnCache)
+		return;
+
+	hash_seq_init(&scan, RedisConnCache);
+	while ((entry = hash_seq_search(&scan)) != NULL)
+		entry->invalidated = true;
+}
+
+/*
+ * redis_conn_cache_end_xact
+ *		End-of-transaction cleanup for the connection cache.
+ *
+ *		Cached connections are held for the duration of a transaction, so this
+ *		is where they are released: clear the per-transaction mark on every
+ *		entry, drop any entry a syscache invalidation marked stale, and free
+ *		the contexts discarded during the transaction.
+ *
+ *		Entries are left in the hash with a NULL context rather than removed,
+ *		as postgres_fdw does; the key is small and will very likely be reused.
+ */
+static void
+redis_conn_cache_end_xact(void)
+{
+	ListCell   *lc;
+
+	if (RedisConnCacheInitialized && RedisConnCache)
+	{
+		HASH_SEQ_STATUS scan;
+		RedisConnCacheEntry *entry;
+
+		hash_seq_init(&scan, RedisConnCache);
+		while ((entry = hash_seq_search(&scan)) != NULL)
+		{
+			entry->used_in_xact = false;
+
+			if (entry->invalidated && entry->context)
+			{
+				redisFree(entry->context);
+				entry->context = NULL;
+				entry->invalidated = false;
+			}
+		}
+	}
+
+	foreach(lc, RedisDeadContexts)
+		redisFree((redisContext *) lfirst(lc));
+
+	list_free(RedisDeadContexts);
+	RedisDeadContexts = NIL;
+}
+
+/*
+ * redis_xact_callback
+ *		Transaction callback: the executor End nodes do not run when a
+ *		statement aborts, so end of transaction is the only point at which
+ *		connection cleanup is guaranteed to happen on both the success and the
+ *		failure path. This mirrors postgres_fdw's pgfdw_xact_callback.
+ *
+ *		No subtransaction callback is needed: nothing is released at
+ *		subtransaction boundaries, so a subtransaction abort has nothing to
+ *		reconcile.
+ */
+static void
+redis_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PREPARE:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			redis_conn_cache_end_xact();
+			break;
+		default:
+			break;
+	}
+}
+
+/*
+ * _PG_init
+ *		Module load callback: register for invalidation of cached
+ *		connections when a foreign server or user mapping changes.
+ */
+void
+_PG_init(void)
+{
+	CacheRegisterSyscacheCallback(FOREIGNSERVEROID,
+								   redis_conn_cache_invalidate_callback,
+								   (Datum) 0);
+	CacheRegisterSyscacheCallback(USERMAPPINGOID,
+								   redis_conn_cache_invalidate_callback,
+								   (Datum) 0);
+
+	RegisterXactCallback(redis_xact_callback, NULL);
+}
+
+/*
+ * redis_build_cache_key
+ *		Build a cache key from connection options.
+ */
+static void
+redis_build_cache_key(RedisConnCacheKey *key, redisTableOptions *options)
+{
+	memset(key, 0, sizeof(RedisConnCacheKey));
+
+	if (options->address)
+		strlcpy(key->address, options->address, sizeof(key->address));
+	else
+		strlcpy(key->address, "127.0.0.1", sizeof(key->address));
+
+	key->port = options->port ? options->port : 6379;
+
+	if (options->password)
+		strlcpy(key->password, options->password, sizeof(key->password));
+
+	key->database = options->database;
+}
+
+/*
+ * redis_validate_connection
+ *		Check if a cached connection is still alive using PING.
+ */
+static bool
+redis_validate_connection(redisContext *context)
+{
+	redisReply *reply;
+	bool		valid = false;
+
+	if (!context)
+		return false;
+
+	reply = redisCommand(context, "PING");
+
+	if (reply && reply->type == REDIS_REPLY_STATUS &&
+		strcmp(reply->str, "PONG") == 0)
+	{
+		valid = true;
+	}
+
+	if (reply)
+		freeReplyObject(reply);
+
+	return valid;
+}
+
+/*
+ * redis_get_connection
+ *		Get a connection from cache or create a new one.
+ *		The connection is held until end of transaction and released by
+ *		redis_conn_cache_end_xact; callers must not free or release it.
+ */
+static redisContext *
+redis_get_connection(redisTableOptions *options)
+{
+	RedisConnCacheKey key;
+	RedisConnCacheEntry *entry;
+	bool		found;
+	redisContext *context;
+	redisReply *reply;
+	struct timeval timeout = {1, 500000};
+
+	redis_conn_cache_init();
+
+	redis_build_cache_key(&key, options);
+
+	entry = hash_search(RedisConnCache, &key, HASH_ENTER, &found);
+
+	if (found && entry->context)
+	{
+		/*
+		 * A connection is held for the whole transaction, so it only needs
+		 * validating on its first checkout in each one.
+		 *
+		 * This deliberately tests used_in_xact before invalidated: an entry
+		 * can only be both at once when a syscache invalidation marked it
+		 * while the socket still works, and in that case the teardown belongs
+		 * at end of transaction rather than in the middle of a statement. The
+		 * I/O-failure path clears used_in_xact, so it never reaches here.
+		 */
+		if (entry->used_in_xact)
+			return entry->context;
+
+		if (!entry->invalidated && redis_validate_connection(entry->context))
+		{
+			entry->used_in_xact = true;
+			return entry->context;
+		}
+
+		redis_discard_connection(entry->context);
+	}
+
+	context = redisConnectWithTimeout(
+		options->address ? options->address : "127.0.0.1",
+		options->port ? options->port : 6379,
+		timeout);
+
+	if (context->err)
+	{
+		char	   *errstr = pstrdup(context->errstr);
+
+		redisFree(context);
+		hash_search(RedisConnCache, &key, HASH_REMOVE, NULL);
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+				 errmsg("failed to connect to Redis: %s", errstr)));
+	}
+
+	if (options->password)
+	{
+		reply = redisCommand(context, "AUTH %s", options->password);
+
+		if (!reply)
+		{
+			char	   *err = pstrdup(context->errstr);
+
+			redisFree(context);
+			hash_search(RedisConnCache, &key, HASH_REMOVE, NULL);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("failed to authenticate to Redis: %s", err)));
+		}
+
+		if (reply->type == REDIS_REPLY_ERROR)
+		{
+			char	   *err = pstrdup(reply->str);
+
+			freeReplyObject(reply);
+			redisFree(context);
+			hash_search(RedisConnCache, &key, HASH_REMOVE, NULL);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("failed to authenticate to Redis: %s", err)));
+		}
+
+		freeReplyObject(reply);
+	}
+
+	reply = redisCommand(context, "SELECT %d", options->database);
+
+	if (!reply)
+	{
+		char	   *err = pstrdup(context->errstr);
+
+		redisFree(context);
+		hash_search(RedisConnCache, &key, HASH_REMOVE, NULL);
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+				 errmsg("failed to select database %d: %s",
+						options->database, err)));
+	}
+
+	if (reply->type == REDIS_REPLY_ERROR)
+	{
+		char	   *err = pstrdup(reply->str);
+
+		freeReplyObject(reply);
+		redisFree(context);
+		hash_search(RedisConnCache, &key, HASH_REMOVE, NULL);
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+				 errmsg("failed to select database %d: %s",
+						options->database, err)));
+	}
+
+	freeReplyObject(reply);
+
+	entry->context = context;
+	entry->used_in_xact = true;
+	entry->invalidated = false;
+
+	return context;
+}
+
+/*
+ * redis_find_cache_entry
+ *		Find the cache entry currently holding the given connection, if any.
+ */
+static RedisConnCacheEntry *
+redis_find_cache_entry(redisContext *context)
+{
+	HASH_SEQ_STATUS scan;
+	RedisConnCacheEntry *entry;
+
+	if (!context || !RedisConnCacheInitialized || !RedisConnCache)
+		return NULL;
+
+	hash_seq_init(&scan, RedisConnCache);
+	while ((entry = hash_seq_search(&scan)) != NULL)
+	{
+		if (entry->context == context)
+		{
+			hash_seq_term(&scan);
+			return entry;
+		}
+	}
+
+	return NULL;
+}
+
+/*
+ * redis_discard_connection
+ *		Drop a connection whose socket has failed, so that the next checkout
+ *		reconnects.
+ *
+ *		The context is not freed here. A concurrent holder may still point at
+ *		it -- two scans in one query can share a cache entry -- so the free is
+ *		deferred to end of transaction, where nothing holds a reference. A
+ *		stale holder is left pointing at valid memory backing a dead socket,
+ *		so it gets an error rather than a crash. The deferral also covers
+ *		this function's own callers: several of them read context->err or
+ *		context->errstr for an error message immediately after calling this,
+ *		which is only safe because the context they are still holding has not
+ *		actually been freed yet.
+ *
+ *		Unlike postgres_fdw, this reconnects mid-transaction rather than
+ *		poisoning the connection until the transaction ends. postgres_fdw must
+ *		refuse, because reconnecting would abandon an open remote transaction
+ *		and its uncommitted writes; Redis has no transaction to abandon, and
+ *		refusing would strand the user partway through writes that have
+ *		already been applied and that no rollback will undo.
+ */
+static void
+redis_discard_connection(redisContext *context)
+{
+	RedisConnCacheEntry *entry = redis_find_cache_entry(context);
+	MemoryContext oldcxt;
+
+	if (!entry || !entry->context)
+		return;
+
+	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+	RedisDeadContexts = lappend(RedisDeadContexts, entry->context);
+	MemoryContextSwitchTo(oldcxt);
+
+	entry->context = NULL;
+	entry->invalidated = false;
+	entry->used_in_xact = false;
 }
 
 /*
@@ -704,8 +1180,7 @@ redisGetForeignRelSize(PlannerInfo *root,
 	redisTableOptions table_options;
 
 	redisContext *context;
-	redisReply *reply;
-	struct timeval timeout = {1, 500000};
+	redisReply *reply = NULL;
 
 #ifdef DEBUG
 	elog(NOTICE, "redisGetForeignRelSize");
@@ -724,36 +1199,8 @@ redisGetForeignRelSize(PlannerInfo *root,
 	fdw_private->svr_port = table_options.port;
 	fdw_private->svr_database = table_options.database;
 
-	/* Connect to the database */
-	context = redisConnectWithTimeout(table_options.address, table_options.port,
-									  timeout);
-	if (context->err)
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to connect to Redis: %d", context->err)
-				 ));
-
-	/* Authenticate */
-	if (table_options.password)
-	{
-		reply = redisCommand(context, "AUTH %s", table_options.password);
-
-		check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
-					ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
-					"failed to authenticate to redis", NULL);
-
-		freeReplyObject(reply);
-	}
-
-	/* Select the appropriate database */
-	reply = redisCommand(context, "SELECT %d", table_options.database);
-
-	check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
-				ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-				"failed to select database", NULL);
-
-	freeReplyObject(reply);
-	reply = NULL;
+	/* Connect to the database (via connection cache) */
+	context = redis_get_connection(&table_options);
 
 	/* Execute a query to get the table size */
 #if 0
@@ -816,7 +1263,6 @@ redisGetForeignRelSize(PlannerInfo *root,
 		baserel->rows = reply->integer;
 
 	freeReplyObject(reply);
-	redisFree(context);
 }
 
 /*
@@ -962,12 +1408,11 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 {
 	redisTableOptions table_options;
 	redisContext *context;
-	redisReply *reply;
+	redisReply *reply = NULL;
 	char	   *qual_key = NULL;
 	char	   *qual_value = NULL;
 	bool		pushdown = false;
 	RedisFdwExecutionState *festate;
-	struct timeval timeout = {1, 500000};
 
 #ifdef DEBUG
 	elog(NOTICE, "BeginForeignScan");
@@ -977,39 +1422,8 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	redisGetOptions(RelationGetRelid(node->ss.ss_currentRelation),
 					&table_options);
 
-	/* Connect to the server */
-	context = redisConnectWithTimeout(table_options.address,
-									  table_options.port, timeout);
-
-	if (context->err)
-	{
-		redisFree(context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to connect to Redis: %s", context->errstr)
-				 ));
-	}
-
-	/* Authenticate */
-	if (table_options.password)
-	{
-		reply = redisCommand(context, "AUTH %s", table_options.password);
-
-		check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
-					ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
-					"failed to authenticate to redis", NULL);
-
-		freeReplyObject(reply);
-	}
-
-	/* Select the appropriate database */
-	reply = redisCommand(context, "SELECT %d", table_options.database);
-
-	check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
-				ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
-				"failed to select database", NULL);
-
-	freeReplyObject(reply);
+	/* Connect to the server (via connection cache) */
+	context = redis_get_connection(&table_options);
 
 	/* See if we've got a qual we can push down */
 	if (node->ss.ps.plan->qual)
@@ -1163,10 +1577,10 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 
 	if (!reply)
 	{
-		redisFree(festate->context);
+		redis_discard_connection(festate->context);
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("failed to list keys: %s", context->errstr)
+				 errmsg("failed to list keys: %s", festate->context->errstr)
 				 ));
 	}
 	else if (reply->type == REDIS_REPLY_ERROR)
@@ -1320,7 +1734,7 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 
 		if (!creply)
 		{
-			redisFree(festate->context);
+			redis_discard_connection(festate->context);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
 					 errmsg("failed to list keys: %s",
@@ -1422,7 +1836,7 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 			if (!reply)
 			{
 				freeReplyObject(festate->owned_reply);
-				redisFree(festate->context);
+				redis_discard_connection(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 						 errmsg("failed to get the value for key \"%s\": %s",
 								key, festate->context->errstr)
@@ -1529,7 +1943,6 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 
 			case REDIS_REPLY_ARRAY:
 				freeReplyObject(festate->owned_reply);
-				redisFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 								errmsg("not expecting an array for a singleton scalar table")));
 				break;
@@ -1554,7 +1967,6 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 
 			case REDIS_REPLY_ARRAY:
 				freeReplyObject(festate->owned_reply);
-				redisFree(festate->context);
 				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 								errmsg("not expecting an array for a single hash property: %s", festate->qual_value)));
 				break;
@@ -1584,7 +1996,6 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 
 				case REDIS_REPLY_ARRAY:
 					freeReplyObject(festate->owned_reply);
-					redisFree(festate->context);
 					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 									errmsg("not expecting array for a hash value or zset score")
 									));
@@ -1626,9 +2037,6 @@ redisEndForeignScan(ForeignScanState *node)
 	{
 		if (festate->owned_reply)
 			freeReplyObject(festate->owned_reply);
-
-		if (festate->context)
-			redisFree(festate->context);
 	}
 }
 
@@ -1898,9 +2306,7 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 {
 	redisTableOptions table_options;
 	redisContext *context;
-	redisReply *reply;
 	RedisFdwModifyState *fmstate;
-	struct timeval timeout = {1, 500000};
 	Relation	rel = rinfo->ri_RelationDesc;
 	ListCell   *lc;
 	Oid			typefnoid;
@@ -2044,39 +2450,8 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
-	/* Finally, Connect to the server and set the Redis execution context */
-	context = redisConnectWithTimeout(table_options.address,
-									  table_options.port, timeout);
-
-	if (context->err)
-	{
-		redisFree(context);
-		ereport(ERROR,
-				(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-				 errmsg("failed to connect to Redis: %s", context->errstr)
-				 ));
-	}
-
-	/* Authenticate */
-	if (table_options.password)
-	{
-		reply = redisCommand(context, "AUTH %s", table_options.password);
-
-		check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
-					ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
-					"failed to authenticate to redis", NULL);
-
-		freeReplyObject(reply);
-	}
-
-	/* Select the appropriate database */
-	reply = redisCommand(context, "SELECT %d", table_options.database);
-
-	check_reply(reply, context, RTYPE(REDIS_REPLY_STATUS),
-				ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION,
-				"failed to select database", NULL);
-
-	freeReplyObject(reply);
+	/* Connect to the server (via connection cache) */
+	context = redis_get_connection(&table_options);
 
 	fmstate->context = context;
 }
@@ -2092,19 +2467,27 @@ check_reply(redisReply *reply, redisContext *context, int allowed,
 	if (!reply)
 	{
 		err = pstrdup(context->errstr);
-		redisFree(context);
+
+		/*
+		 * Don't free context here - redis_discard_connection() discards it
+		 * and reconnects on the next checkout.
+		 */
+		redis_discard_connection(context);
 	}
 	else if (reply->type == REDIS_REPLY_ERROR)
 	{
+		/*
+		 * The connection is fine - Redis just refused the command - and the
+		 * cache owns it, so leave it alone. Freeing it here would leave the
+		 * cache holding a dangling pointer for the next statement to reuse.
+		 */
 		err = pstrdup(reply->str);
 		freeReplyObject(reply);
-		redisFree(context);
 	}
 	else if (allowed != RTYPE_ANY && (allowed & RTYPE(reply->type)) == 0)
 	{
 		err = psprintf("unexpected reply type %d", reply->type);
 		freeReplyObject(reply);
-		redisFree(context);
 	}
 	else
 		return;
@@ -3022,18 +3405,9 @@ static void
 redisEndForeignModify(EState *estate,
 					  ResultRelInfo *rinfo)
 {
-	RedisFdwModifyState *fmstate = (RedisFdwModifyState *) rinfo->ri_FdwState;
-
 #ifdef DEBUG
-	elog(NOTICE, "redisEndForeignScan");
+	elog(NOTICE, "redisEndForeignModify");
 #endif
-
-	/* if fmstate is NULL, we are in EXPLAIN; nothing to do */
-	if (fmstate)
-	{
-		if (fmstate->context)
-			redisFree(fmstate->context);
-	}
 }
 
 /*

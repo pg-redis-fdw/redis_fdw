@@ -958,6 +958,26 @@ insert into db15_w_nulls_multi values ('k', null);
 drop foreign table db15_w_nulls_hash;
 drop foreign table db15_w_nulls_zset;
 drop foreign table db15_w_nulls_multi;
+-- a self-join opens two concurrent ForeignScans sharing the same cache key
+-- (same connection options); results must be correct regardless.
+-- ALTER SERVER (even a no-op value change) exercises the connection cache's
+-- invalidation path; queries against the table must keep working afterwards.
+
+create foreign table db15_cachetest(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'cachetest_');
+
+insert into db15_cachetest values
+       ('cachetest_a', '1'), ('cachetest_b', '2'), ('cachetest_c', '3');
+
+select count(*) from db15_cachetest t1 join db15_cachetest t2
+       on t1.key <> t2.key;
+
+alter server localredis options (add address '127.0.0.1');
+
+select value from db15_cachetest where key = 'cachetest_a';
+
+drop foreign table db15_cachetest;
 
 -- A tablekeyprefix is a literal prefix, not a glob pattern. It is embedded in
 -- the KEYS/SCAN MATCH pattern used to find the table's keys, so any glob
@@ -1003,6 +1023,49 @@ drop foreign table db15_glob_star;
 drop foreign table db15_glob_quest;
 drop foreign table db15_glob_class;
 drop foreign table db15_glob_plain;
+-- An aborted statement must not wedge the backend's Redis connection.
+-- The abort skips the executor End nodes, so anything the FDW expects those
+-- nodes to clean up is never cleaned up; a connection cache that relies on
+-- them will hand out a dead socket for the rest of the session.
+
+create foreign table db15_conntest(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'conntest_');
+
+insert into db15_conntest values ('conntest_a', 'notanumber');
+
+-- abort a statement partway through a scan
+select value::int from db15_conntest;
+
+-- Kill the backend's cached Redis connection from the server side. CLIENT
+-- KILL defaults to SKIPME yes, so redis-cli spares its own connection. Like
+-- the rest of this suite, this assumes redis-cli runs on the same host as
+-- the PostgreSQL server.
+\! redis-cli CLIENT KILL TYPE normal > /dev/null
+
+-- must reconnect rather than reuse the dead socket
+select value from db15_conntest;
+
+-- A connection lost mid-transaction is re-established without ending the
+-- transaction, and a subtransaction abort needs no special handling.
+begin;
+select value from db15_conntest;
+\! redis-cli CLIENT KILL TYPE normal > /dev/null
+savepoint s;
+-- the error text comes from hiredis and varies by version, so normalise it
+do $$
+begin
+  perform value from db15_conntest;
+  raise notice 'unexpectedly succeeded on a dead socket';
+exception when others then
+  raise notice 'connection loss detected';
+end
+$$;
+rollback to s;
+select value from db15_conntest;
+commit;
+
+drop foreign table db15_conntest;
 
 -- all done, so now blow everything in the db away again
 

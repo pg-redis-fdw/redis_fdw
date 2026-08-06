@@ -117,6 +117,14 @@ Usage
 `redis_fdw` accepts the following options via the `CREATE USER MAPPING`
 command:
 
+- **username** as *string*, optional, no default
+
+  The username to authenticate to the Redis server with, for servers using
+  Redis ACLs (`AUTH username password`). If omitted, the legacy
+  password-only form (`AUTH password`) is used. Requires **password**: a
+  username on its own is rejected, since authentication is only attempted
+  when a password is present.
+
 - **password** as *string*, no default
 
   The password to authenticate to the Redis server with.
@@ -246,6 +254,19 @@ Where `pguser` is a sample user for works with foreign server (and foreign table
 	CREATE USER MAPPING FOR pguser
 	SERVER redis_server
 	OPTIONS (
+	  password 'secret'
+	);
+```
+
+If the Redis server uses ACLs, a `username` option can be supplied alongside
+`password` to authenticate as a specific ACL user instead of the default
+user:
+
+```sql
+	CREATE USER MAPPING FOR pguser
+	SERVER redis_server
+	OPTIONS (
+	  username 'redisuser',
 	  password 'secret'
 	);
 ```

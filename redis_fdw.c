@@ -103,6 +103,7 @@ static struct RedisFdwOption valid_options[] =
 	/* Connection options */
 	{"address", ForeignServerRelationId},
 	{"port", ForeignServerRelationId},
+	{"username", UserMappingRelationId},
 	{"password", UserMappingRelationId},
 
 	/* table options */
@@ -140,6 +141,7 @@ typedef struct redisTableOptions
 {
 	char	   *address;
 	int			port;
+	char	   *username;
 	char	   *password;
 	int			database;
 	char	   *keyprefix;
@@ -229,6 +231,7 @@ typedef struct RedisConnCacheKey
 {
 	char		address[256];
 	int			port;
+	char		username[256];
 	char		password[256];
 	int			database;
 } RedisConnCacheKey;
@@ -375,6 +378,8 @@ static void redis_conn_cache_cleanup(int code, Datum arg);
 static void redis_conn_cache_invalidate_callback(Datum arg, int cacheid, uint32 hashvalue);
 static void redis_build_cache_key(RedisConnCacheKey *key, redisTableOptions *options);
 static bool redis_validate_connection(redisContext *context);
+static redisReply *redis_authenticate(redisContext *context,
+						const char *username, const char *password);
 static redisContext *redis_get_connection(redisTableOptions *options);
 static RedisConnCacheEntry *redis_find_cache_entry(redisContext *context);
 static void redis_discard_connection(redisContext *context);
@@ -622,6 +627,9 @@ redis_build_cache_key(RedisConnCacheKey *key, redisTableOptions *options)
 
 	key->port = options->port ? options->port : 6379;
 
+	if (options->username)
+		strlcpy(key->username, options->username, sizeof(key->username));
+
 	if (options->password)
 		strlcpy(key->password, options->password, sizeof(key->password));
 
@@ -653,6 +661,30 @@ redis_validate_connection(redisContext *context)
 		freeReplyObject(reply);
 
 	return valid;
+}
+
+/*
+ * redis_authenticate
+ *		Send the Redis AUTH command, binary-safely. Uses the ACL
+ *		"AUTH username password" form when a username is supplied,
+ *		otherwise falls back to the legacy "AUTH password" form.
+ */
+static redisReply *
+redis_authenticate(redisContext *context, const char *username, const char *password)
+{
+	size_t		password_len = strlen(password);
+
+	if (username)
+		return redis_command_impl(context, "AUTH", sizeof("AUTH") - 1,
+								  username, strlen(username),
+								  NULL, 0, password, password_len);
+	else
+	{
+		const char *argv[2] = {"AUTH", password};
+		size_t		argvlen[2] = {sizeof("AUTH") - 1, password_len};
+
+		return redisCommandArgv(context, 2, argv, argvlen);
+	}
 }
 
 /*
@@ -719,7 +751,7 @@ redis_get_connection(redisTableOptions *options)
 
 	if (options->password)
 	{
-		reply = redisCommand(context, "AUTH %s", options->password);
+		reply = redis_authenticate(context, options->username, options->password);
 
 		if (!reply)
 		{
@@ -863,6 +895,7 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 	Oid			catalog = PG_GETARG_OID(1);
 	char	   *svr_address = NULL;
 	int			svr_port = 0;
+	char	   *svr_username = NULL;
 	char	   *svr_password = NULL;
 	int			svr_database = 0;
 	redis_table_type tabletype = PG_REDIS_SCALAR_TABLE;
@@ -937,6 +970,15 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 								));
 
 			svr_password = defGetString(def);
+		}
+		else if (strcmp(def->defname, "username") == 0)
+		{
+			if (svr_username)
+				ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options: username")
+								));
+
+			svr_username = defGetString(def);
 		}
 		else if (strcmp(def->defname, "database") == 0)
 		{
@@ -1049,6 +1091,16 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 		}
 	}
 
+	/*
+	 * Authentication is only attempted when a password is present, so a
+	 * username on its own would be silently ignored and the connection made
+	 * unauthenticated - the opposite of what setting it implies.
+	 */
+	if (svr_username && !svr_password)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("option \"username\" requires option \"password\"")));
+
 	PG_RETURN_VOID();
 }
 
@@ -1094,6 +1146,7 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 	/* Set void values */
 	table_options->address = NULL;
 	table_options->port = 0;
+	table_options->username = NULL;
 	table_options->password = NULL;
 	table_options->database = 0;
 	table_options->keyprefix = NULL;
@@ -1127,6 +1180,9 @@ redisGetOptions(Oid foreigntableid, redisTableOptions *table_options)
 
 		if (strcmp(def->defname, "password") == 0)
 			table_options->password = defGetString(def);
+
+		if (strcmp(def->defname, "username") == 0)
+			table_options->username = defGetString(def);
 
 		if (strcmp(def->defname, "database") == 0)
 			table_options->database = atoi(defGetString(def));

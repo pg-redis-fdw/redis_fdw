@@ -185,6 +185,36 @@ Structured items are returned as `array text`, or, if the value column is a
 text array as an array of values. In the case of hash objects this array is
 an array of key, value, key, value ...
 
+Non-singleton `zset` tables may optionally declare a third column, an array
+type, to hold the score of each member in the value array, in the same order
+(i.e. `scores[i]` is the score of `value[i]`). Any element type whose text
+output is a valid Redis float works; `numeric[]`, `float8[]` and `text[]` are
+all accepted.
+
+The column is writable. `INSERT` and `UPDATE` must supply the members and
+scores arrays together, and the two must have the same length:
+
+```sql
+	INSERT INTO ztab VALUES ('key', '{a,b,c}', '{10,20,30}');
+	UPDATE ztab SET value = '{a,b,d}', scores = '{10,20,40}' WHERE key = 'key';
+```
+
+A zset is a Redis object, not an array: reading it back returns members in
+score order, not the order they were written in, and a member written more
+than once in the same call collapses to a single entry at its last score.
+`scores[i]` is the score of `value[i]` only at write time.
+
+Setting only one of the pair is an error. An `UPDATE` replaces the whole
+Redis key rather than merging into it, so the arrays supplied are the
+complete new contents; a partial update would have to invent the missing
+half, and inventing it from the values read earlier can silently revert a
+score another client changed in the meantime.
+
+`Infinity` and `-Infinity` are accepted as scores. `NaN` is not: PostgreSQL
+allows it in `numeric` and `float8`, but Redis rejects it, so the error comes
+from the server. The whole write is rejected before anything changes, so a
+row's previous members and scores are left exactly as they were.
+
 Singleton key tables are returned as rows with a single column of text
 in the case of lists sets and scalars, rows with key and value text columns
 for hashes, and rows with a value text columns and an optional numeric score

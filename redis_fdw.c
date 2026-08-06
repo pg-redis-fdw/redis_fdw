@@ -197,6 +197,9 @@ typedef struct RedisFdwExecutionState
 	int			natts;			/* number of attributes */
 	TupleDesc	tupdesc;		/* cached tuple descriptor */
 	Oid			array_elem_type;	/* element type if value column is array */
+	Oid			scores_elem_type;	/* element type of the scores column */
+	bool		with_scores;	/* non-singleton zset table has a 3rd
+								 * (scores array) column */
 } RedisFdwExecutionState;
 
 typedef struct RedisFdwModifyState
@@ -219,6 +222,10 @@ typedef struct RedisFdwModifyState
 	int			p_nums;
 	int			keyAttno;
 	Oid			array_elem_type;
+	bool		with_scores;	/* non-singleton zset table with a 3rd
+								 * scores-array column */
+	Oid			scores_elem_type;	/* element type of that scores array */
+	int			scores_pidx;	/* its index in p_flinfo/val_types, or -1 */
 	FmgrInfo   *p_flinfo;
 	redis_val_type *val_types;	/* column value type categories */
 } RedisFdwModifyState;
@@ -227,6 +234,21 @@ typedef struct RedisFdwModifyState
 #define ZERO "0"
 /* redis default is 10 - let's fetch 1000 at a time */
 #define COUNT " COUNT 1000"
+
+/*
+ * Prefix for the staging key a zset UPDATE rebuilds into before swapping it
+ * in with RENAME (see redisExecForeignUpdate).  The backend pid is folded
+ * into the key (built at the use site) so concurrent updates of the same
+ * row use different staging keys rather than racing to reuse one.
+ *
+ * The prefix goes in front rather than behind the real key name so it can
+ * never satisfy a tablekeyprefix- or tablekeyset-restricted scan for that
+ * key.  It is not hidden from a plain, unrestricted scan: a table with
+ * neither option walks the whole keyspace with SCAN, and the staging key is
+ * a real zset, so such a scan can return it as a row for the moment it
+ * exists.
+ */
+#define ZSET_REBUILD_PREFIX "\x01redis_fdw_zset_rebuild\x01"
 
 /*
  * Connection cache structures
@@ -355,8 +377,9 @@ static char *redis_escape_glob(const char *str);
 #define RTYPE(t)	(1 << (t))
 #define RTYPE_ANY	0
 
-static char *redis_array_to_text(redisReply *reply);
-static Datum process_redis_array(redisReply *reply, Oid elem_type);
+static char *redis_array_to_text(redisReply *reply, int offset, int stride);
+static Datum process_redis_array(redisReply *reply, Oid elem_type,
+								 int offset, int stride);
 static void check_reply(redisReply *reply, redisContext *context,
 						int allowed, int error_code, char *message, char *arg);
 static redisReply *redis_command_impl(redisContext *context,
@@ -376,6 +399,8 @@ static redisReply *redis_command2_impl(redisContext *context,
 #define redis_command2(ctx, cmd, arg1, arg1_len, arg2, arg2_len) \
 	redis_command2_impl(ctx, cmd, sizeof(cmd) - 1, arg1, arg1_len, arg2, arg2_len)
 static inline redis_val_type classify_type(Oid typid);
+static inline bool redis_zset_has_scores_column(redis_table_type table_type,
+									const char *singleton_key, int natts);
 static void get_datum_as_string(Datum datum, redis_val_type valtype,
 						FmgrInfo *flinfo, const char **data, size_t *len);
 
@@ -1557,6 +1582,15 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->cursor_id = NULL;
 	festate->cursor_search_string = NULL;
 
+	/*
+	 * A non-singleton zset table may optionally have a 3rd column holding
+	 * a parallel array of scores, alongside the usual key and members-array
+	 * columns.
+	 */
+	festate->with_scores = redis_zset_has_scores_column(festate->table_type,
+														 festate->singleton_key,
+														 node->ss.ss_currentRelation->rd_att->natts);
+
 	festate->qual_value = pushdown ? qual_value : NULL;
 
 	/* OK, we connected. If this is an EXPLAIN, bail out now */
@@ -1583,6 +1617,19 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	{
 		Form_pg_attribute attr = TupleDescAttr(festate->tupdesc, 1);
 		festate->array_elem_type = get_element_type(attr->atttypid);
+	}
+
+	/*
+	 * The scores column, when the table declares one. Its element type is
+	 * whatever the user declared - numeric[] in the usual case - so the
+	 * decoder needs it to know which input function to use.
+	 */
+	festate->scores_elem_type = InvalidOid;
+	if (festate->with_scores && festate->natts >= 3)
+	{
+		Form_pg_attribute sattr = TupleDescAttr(festate->tupdesc, 2);
+
+		festate->scores_elem_type = get_element_type(sattr->atttypid);
 	}
 
 	/*
@@ -1825,11 +1872,13 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 	char	   *key;
 	char	   *data = 0;
 	size_t		data_len = 0;
+	char	   *scores = 0;
 	char	  **values;
 	HeapTuple	tuple;
 	bool		has_bytea = false;
 	bool		has_array = false;
 	Datum		array_datum = (Datum) 0;
+	Datum		scores_datum = (Datum) 0;
 
 	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
@@ -1981,8 +2030,12 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 										 "SMEMBERS %s", key);
 					break;
 				case PG_REDIS_ZSET_TABLE:
-					reply = redisCommand(festate->context,
-										 "ZRANGE %s 0 -1", key);
+					if (festate->with_scores)
+						reply = redisCommand(festate->context,
+											 "ZRANGE %s 0 -1 WITHSCORES", key);
+					else
+						reply = redisCommand(festate->context,
+											 "ZRANGE %s 0 -1", key);
 					break;
 				case PG_REDIS_SCALAR_TABLE:
 				default:
@@ -2030,10 +2083,26 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 					break;
 
 				case REDIS_REPLY_ARRAY:
-					if (has_array)
-						array_datum = process_redis_array(reply, festate->array_elem_type);
-					else
-						data = redis_array_to_text(reply);
+					{
+						int			stride = festate->with_scores ? 2 : 1;
+
+						if (has_array)
+							array_datum = process_redis_array(reply,
+															  festate->array_elem_type,
+															  0, stride);
+						else
+							data = redis_array_to_text(reply, 0, stride);
+
+						if (festate->with_scores)
+						{
+							if (festate->scores_elem_type != InvalidOid)
+								scores_datum = process_redis_array(reply,
+																   festate->scores_elem_type,
+																   1, 2);
+							else
+								scores = redis_array_to_text(reply, 1, 2);
+						}
+					}
 					found = true;
 					break;
 			}
@@ -2047,7 +2116,7 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 	/* Build the tuple */
 	if (found)
 	{
-		if (has_bytea || has_array)
+		if (has_bytea || has_array || festate->with_scores)
 		{
 			/* Use heap_form_tuple for bytea or array columns */
 			Datum	   *datums;
@@ -2071,12 +2140,36 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 			{
 				nulls[1] = true;
 			}
-			else
+			else if (has_bytea)
 			{
 				bytea	   *bval = (bytea *) palloc(data_len + VARHDRSZ);
 				SET_VARSIZE(bval, data_len + VARHDRSZ);
 				memcpy(VARDATA(bval), data, data_len);
 				datums[1] = PointerGetDatum(bval);
+			}
+			else
+			{
+				/*
+				 * with_scores can reach here with a scalar text members
+				 * column, which must not be built as a bytea.
+				 */
+				datums[1] = CStringGetTextDatum(data);
+			}
+
+			/* Column 2: scores, when the table declares one */
+			if (festate->with_scores && festate->natts >= 3)
+			{
+				if (festate->scores_elem_type != InvalidOid)
+				{
+					if (scores_datum == (Datum) 0)
+						nulls[2] = true;
+					else
+						datums[2] = scores_datum;
+				}
+				else if (scores == NULL)
+					nulls[2] = true;
+				else
+					datums[2] = CStringGetTextDatum(scores);
 			}
 
 			tuple = heap_form_tuple(festate->tupdesc, datums, nulls);
@@ -2383,18 +2476,45 @@ redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *push
 }
 
 /*
+ * append_quoted_array_element
+ *		Append str (of length len) to buf as a double-quoted,
+ *		backslash-escaped PostgreSQL array literal element.
+ */
+static void
+append_quoted_array_element(StringInfo buf, const char *str, int len)
+{
+	char	   *quoted;
+	char	   *crs;
+
+	pg_verifymbstr(str, len, false);
+	quoted = palloc(len * 2 + 3);
+	crs = quoted;
+	*crs++ = '"';
+	for (int j = 0; j < len; j++)
+	{
+		if (str[j] == '"' || str[j] == '\\')
+			*crs++ = '\\';
+		*crs++ = str[j];
+	}
+	*crs++ = '"';
+	*crs = '\0';
+	appendStringInfoString(buf, quoted);
+	pfree(quoted);
+}
+
+/*
  * redis_array_to_text
  *		Convert a Redis array reply to a PostgreSQL array literal string.
  *		Used for scalar text columns that receive array data from Redis.
  */
 static char *
-redis_array_to_text(redisReply *reply)
+redis_array_to_text(redisReply *reply, int offset, int stride)
 {
 	StringInfo	res = makeStringInfo();
 	bool		need_sep = false;
 
 	appendStringInfoChar(res, '{');
-	for (int i = 0; i < reply->elements; i++)
+	for (int i = offset; i < reply->elements; i += stride)
 	{
 		redisReply *ir = reply->element[i];
 
@@ -2411,25 +2531,7 @@ redis_array_to_text(redisReply *reply)
 		{
 			case REDIS_REPLY_STATUS:
 			case REDIS_REPLY_STRING:
-				{
-					char	   *buff;
-					char	   *crs;
-
-					pg_verifymbstr(ir->str, ir->len, false);
-					buff = palloc(ir->len * 2 + 3);
-					crs = buff;
-					*crs++ = '"';
-					for (int j = 0; j < ir->len; j++)
-					{
-						if (ir->str[j] == '"' || ir->str[j] == '\\')
-							*crs++ = '\\';
-						*crs++ = ir->str[j];
-					}
-					*crs++ = '"';
-					*crs = '\0';
-					appendStringInfoString(res, buff);
-					pfree(buff);
-				}
+				append_quoted_array_element(res, ir->str, ir->len);
 				break;
 			case REDIS_REPLY_INTEGER:
 				appendStringInfo(res, "%lld", ir->integer);
@@ -2453,19 +2555,39 @@ redis_array_to_text(redisReply *reply)
  *		For text, validates UTF-8 encoding.
  */
 static Datum
-process_redis_array(redisReply *reply, Oid elem_type)
+process_redis_array(redisReply *reply, Oid elem_type, int offset, int stride)
 {
 	Datum	   *elems;
-	int			nelems = reply->elements;
+	int			nelems = (reply->elements > offset)
+		? ((reply->elements - offset + stride - 1) / stride)
+		: 0;
+	int			n = 0;
 	ArrayType  *result;
 	bool		is_bytea = (elem_type == BYTEAOID);
+	bool		is_text = (elem_type == TEXTOID ||
+						   elem_type == VARCHAROID ||
+						   elem_type == BPCHAROID);
+	Oid			typinput = InvalidOid;
+	Oid			typioparam = InvalidOid;
+	FmgrInfo	inputproc;
 	int16		typlen;
 	bool		typbyval;
 	char		typalign;
 
+	/*
+	 * Redis hands every value back as text. text and bytea are converted
+	 * directly; any other element type has no route in but its own input
+	 * function, so look that up once rather than per element.
+	 */
+	if (!is_bytea && !is_text)
+	{
+		getTypeInputInfo(elem_type, &typinput, &typioparam);
+		fmgr_info(typinput, &inputproc);
+	}
+
 	elems = (Datum *) palloc(sizeof(Datum) * nelems);
 
-	for (int i = 0; i < nelems; i++)
+	for (int i = offset; i < reply->elements; i += stride, n++)
 	{
 		redisReply *ir = reply->element[i];
 
@@ -2484,12 +2606,19 @@ process_redis_array(redisReply *reply, Oid elem_type)
 
 					SET_VARSIZE(bval, ir->len + VARHDRSZ);
 					memcpy(VARDATA(bval), ir->str, ir->len);
-					elems[i] = PointerGetDatum(bval);
+					elems[n] = PointerGetDatum(bval);
+				}
+				else if (is_text)
+				{
+					pg_verifymbstr(ir->str, ir->len, false);
+					elems[n] = PointerGetDatum(cstring_to_text_with_len(ir->str, ir->len));
 				}
 				else
 				{
-					pg_verifymbstr(ir->str, ir->len, false);
-					elems[i] = PointerGetDatum(cstring_to_text_with_len(ir->str, ir->len));
+					char	   *val = pnstrdup(ir->str, ir->len);
+
+					elems[n] = InputFunctionCall(&inputproc, val, typioparam, -1);
+					pfree(val);
 				}
 				break;
 			case REDIS_REPLY_INTEGER:
@@ -2504,11 +2633,15 @@ process_redis_array(redisReply *reply, Oid elem_type)
 
 						SET_VARSIZE(bval, len + VARHDRSZ);
 						memcpy(VARDATA(bval), buf, len);
-						elems[i] = PointerGetDatum(bval);
+						elems[n] = PointerGetDatum(bval);
+					}
+					else if (is_text)
+					{
+						elems[n] = PointerGetDatum(cstring_to_text_with_len(buf, len));
 					}
 					else
 					{
-						elems[i] = PointerGetDatum(cstring_to_text_with_len(buf, len));
+						elems[n] = InputFunctionCall(&inputproc, buf, typioparam, -1);
 					}
 				}
 				break;
@@ -2520,12 +2653,16 @@ process_redis_array(redisReply *reply, Oid elem_type)
 					bytea	   *bval = (bytea *) palloc(VARHDRSZ);
 
 					SET_VARSIZE(bval, VARHDRSZ);
-					elems[i] = PointerGetDatum(bval);
+					elems[n] = PointerGetDatum(bval);
+				}
+				else if (is_text)
+				{
+					elems[n] = PointerGetDatum(cstring_to_text(""));
 				}
 				else
-				{
-					elems[i] = PointerGetDatum(cstring_to_text(""));
-				}
+					ereport(ERROR,
+							(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+							 errmsg("unexpected NULL element in a Redis array reply")));
 				break;
 		}
 	}
@@ -2710,6 +2847,24 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 
 	array_elem_list = (List *) list_nth(fdw_private, 1);
 	fmstate->array_elem_type = list_nth_oid(array_elem_list, 0);
+	fmstate->with_scores =
+		redis_zset_has_scores_column(fmstate->table_type,
+									 fmstate->singleton_key,
+									 RelationGetDescr(rel)->natts);
+	fmstate->scores_elem_type = InvalidOid;
+	fmstate->scores_pidx = -1;
+
+	/*
+	 * The scores column's shape is known from the relation descriptor
+	 * alone, so check it here rather than per row: a scalar column would
+	 * otherwise reach DatumGetArrayTypeP() as though it were an array.
+	 */
+	if (fmstate->with_scores &&
+		TupleDescAttr(RelationGetDescr(rel), 2)->attndims == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("scores column must be an array")
+				 ));
 
 	fmstate->p_nums = 0;
 
@@ -2811,6 +2966,13 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 			fmstate->targetDims[fmstate->p_nums] = attr->attndims;
 			getTypeOutputInfo(elem, &typefnoid, &isvarlena);
 			fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
+
+			if (fmstate->with_scores && attnum == 3)
+			{
+				fmstate->scores_pidx = fmstate->p_nums;
+				fmstate->scores_elem_type = elem;
+			}
+
 			fmstate->p_nums++;
 		}
 	}
@@ -2837,12 +2999,19 @@ redisBeginForeignModify(ModifyTableState *mtstate,
 						 errmsg("table has incorrect number of columns: %d for type %d", fmstate->p_nums, table_options.table_type)
 						 ));
 		}
-		else if (fmstate->p_nums != 2)
+		else
 		{
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("table has incorrect number of columns")
-					 ));
+			int			expected_cols;
+
+			expected_cols = redis_zset_has_scores_column(table_options.table_type,
+														  table_options.singleton_key,
+														  RelationGetDescr(rel)->natts) ? 3 : 2;
+
+			if (fmstate->p_nums != expected_cols)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("table has incorrect number of columns")
+						 ));
 		}
 	}
 	else if (op == CMD_UPDATE)
@@ -3034,6 +3203,21 @@ classify_type(Oid typid)
 		default:
 			return REDIS_VAL_OTHER;
 	}
+}
+
+/*
+ * redis_zset_has_scores_column
+ *		A non-singleton zset table may declare a 3rd column holding a
+ *		parallel array of member scores, alongside the usual key and
+ *		members-array columns.
+ */
+static inline bool
+redis_zset_has_scores_column(redis_table_type table_type,
+							  const char *singleton_key, int natts)
+{
+	return table_type == PG_REDIS_ZSET_TABLE &&
+		!singleton_key &&
+		natts == 3;
 }
 
 /*
@@ -3256,6 +3440,10 @@ redisExecForeignInsert(EState *estate,
 		redis_val_type elem_valtype;
 		bool		is_array = fmstate->array_elem_type != InvalidOid;
 		Datum		value = slot_getattr(slot, 2, &isnull);
+		Datum	   *score_elements = NULL;
+		bool	   *score_nulls = NULL;
+		int			nscores = 0;
+		redis_val_type score_valtype = REDIS_VAL_OTHER;
 
 		/* For non-singleton, get keyval for prefix checks and error messages */
 		keyval = OutputFunctionCall(&fmstate->p_flinfo[0], key);
@@ -3346,6 +3534,44 @@ redisExecForeignInsert(EState *estate,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("cannot insert NULL into a Redis table")
 							 ));
+			}
+
+			if (fmstate->with_scores)
+			{
+				bool		snull;
+				Datum		sval = slot_getattr(slot, 3, &snull);
+				int16		stlen;
+				bool		stbyval;
+				char		stalign;
+				int			si;
+
+				if (snull)
+					ereport(ERROR,
+							(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+							 errmsg("cannot insert NULL into a Redis table"),
+							 errhint("A zset table's members and scores columns are written as a pair.")));
+
+				get_typlenbyvalalign(fmstate->scores_elem_type,
+									 &stlen, &stbyval, &stalign);
+				deconstruct_array(DatumGetArrayTypeP(sval),
+								  fmstate->scores_elem_type, stlen, stbyval,
+								  stalign, &score_elements, &score_nulls,
+								  &nscores);
+
+				if (nscores != nitems)
+					ereport(ERROR,
+							(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+							 errmsg("members and scores arrays must have the same length"),
+							 errdetail("members has %d elements, scores has %d",
+									   nitems, nscores)));
+
+				for (si = 0; si < nscores; si++)
+					if (score_nulls[si])
+						ereport(ERROR,
+								(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+								 errmsg("cannot insert NULL into a Redis table")));
+
+				score_valtype = classify_type(fmstate->scores_elem_type);
 			}
 		}
 
@@ -3449,24 +3675,55 @@ redisExecForeignInsert(EState *estate,
 					int			i;
 					int			ibuff_len;
 					char		ibuff[100];
+					int			zargc = 2 + 2 * nitems;
+					const char **zargv = (const char **) palloc(sizeof(char *) * zargc);
+					size_t	   *zargvlen = (size_t *) palloc(sizeof(size_t) * zargc);
+
+					zargv[0] = "ZADD";
+					zargvlen[0] = 4;
+					zargv[1] = key_data;
+					zargvlen[1] = key_len;
 
 					for (i = 0; i < nitems; i++)
 					{
 						const char *data;
 						size_t		len;
+						const char *score_data;
+						size_t		score_len;
 
-						ibuff_len = sprintf(ibuff, "%d", i);
+						if (fmstate->with_scores)
+							get_datum_as_string(score_elements[i], score_valtype,
+												&fmstate->p_flinfo[fmstate->scores_pidx],
+												&score_data, &score_len);
+						else
+						{
+							ibuff_len = sprintf(ibuff, "%d", i);
+							score_data = pnstrdup(ibuff, ibuff_len);
+							score_len = ibuff_len;
+						}
+
 						/* score comes BEFORE value in ZADD */
 						get_datum_as_string(elements[i], elem_valtype,
 											&fmstate->p_flinfo[1], &data, &len);
-						sreply = redis_command(context, "ZADD",
-											   key_data, key_len,
-											   ibuff, ibuff_len, data, len);
-						check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
-									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add zset member", NULL);
-						freeReplyObject(sreply);
+
+						zargv[2 + 2 * i] = score_data;
+						zargvlen[2 + 2 * i] = score_len;
+						zargv[2 + 2 * i + 1] = data;
+						zargvlen[2 + 2 * i + 1] = len;
 					}
+
+					/*
+					 * All members go in a single ZADD: Redis parses every
+					 * score before adding any member, so an invalid score
+					 * fails the whole command and the key is never created,
+					 * instead of leaving a half-built key behind for the
+					 * retry to trip over.
+					 */
+					sreply = redisCommandArgv(context, zargc, zargv, zargvlen);
+					check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
+								ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+								"could not add zset members", NULL);
+					freeReplyObject(sreply);
 				}
 				break;
 			default:
@@ -3619,6 +3876,12 @@ redisExecForeignUpdate(EState *estate,
 	/* For array updates */
 	Datum	   *array_elems = NULL;
 	redis_val_type array_elem_valtype = REDIS_VAL_OTHER;
+	bool		saw_members = false;
+	bool		saw_scores = false;
+	Datum	   *score_elements = NULL;
+	bool	   *score_nulls = NULL;
+	int			nscores = 0;
+	redis_val_type score_valtype = REDIS_VAL_OTHER;
 
 #ifdef DEBUG
 	elog(NOTICE, "redisExecForeignUpdate");
@@ -3639,6 +3902,33 @@ redisExecForeignUpdate(EState *estate,
 	newkey_len = key_len;
 
 	Assert(keyval != NULL);
+
+	if (fmstate->with_scores)
+	{
+		ListCell   *slc;
+
+		foreach(slc, fmstate->target_attrs)
+		{
+			int			a = lfirst_int(slc);
+
+			if (a == 2)
+				saw_members = true;
+			else if (a == 3)
+				saw_scores = true;
+		}
+
+		if (saw_members != saw_scores)
+		{
+			char	   *membname = NameStr(TupleDescAttr(RelationGetDescr(fmstate->rel), 1)->attname);
+			char	   *scorename = NameStr(TupleDescAttr(RelationGetDescr(fmstate->rel), 2)->attname);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("updating \"%s\" or \"%s\" requires setting both",
+							membname, scorename),
+					 errhint("A zset table's members and scores columns are written as a pair.")));
+		}
+	}
 
 	/* extract the updated values */
 	foreach(lc, fmstate->target_attrs)
@@ -3696,6 +3986,20 @@ redisExecForeignUpdate(EState *estate,
 				newval_len = strlen(newval);
 			}
 		}
+		else if (fmstate->with_scores && attnum == 3)
+		{
+			int16		stlen;
+			bool		stbyval;
+			char		stalign;
+
+			get_typlenbyvalalign(fmstate->scores_elem_type,
+								 &stlen, &stbyval, &stalign);
+			deconstruct_array(DatumGetArrayTypeP(datum),
+							  fmstate->scores_elem_type, stlen, stbyval,
+							  stalign, &score_elements, &score_nulls,
+							  &nscores);
+			score_valtype = classify_type(fmstate->scores_elem_type);
+		}
 		else
 		{
 			/*
@@ -3745,6 +4049,13 @@ redisExecForeignUpdate(EState *estate,
 
 		flslot++;
 	}
+
+	if (fmstate->with_scores && saw_scores && nscores != nitems)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("members and scores arrays must have the same length"),
+				 errdetail("members has %d elements, scores has %d",
+						   nitems, nscores)));
 
 	/* now we have all the data we need */
 
@@ -4112,7 +4423,102 @@ redisExecForeignUpdate(EState *estate,
 		freeReplyObject(ereply);
 	}
 
-	if (array_elems)
+	if (array_elems && fmstate->table_type == PG_REDIS_ZSET_TABLE)
+	{
+		/*
+		 * A zset rebuild cannot use the DEL-then-repopulate approach below:
+		 * unlike SADD/RPUSH/HSET, ZADD can reject one of the caller's own
+		 * arguments (an invalid score), and by that point the DEL would
+		 * already have destroyed the row it was rebuilding.  Build the new
+		 * contents in a private staging key instead, with a single ZADD --
+		 * Redis parses every score before touching the object, so a bad
+		 * score fails the whole command and never even reaches the staging
+		 * key -- and only swap it in with RENAME once that succeeds.
+		 * RENAME replaces the destination atomically, so this never runs a
+		 * command against newkey that could fail because of the caller's
+		 * data.
+		 */
+		int			i;
+		int			ibuff_len;
+		char		ibuff[100];
+		char		pidbuf[24];
+		int			pidlen;
+		char	   *stagingkey;
+		size_t		stagingkey_len;
+		int			zargc = 2 + 2 * nitems;
+		const char **zargv = (const char **) palloc(sizeof(char *) * zargc);
+		size_t	   *zargvlen = (size_t *) palloc(sizeof(size_t) * zargc);
+
+		Assert(!fmstate->singleton_key);
+
+		/*
+		 * Fold the backend pid into the staging key: without it, two
+		 * backends updating the same row would share one staging key, and
+		 * whichever ZADD ran last would win the RENAME with the other
+		 * backend's contents instead of its own.
+		 */
+		pidlen = snprintf(pidbuf, sizeof(pidbuf), "%d\x01", (int) MyProcPid);
+
+		stagingkey_len = strlen(ZSET_REBUILD_PREFIX) + pidlen + newkey_len;
+		stagingkey = palloc(stagingkey_len);
+		memcpy(stagingkey, ZSET_REBUILD_PREFIX, strlen(ZSET_REBUILD_PREFIX));
+		memcpy(stagingkey + strlen(ZSET_REBUILD_PREFIX), pidbuf, pidlen);
+		memcpy(stagingkey + strlen(ZSET_REBUILD_PREFIX) + pidlen, newkey_data, newkey_len);
+
+		/* clear any staging key a previous failed attempt left behind */
+		ereply = redis_command1(context, "DEL", stagingkey, stagingkey_len);
+		check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"could not clear staging key for %s", newkey);
+		freeReplyObject(ereply);
+
+		zargv[0] = "ZADD";
+		zargvlen[0] = 4;
+		zargv[1] = stagingkey;
+		zargvlen[1] = stagingkey_len;
+
+		for (i = 0; i < nitems; i++)
+		{
+			const char *data;
+			size_t		len;
+			const char *score_data;
+			size_t		score_len;
+
+			if (fmstate->with_scores)
+				get_datum_as_string(score_elements[i], score_valtype,
+									&fmstate->p_flinfo[fmstate->scores_pidx],
+									&score_data, &score_len);
+			else
+			{
+				ibuff_len = sprintf(ibuff, "%d", i);
+				score_data = pnstrdup(ibuff, ibuff_len);
+				score_len = ibuff_len;
+			}
+
+			/* score comes BEFORE value in ZADD */
+			get_datum_as_string(array_elems[i], array_elem_valtype,
+								&fmstate->p_flinfo[1], &data, &len);
+
+			zargv[2 + 2 * i] = score_data;
+			zargvlen[2 + 2 * i] = score_len;
+			zargv[2 + 2 * i + 1] = data;
+			zargvlen[2 + 2 * i + 1] = len;
+		}
+
+		ereply = redisCommandArgv(context, zargc, zargv, zargvlen);
+		check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"could not add zset members", NULL);
+		freeReplyObject(ereply);
+
+		ereply = redis_command2(context, "RENAME", stagingkey, stagingkey_len,
+								newkey_data, newkey_len);
+		check_reply(ereply, context, RTYPE(REDIS_REPLY_STATUS),
+					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+					"could not replace key %s", newkey);
+		freeReplyObject(ereply);
+	}
+	else if (array_elems)
 	{
 		Assert(!fmstate->singleton_key);
 
@@ -4201,31 +4607,6 @@ redisExecForeignUpdate(EState *estate,
 						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"could not add hash field", NULL);
-						freeReplyObject(ereply);
-					}
-				}
-				break;
-			case PG_REDIS_ZSET_TABLE:
-				{
-					int			i;
-					int			ibuff_len;
-					char		ibuff[100];
-
-					for (i = 0; i < nitems; i++)
-					{
-						const char *data;
-						size_t		len;
-
-						ibuff_len = sprintf(ibuff, "%d", i);
-						/* score comes BEFORE value in ZADD */
-						get_datum_as_string(array_elems[i], array_elem_valtype,
-											&fmstate->p_flinfo[1], &data, &len);
-						ereply = redis_command(context, "ZADD",
-											   newkey_data, newkey_len,
-											   ibuff, ibuff_len, data, len);
-						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add zset member", NULL);
 						freeReplyObject(ereply);
 					}
 				}

@@ -1168,8 +1168,303 @@ drop server aclsrv cascade;
 drop server aclbad cascade;
 
 \! redis-cli ACL DELUSER fdwtest > /dev/null
+-- A collection table stores its members in an array-typed value column. A
+-- scalar bytea column cannot hold them: unlike scalar text, which yields a
+-- PostgreSQL array literal that casts back to an array, bytea has no array
+-- literal form. The write path already refuses this shape; the read path
+-- must too, rather than silently returning an empty bytea.
+
+\! redis-cli -n 15 rpush bcol_list a b c > /dev/null
+\! redis-cli -n 15 sadd  bcol_set  x y   > /dev/null
+\! redis-cli -n 15 hset  bcol_hash f1 v1 > /dev/null
+\! redis-cli -n 15 zadd  bcol_zset 1 m1  > /dev/null
+
+create foreign table db15_bcol_list(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'list', tablekeyprefix 'bcol_list');
+
+select * from db15_bcol_list;
+
+-- the check must sit after the EXPLAIN early return: planning must not error
+explain (costs off) select * from db15_bcol_list;
+
+create foreign table db15_bcol_set(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'set', tablekeyprefix 'bcol_set');
+
+select * from db15_bcol_set;
+
+create foreign table db15_bcol_hash(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'hash', tablekeyprefix 'bcol_hash');
+
+select * from db15_bcol_hash;
+
+create foreign table db15_bcol_zset(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'bcol_zset');
+
+select * from db15_bcol_zset;
+
+-- bytea[] on the same table is the correct shape and must keep working
+create foreign table db15_bcol_list_arr(key text, value bytea[])
+       server localredis
+       options (database '15', tabletype 'list', tablekeyprefix 'bcol_list');
+
+select key, value from db15_bcol_list_arr;
+
+-- a singleton collection with a scalar bytea column is the feature's main
+-- use case and must keep working
+create foreign table db15_bcol_sing_set(member bytea)
+       server localredis
+       options (database '15', tabletype 'set', singleton_key 'bcol_set');
+
+select member from db15_bcol_sing_set order by member;
+
+create foreign table db15_bcol_sing_list(member bytea)
+       server localredis
+       options (database '15', tabletype 'list', singleton_key 'bcol_list');
+
+select member from db15_bcol_sing_list;
+
+-- a scalar table with a bytea value column must keep working
+\! redis-cli -n 15 set bcol_scalar_k hello > /dev/null
+
+create foreign table db15_bcol_scalar(key text, value bytea)
+       server localredis
+       options (database '15', tablekeyprefix 'bcol_scalar');
+
+select key, value from db15_bcol_scalar;
+
+drop foreign table db15_bcol_list;
+drop foreign table db15_bcol_set;
+drop foreign table db15_bcol_hash;
+drop foreign table db15_bcol_zset;
+drop foreign table db15_bcol_list_arr;
+drop foreign table db15_bcol_sing_set;
+drop foreign table db15_bcol_sing_list;
+drop foreign table db15_bcol_scalar;
 
 -- all done, so now blow everything in the db away again
 
+\! redis-cli < test/sql/redis_clean
+
+-- =====================================================
+-- bytea column tests
+-- =====================================================
+
+-- Test that bytea columns work correctly for storing binary data
+-- including data with embedded NUL bytes
+
+-- singleton scalar table with bytea value
+create foreign table db15_bytea_scalar(val bytea)
+       server localredis
+       options (singleton_key 'bytea_scalar', database '15');
+
+select * from db15_bytea_scalar;
+
+-- insert binary data with embedded NUL bytes
+insert into db15_bytea_scalar values (E'hello\\000world'::bytea);
+
+select * from db15_bytea_scalar;
+select length(val), val from db15_bytea_scalar;
+
+-- update with different binary data
+update db15_bytea_scalar set val = E'binary\\000data\\000here'::bytea;
+
+select length(val), val from db15_bytea_scalar;
+
+delete from db15_bytea_scalar;
+
+select * from db15_bytea_scalar;
+
+-- non-singleton scalar table with bytea value column
+create foreign table db15_bytea_scalar_ns(key text, val bytea)
+       server localredis
+       options (database '15', tablekeyprefix 'bscalar_');
+
+select * from db15_bytea_scalar_ns;
+
+insert into db15_bytea_scalar_ns values
+    ('bscalar_a', E'binary\\000a'::bytea),
+    ('bscalar_b', E'binary\\000b'::bytea);
+
+select key, length(val), val from db15_bytea_scalar_ns order by key;
+
+update db15_bytea_scalar_ns set val = E'updated\\000val'::bytea where key = 'bscalar_a';
+
+select key, length(val), val from db15_bytea_scalar_ns order by key;
+
+delete from db15_bytea_scalar_ns where key = 'bscalar_a';
+
+select key, length(val), val from db15_bytea_scalar_ns order by key;
+
+delete from db15_bytea_scalar_ns;
+
+select * from db15_bytea_scalar_ns;
+
+-- singleton hash table with bytea value column (key must be text)
+create foreign table db15_bytea_hash(key text, val bytea)
+       server localredis
+       options (singleton_key 'bytea_hash', tabletype 'hash', database '15');
+
+select * from db15_bytea_hash;
+
+insert into db15_bytea_hash values
+    ('field1', E'hash\\000val1'::bytea),
+    ('field2', E'hash\\000val2'::bytea);
+
+select key, length(val), val from db15_bytea_hash order by key;
+
+update db15_bytea_hash set val = E'new\\000hash\\000val'::bytea where key = 'field1';
+
+select key, length(val), val from db15_bytea_hash order by key;
+
+delete from db15_bytea_hash where key = 'field2';
+
+select key, length(val), val from db15_bytea_hash order by key;
+
+delete from db15_bytea_hash;
+
+select * from db15_bytea_hash;
+
+-- test that bytea key column in hash is rejected
+create foreign table db15_bytea_hash_bad(key bytea, val text)
+       server localredis
+       options (singleton_key 'bytea_hash_bad', tabletype 'hash', database '15');
+
+insert into db15_bytea_hash_bad values (E'key'::bytea, 'val');
+
+-- singleton set table with bytea member
+create foreign table db15_bytea_set(member bytea)
+       server localredis
+       options (singleton_key 'bytea_set', tabletype 'set', database '15');
+
+select * from db15_bytea_set;
+
+insert into db15_bytea_set values
+    (E'set\\000member1'::bytea),
+    (E'set\\000member2'::bytea),
+    (E'set\\000member3'::bytea);
+
+select length(member), member from db15_bytea_set order by member;
+
+delete from db15_bytea_set where member = E'set\\000member2'::bytea;
+
+select length(member), member from db15_bytea_set order by member;
+
+-- update member
+update db15_bytea_set set member = E'set\\000updated'::bytea where member = E'set\\000member1'::bytea;
+
+select length(member), member from db15_bytea_set order by member;
+
+delete from db15_bytea_set;
+
+select * from db15_bytea_set;
+
+-- singleton zset table with bytea member and scores
+create foreign table db15_bytea_zset(member bytea, score numeric)
+       server localredis
+       options (singleton_key 'bytea_zset', tabletype 'zset', database '15');
+
+select * from db15_bytea_zset;
+
+insert into db15_bytea_zset values
+    (E'zset\\000m1'::bytea, 1),
+    (E'zset\\000m2'::bytea, 2),
+    (E'zset\\000m3'::bytea, 3);
+
+select length(member), member, score from db15_bytea_zset order by score;
+
+delete from db15_bytea_zset where member = E'zset\\000m2'::bytea;
+
+select length(member), member, score from db15_bytea_zset order by score;
+
+update db15_bytea_zset set score = 10 where member = E'zset\\000m1'::bytea;
+
+select length(member), member, score from db15_bytea_zset order by score;
+
+delete from db15_bytea_zset;
+
+select * from db15_bytea_zset;
+
+-- non-singleton set table with bytea[] array column
+create foreign table db15_bytea_set_arr(key text, val bytea[])
+       server localredis
+       options (database '15', tabletype 'set', tablekeyprefix 'bset_');
+
+select * from db15_bytea_set_arr;
+
+insert into db15_bytea_set_arr values
+    ('bset_a', array[E'a\\000'::bytea, E'b\\000'::bytea, E'c\\000'::bytea]);
+
+select key, val from db15_bytea_set_arr order by key;
+
+delete from db15_bytea_set_arr;
+
+select * from db15_bytea_set_arr;
+
+-- non-singleton zset table with bytea[] array column
+create foreign table db15_bytea_zset_arr(key text, val bytea[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'bzset_');
+
+select * from db15_bytea_zset_arr;
+
+insert into db15_bytea_zset_arr values
+    ('bzset_a', array[E'x\\000'::bytea, E'y\\000'::bytea, E'z\\000'::bytea]);
+
+select key, val from db15_bytea_zset_arr order by key;
+
+delete from db15_bytea_zset_arr;
+
+select * from db15_bytea_zset_arr;
+
+-- singleton list table with bytea value
+-- note: UPDATE and DELETE not supported for list tables (Redis API limitation)
+create foreign table db15_bytea_list(val bytea)
+       server localredis
+       options (singleton_key 'bytea_list', tabletype 'list', database '15');
+
+select * from db15_bytea_list;
+
+insert into db15_bytea_list values
+    (E'list\\000item1'::bytea),
+    (E'list\\000item2'::bytea),
+    (E'list\\000item3'::bytea);
+
+select length(val), val from db15_bytea_list;
+
+-- a bytea key column on a non-singleton table is rejected for DELETE too,
+-- not just INSERT/UPDATE
+
+create foreign table db15_bytea_key_ns(key bytea, val text)
+       server localredis
+       options (database '15');
+
+delete from db15_bytea_key_ns where key = E'anything'::bytea; -- bytea key error
+
+drop foreign table db15_bytea_key_ns;
+
+-- updating a singleton set member to a bytea value that already exists in
+-- the set is rejected as a duplicate
+
+create foreign table db15_bytea_set_dup(member bytea)
+       server localredis
+       options (singleton_key 'bytea_set_dup', tabletype 'set', database '15');
+
+insert into db15_bytea_set_dup values
+    (E'dup\\000existing'::bytea), (E'other\\000member'::bytea);
+
+update db15_bytea_set_dup set member = E'dup\\000existing'::bytea
+       where member = E'other\\000member'::bytea; -- must fail: key already exists
+
+select length(member), member from db15_bytea_set_dup order by member;
+
+delete from db15_bytea_set_dup;
+
+drop foreign table db15_bytea_set_dup;
+
+-- clean up bytea tests
 \! redis-cli < test/sql/redis_clean
 

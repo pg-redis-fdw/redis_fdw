@@ -46,6 +46,24 @@ Features
   priority column
   - non-singleton non-scalar tables must have an array type for the second column
 
+### Binary data (bytea) support
+
+`redis_fdw` supports `bytea` columns for storing binary data, including data with embedded NUL bytes. Binary data is handled using Redis's binary-safe commands. The following table types and columns support `bytea`:
+
+| Table Type | Column | bytea Supported |
+|------------|--------|-----------------|
+| Scalar (singleton) | value | Yes |
+| Scalar (non-singleton) | value | Yes |
+| Hash (singleton) | value | Yes |
+| Hash (singleton) | key/field | No |
+| Hash (non-singleton) | value array | Yes (`bytea[]`) |
+| Set (singleton) | member | Yes |
+| Set (non-singleton) | value array | Yes (`bytea[]`) |
+| Zset (singleton) | member | Yes |
+| Zset (singleton) | score | No (must be numeric) |
+| Zset (non-singleton) | value array | Yes (`bytea[]`) |
+| List (singleton) | value | Yes |
+
 ### Pushdowning
 
 Not supported, there is no common calculations in Redis.
@@ -336,6 +354,62 @@ All `CREATE FOREIGN TABLE` SQL commands can be executed as a normal PostgreSQL u
      WHERE key = 'prop2';
 ```
 
+#### Binary data (bytea) examples
+
+Store binary data with embedded NUL bytes in a scalar table:
+```sql
+	CREATE FOREIGN TABLE binary_data (
+	  key text,
+	  val bytea
+	)
+	SERVER redis_server
+	OPTIONS (
+	  database '0',
+	  tablekeyprefix 'bin_'
+	);
+
+    -- Insert binary data with embedded NUL byte
+    INSERT INTO binary_data (key, val)
+    VALUES ('bin_image', E'\\x89504e470d0a1a0a'::bytea);
+
+    SELECT key, length(val), val FROM binary_data;
+```
+
+Store binary members in a singleton set:
+```sql
+	CREATE FOREIGN TABLE binary_set (
+	  member bytea
+	)
+	SERVER redis_server
+	OPTIONS (
+	  database '0',
+	  tabletype 'set',
+	  singleton_key 'binary_members'
+	);
+
+    INSERT INTO binary_set VALUES
+        (E'data\\000with\\000nulls'::bytea);
+
+    SELECT length(member), member FROM binary_set;
+```
+
+Store binary data in a hash value column:
+```sql
+	CREATE FOREIGN TABLE binary_hash (
+	  field text,
+	  data bytea
+	)
+	SERVER redis_server
+	OPTIONS (
+	  database '0',
+	  tabletype 'hash',
+	  singleton_key 'binary_hash_key'
+	);
+
+    INSERT INTO binary_hash VALUES
+        ('file1', E'\\x00\\x01\\x02\\x03'::bytea);
+```
+
 Limitations
 -----------
 
@@ -343,6 +417,11 @@ Limitations
 - `COPY` command for foreign tables is not supported.
 - `TRUNCATE` is not supported.
 - `RETURNING` is not supported.
+
+### Binary data (bytea)
+- `bytea` is not supported for hash field/key columns (only hash value columns).
+- A non-singleton collection table (hash, list, set, zset) must declare its
+  value column as an array type; a scalar `bytea` value column is rejected.
 
 ### Other
 - Redis has acquired cursors in 2.8+. This is used in all the

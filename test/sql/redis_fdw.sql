@@ -291,6 +291,17 @@ update db15_w_1key_hash set key = 'w' where key = 'e';
 
 select * from db15_w_1key_hash order by key;
 
+-- a key-only UPDATE re-stores the existing value using its full Redis length,
+-- so a value containing an embedded NUL must survive byte-for-byte (copying it
+-- with pstrdup would truncate at the NUL while the length stayed full, reading
+-- past the buffer and corrupting the value).  Seed a binary value plus a
+-- pristine copy directly in Redis, rename the field via the FDW, then compare
+-- server-side.
+\! printf 'ab\000cdefghij' | redis-cli -n 15 -x hset w_1key_hash binkey
+\! printf 'ab\000cdefghij' | redis-cli -n 15 -x hset w_1key_hash binkey_orig
+update db15_w_1key_hash set key = 'binkey2' where key = 'binkey';
+\! redis-cli -n 15 eval "return (redis.call('HGET',KEYS[1],ARGV[1]) == redis.call('HGET',KEYS[1],ARGV[2])) and 'value preserved' or 'value CORRUPTED'" 1 w_1key_hash binkey2 binkey_orig
+
 -- singleton list
 
 create foreign table db15_w_1key_list(val text)
@@ -440,6 +451,10 @@ insert into db15_w_scalar_pfx values ('w_scalar_a','b'), ('w_scalar_c','d'),('w_
 
 insert into db15_w_scalar_pfx values ('x','y'); -- prefix error
 
+-- a key that is a genuine (but shorter) prefix of the table's configured
+-- key prefix must still be rejected as a mismatch
+insert into db15_w_scalar_pfx values ('w','y'); -- prefix error, key shorter than prefix
+
 insert into db15_w_scalar_pfx values ('w_scalar_a','x'); -- dup error
 
 select * from db15_w_scalar_pfx order by key;
@@ -466,6 +481,20 @@ select * from db15_w_scalar_pfx order by key;
 delete from db15_w_scalar_pfx;
 
 select * from db15_w_scalar_pfx order by key;
+
+-- a name-typed key column round-trips correctly
+
+create foreign table db15_nametest(key name, val text)
+       server localredis
+       options (database '15', tablekeyprefix 'nametest_');
+
+insert into db15_nametest values ('nametest_a', 'v1'), ('nametest_b', 'v2');
+
+select * from db15_nametest order by key;
+
+delete from db15_nametest;
+
+drop foreign table db15_nametest;
 
 -- non-singleton scalar table keyset
 

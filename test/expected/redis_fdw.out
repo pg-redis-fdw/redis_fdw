@@ -472,6 +472,19 @@ select * from db15_w_1key_hash order by key;
  x   | y
 (2 rows)
 
+-- a key-only UPDATE re-stores the existing value using its full Redis length,
+-- so a value containing an embedded NUL must survive byte-for-byte (copying it
+-- with pstrdup would truncate at the NUL while the length stayed full, reading
+-- past the buffer and corrupting the value).  Seed a binary value plus a
+-- pristine copy directly in Redis, rename the field via the FDW, then compare
+-- server-side.
+\! printf 'ab\000cdefghij' | redis-cli -n 15 -x hset w_1key_hash binkey
+1
+\! printf 'ab\000cdefghij' | redis-cli -n 15 -x hset w_1key_hash binkey_orig
+1
+update db15_w_1key_hash set key = 'binkey2' where key = 'binkey';
+\! redis-cli -n 15 eval "return (redis.call('HGET',KEYS[1],ARGV[1]) == redis.call('HGET',KEYS[1],ARGV[2])) and 'value preserved' or 'value CORRUPTED'" 1 w_1key_hash binkey2 binkey_orig
+value preserved
 -- singleton list
 create foreign table db15_w_1key_list(val text)
        server localredis
@@ -704,6 +717,10 @@ select * from db15_w_scalar_pfx;
 insert into db15_w_scalar_pfx values ('w_scalar_a','b'), ('w_scalar_c','d'),('w_scalar_e','f');
 insert into db15_w_scalar_pfx values ('x','y'); -- prefix error
 ERROR:  key 'x' does not match table key prefix 'w_scalar_'
+-- a key that is a genuine (but shorter) prefix of the table's configured
+-- key prefix must still be rejected as a mismatch
+insert into db15_w_scalar_pfx values ('w','y'); -- prefix error, key shorter than prefix
+ERROR:  key 'w' does not match table key prefix 'w_scalar_'
 insert into db15_w_scalar_pfx values ('w_scalar_a','x'); -- dup error
 ERROR:  key already exists: w_scalar_a
 select * from db15_w_scalar_pfx order by key;
@@ -756,6 +773,20 @@ select * from db15_w_scalar_pfx order by key;
 -----+-----
 (0 rows)
 
+-- a name-typed key column round-trips correctly
+create foreign table db15_nametest(key name, val text)
+       server localredis
+       options (database '15', tablekeyprefix 'nametest_');
+insert into db15_nametest values ('nametest_a', 'v1'), ('nametest_b', 'v2');
+select * from db15_nametest order by key;
+    key     | val 
+------------+-----
+ nametest_a | v1
+ nametest_b | v2
+(2 rows)
+
+delete from db15_nametest;
+drop foreign table db15_nametest;
 -- non-singleton scalar table keyset
 create foreign table db15_w_scalar_kset(key text, val text)
        server localredis

@@ -44,7 +44,7 @@ do $$
 $$;
 \unset ON_ERROR_STOP
 -- ok, empty, so now run the setup script
-\! redis-cli < test/sql/redis_setup
+\! redis-cli < test/redis_setup
 OK
 OK
 OK
@@ -411,7 +411,7 @@ select * from db15_1key_zset_scores order by score desc;
 
 -- insert delete update
 -- first clean the database again
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 OK
 OK
 -- singleton scalar table
@@ -1743,7 +1743,7 @@ select * from db15_w_hash_kset;
 (0 rows)
 
 -- now clean up for the cursor tests
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 OK
 OK
 -- cursor tests
@@ -2330,7 +2330,7 @@ drop foreign table db15_zs3;
 drop foreign table db15_zs2;
 drop foreign table db15_szs;
 -- all done, so now blow everything in the db away again
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 OK
 OK
 -- =====================================================
@@ -2644,7 +2644,7 @@ select length(member), member from db15_bytea_set_dup order by member;
 delete from db15_bytea_set_dup;
 drop foreign table db15_bytea_set_dup;
 -- clean up bytea tests
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 OK
 OK
 -- bytea[] members with a scores column: binary members must survive intact and

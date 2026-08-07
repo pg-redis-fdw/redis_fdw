@@ -61,7 +61,7 @@ $$;
 
 -- ok, empty, so now run the setup script
 
-\! redis-cli < test/sql/redis_setup
+\! redis-cli < test/redis_setup
 
 select * from db15 order by key;
 
@@ -247,7 +247,7 @@ select * from db15_1key_zset_scores order by score desc;
 
 -- first clean the database again
 
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 
 -- singleton scalar table
 
@@ -1206,7 +1206,7 @@ select * from db15_w_hash_kset;
 
 -- now clean up for the cursor tests
 
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 
 -- cursor tests
 
@@ -1702,7 +1702,7 @@ drop foreign table db15_szs;
 
 -- all done, so now blow everything in the db away again
 
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 
 -- =====================================================
 -- bytea column tests
@@ -1921,7 +1921,7 @@ delete from db15_bytea_set_dup;
 drop foreign table db15_bytea_set_dup;
 
 -- clean up bytea tests
-\! redis-cli < test/sql/redis_clean
+\! redis-cli < test/redis_clean
 
 -- bytea[] members with a scores column: binary members must survive intact and
 -- keep their scores. Neither PR could express this shape on its own.

@@ -21,7 +21,7 @@ EXTENSION = redis_fdw
 DATA = redis_fdw--1.0.sql redis_fdw--2.0.sql redis_fdw--1.0--2.0.sql
 
 ifndef REGRESS
-REGRESS = redis_fdw
+REGRESS = geo redis_fdw
 endif
 REGRESS_OPTS = --inputdir=test --outputdir=test \
       --load-extension=hstore \

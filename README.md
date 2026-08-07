@@ -45,6 +45,7 @@ Features
   - `INSERT` and `UPDATE` only work for singleton key `ZSET` tables if they have the
   priority column
   - non-singleton non-scalar tables must have an array type for the second column
+  - `GEO` tables are only supported with `singleton_key`
 
 ### Binary data (bytea) support
 
@@ -158,7 +159,7 @@ command:
 
 - **tabletype** as *string*, optional, no default
 
-  Can be `hash`, `list`, `set` or `zset`. If not provided only look at scalar values.
+  Can be `hash`, `list`, `set`, `zset` or `geo`. If not provided only look at scalar values.
 
 - **tablekeyprefix** as *string*, optional, no default
 
@@ -219,6 +220,120 @@ Singleton key tables are returned as rows with a single column of text
 in the case of lists sets and scalars, rows with key and value text columns
 for hashes, and rows with a value text columns and an optional numeric score
 column for zsets.
+
+### Geo tables
+
+`tabletype 'geo'` exposes a Redis [geospatial index](https://redis.io/docs/latest/develop/data-types/geospatial/)
+(a zset under the hood, with each member's score encoding its coordinates).
+Only the singleton-key form is supported. The table can be declared in
+either of two shapes, and `redis_fdw` picks the matching behavior from the
+declared columns — there's no separate tabletype for this:
+
+- `(member text, lat double precision, long double precision)` — a row per
+  member with separate coordinate columns.
+- `(member text, point text)` — a row per member with a single EWKT point
+  column such as `SRID=4326;POINT(long lat)`, PostGIS's own text
+  representation of a `geometry(Point, 4326)`. This is simpler to use with
+  PostGIS: no view or trigger is needed, just cast the column directly.
+
+Any other column count or column types on a `geo` table raise an error.
+
+```sql
+CREATE FOREIGN TABLE mygeo (value text, lat double precision, long double precision)
+    SERVER redis_server
+    OPTIONS (database '0', tabletype 'geo', singleton_key 'mygeo');
+
+INSERT INTO mygeo (value, lat, long) VALUES ('Palermo', 38.115556, 13.361389);
+
+SELECT * FROM mygeo;
+```
+
+```sql
+CREATE FOREIGN TABLE mygeo_ewkt (value text, point text)
+    SERVER redis_server
+    OPTIONS (database '0', tabletype 'geo', singleton_key 'mygeo_ewkt');
+
+INSERT INTO mygeo_ewkt (value, point) VALUES ('Palermo', 'SRID=4326;POINT(13.361389 38.115556)');
+
+SELECT value, point::geometry FROM mygeo_ewkt;
+
+-- distance in metres between two members, using a geography cast
+SELECT a.value, b.value,
+       ST_Distance(a.point::geometry::geography, b.point::geometry::geography) AS metres
+FROM mygeo_ewkt a, mygeo_ewkt b
+WHERE a.value = 'Palermo' AND b.value = 'Catania';
+```
+
+A bare WKT point (no `SRID=...;` prefix, e.g. `POINT(13.361389 38.115556)`)
+is also accepted on input for the `point`-column shape, since 4326 is
+implied. Any other SRID is rejected, since `4326` is the only coordinate
+system that matches what `GEOADD`/`GEOPOS` use.
+
+`UPDATE` supports changing the member name, the coordinates, or both at
+once. With the `lat`/`long` shape, updating just one coordinate looks up
+the other via `GEOPOS` so it's preserved; with the `point` shape there's
+only one column to update, so setting it always replaces both coordinates
+together (renaming a member without touching `point` still preserves its
+position via `GEOPOS`). Note that Redis's internal geohash encoding is not
+perfectly exact (sub-meter precision loss), so a coordinate read back may
+differ very slightly from what was inserted.
+
+Non-singleton geo tables are not currently supported.
+
+#### Using geo tables with PostGIS
+
+`redis_fdw` itself has no PostGIS dependency — geo tables always expose
+plain `double precision` columns, or plain EWKT text for the `point`-column
+shape (see above for casting that directly to `geometry`). If PostGIS is
+installed, a `geometry(Point, 4326)` view can be layered on top of the
+`lat`/`long` shape with an `INSTEAD OF` trigger, giving full read/write
+access via `ST_Distance`/`ST_DWithin`/etc. without redis_fdw needing to
+know PostGIS exists:
+
+```sql
+CREATE VIEW mygeo_postgis AS
+  SELECT value, ST_SetSRID(ST_MakePoint(long, lat), 4326) AS geom
+  FROM mygeo;
+
+CREATE FUNCTION mygeo_postgis_write() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    DELETE FROM mygeo WHERE value = OLD.value;
+    RETURN OLD;
+  ELSIF TG_OP = 'UPDATE' THEN
+    UPDATE mygeo SET value = NEW.value, lat = ST_Y(NEW.geom), long = ST_X(NEW.geom)
+      WHERE value = OLD.value;
+    RETURN NEW;
+  ELSE -- INSERT
+    INSERT INTO mygeo (value, lat, long) VALUES (NEW.value, ST_Y(NEW.geom), ST_X(NEW.geom));
+    RETURN NEW;
+  END IF;
+END;
+$$;
+
+CREATE TRIGGER mygeo_postgis_write
+  INSTEAD OF INSERT OR UPDATE OR DELETE ON mygeo_postgis
+  FOR EACH ROW EXECUTE FUNCTION mygeo_postgis_write();
+```
+
+```sql
+INSERT INTO mygeo_postgis (value, geom) VALUES ('Rome', ST_SetSRID(ST_MakePoint(12.4964, 41.9028), 4326));
+
+-- distance in metres between two members, using a geography cast
+SELECT a.value, b.value,
+       ST_Distance(a.geom::geography, b.geom::geography) AS metres
+FROM mygeo_postgis a, mygeo_postgis b
+WHERE a.value = 'Rome' AND b.value = 'Palermo';
+
+UPDATE mygeo_postgis SET geom = ST_SetSRID(ST_MakePoint(12.5, 42.0), 4326) WHERE value = 'Rome';
+
+DELETE FROM mygeo_postgis WHERE value = 'Rome';
+```
+
+`4326` is WGS84 (plain latitude/longitude, the same coordinate system
+`GEOADD`/`GEOPOS` use), so no reprojection is needed going in either
+direction.
 
 ## IMPORT FOREIGN SCHEMA options
 

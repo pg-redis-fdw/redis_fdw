@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+# Supersede a PR's earlier runs when it is pushed again: a stacked-branch
+# rebase force-pushes several branches at once, and every run it displaces is
+# testing content that no longer exists. Master is excluded by folding run_id
+# into its group, so each commit on master keeps its own completed run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.run_id || '' }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: PostgreSQL ${{ matrix.pg }}

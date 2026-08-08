@@ -2703,3 +2703,12 @@ select * from db15_inf order by key;
 
 delete from db15_inf;
 drop foreign table db15_inf;
+-- The bytea-members-with-scores test above seeds bsc_z directly in Redis and
+-- only ever drops the foreign tables over it, so the key outlives the suite.
+-- That is invisible against a throwaway Redis, but the buildfarm runs every
+-- branch against one long-lived server, where anything left behind trips the
+-- "db 15 not empty" guard on the next run - and keeps tripping it, because the
+-- guard refuses to flush a database it did not create.
+\! redis-cli < test/sql/redis_clean
+OK
+OK

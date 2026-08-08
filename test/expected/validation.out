@@ -1,0 +1,209 @@
+\i test/common/prologue.sql
+-- Shared prologue for every redis_fdw test module.
+-- psql -a echoes this file into every expected output, so keep it short.
+-- Refuse to run against a database that is not empty, rather than risk
+-- flushing real data. Expected output is (integer) 0.
+\! redis-cli -n 15 dbsize
+0
+create server localredis foreign data wrapper redis_fdw;
+create user mapping for public server localredis;
+-- the default scalar view of db 15, used by the scalar and joins_and_cursors
+-- modules
+create foreign table db15(key text, value text)
+       server localredis
+       options (database '15');
+-- set results come back in arbitrary order; atsort() makes them predictable
+CREATE OR REPLACE FUNCTION atsort( a text[])
+ RETURNS text[]
+ LANGUAGE sql
+ IMMUTABLE  STRICT
+AS $function$
+  select array(select unnest($1) order by 1)
+$function$;
+-- a table declared with the wrong number of columns for its type/shape is
+-- rejected on first use, for every table type this FDW supports
+create foreign table db15_set_bad_shape(key text, value text, extra text)
+       server localredis
+       options (tabletype 'set', tablekeyprefix 'set_bad_', database '15');
+select * from db15_set_bad_shape;
+ERROR:  table has incorrect number of columns
+drop foreign table db15_set_bad_shape;
+create foreign table db15_list_bad_shape(key text, value text, extra text)
+       server localredis
+       options (tabletype 'list', tablekeyprefix 'list_bad_', database '15');
+select * from db15_list_bad_shape;
+ERROR:  table has incorrect number of columns
+drop foreign table db15_list_bad_shape;
+create foreign table db15_hash_bad_shape(key text, value text, extra text)
+       server localredis
+       options (tabletype 'hash', tablekeyprefix 'hash_bad_', database '15');
+select * from db15_hash_bad_shape;
+ERROR:  table has incorrect number of columns
+drop foreign table db15_hash_bad_shape;
+create foreign table db15_zset_bad_shape(key text, value text, extra text, extra2 text)
+       server localredis
+       options (tabletype 'zset', tablekeyprefix 'zset_bad_', database '15');
+select * from db15_zset_bad_shape;
+ERROR:  table has incorrect number of columns
+drop foreign table db15_zset_bad_shape;
+create foreign table db15_singleton_scalar_bad_shape(a text, b text)
+       server localredis
+       options (singleton_key 'bad_singleton', database '15');
+select * from db15_singleton_scalar_bad_shape;
+ERROR:  table has incorrect number of columns
+drop foreign table db15_singleton_scalar_bad_shape;
+-- a dropped column must not count toward the declared column count: adding a
+-- column and dropping it again leaves the table as valid as it started
+create foreign table db15_hash_dropped(key text, value text)
+       server localredis
+       options (tabletype 'hash', tablekeyprefix 'hash_drop_', database '15');
+alter foreign table db15_hash_dropped add column extra text;
+alter foreign table db15_hash_dropped drop column extra;
+select * from db15_hash_dropped;
+ key | value 
+-----+-------
+(0 rows)
+
+drop foreign table db15_hash_dropped;
+-- but dropping a column the table type does need is an error, not a table that
+-- silently reports NULL for the column that went missing
+create foreign table db15_hash_lost_value(key text, value text)
+       server localredis
+       options (tabletype 'hash', tablekeyprefix 'hash_lost_', database '15');
+alter foreign table db15_hash_lost_value drop column value;
+select * from db15_hash_lost_value;
+ERROR:  table has incorrect number of columns
+drop foreign table db15_hash_lost_value;
+-- a dropped column ahead of a live one leaves that live column at a position
+-- past the end of the values array the scan builds, so it is rejected as well
+create foreign table db15_hash_middrop(key text, mid text, value text)
+       server localredis
+       options (tabletype 'hash', tablekeyprefix 'hash_mid_', database '15');
+alter foreign table db15_hash_middrop drop column mid;
+select * from db15_hash_middrop;
+ERROR:  table has a dropped column among the columns this table type uses
+drop foreign table db15_hash_middrop;
+-- NULL key or value must be rejected with an error, not crash the backend.
+create foreign table db15_w_nulls_hash(key text, val text)
+       server localredis
+       options (singleton_key 'w_nulls_hash', tabletype 'hash', database '15');
+insert into db15_w_nulls_hash values (null, 'v');
+ERROR:  cannot insert NULL key into a Redis table
+insert into db15_w_nulls_hash values ('k', null);
+ERROR:  cannot insert NULL value into a Redis table
+create foreign table db15_w_nulls_zset(val text, score numeric)
+       server localredis
+       options (singleton_key 'w_nulls_zset', tabletype 'zset', database '15');
+insert into db15_w_nulls_zset values ('m', null);
+ERROR:  cannot insert NULL value into a Redis table
+create foreign table db15_w_nulls_multi(key text, val text)
+       server localredis
+       options (tabletype 'hash', database '15');
+insert into db15_w_nulls_multi values (null, 'v');
+ERROR:  cannot insert NULL key into a Redis table
+insert into db15_w_nulls_multi values ('k', null);
+ERROR:  cannot insert NULL into a Redis table
+drop foreign table db15_w_nulls_hash;
+drop foreign table db15_w_nulls_zset;
+drop foreign table db15_w_nulls_multi;
+-- A collection table stores its members in an array-typed value column. A
+-- scalar bytea column cannot hold them: unlike scalar text, which yields a
+-- PostgreSQL array literal that casts back to an array, bytea has no array
+-- literal form. The write path already refuses this shape; the read path
+-- must too, rather than silently returning an empty bytea.
+\! redis-cli -n 15 rpush bcol_list a b c > /dev/null
+\! redis-cli -n 15 sadd  bcol_set  x y   > /dev/null
+\! redis-cli -n 15 hset  bcol_hash f1 v1 > /dev/null
+\! redis-cli -n 15 zadd  bcol_zset 1 m1  > /dev/null
+create foreign table db15_bcol_list(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'list', tablekeyprefix 'bcol_list');
+select * from db15_bcol_list;
+ERROR:  bytea value column requires an array type for this Redis table
+HINT:  Declare the value column as bytea[] instead.
+-- the check must sit after the EXPLAIN early return: planning must not error
+explain (costs off) select * from db15_bcol_list;
+           QUERY PLAN           
+--------------------------------
+ Foreign Scan on db15_bcol_list
+(1 row)
+
+create foreign table db15_bcol_set(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'set', tablekeyprefix 'bcol_set');
+select * from db15_bcol_set;
+ERROR:  bytea value column requires an array type for this Redis table
+HINT:  Declare the value column as bytea[] instead.
+create foreign table db15_bcol_hash(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'hash', tablekeyprefix 'bcol_hash');
+select * from db15_bcol_hash;
+ERROR:  bytea value column requires an array type for this Redis table
+HINT:  Declare the value column as bytea[] instead.
+create foreign table db15_bcol_zset(key text, value bytea)
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'bcol_zset');
+select * from db15_bcol_zset;
+ERROR:  bytea value column requires an array type for this Redis table
+HINT:  Declare the value column as bytea[] instead.
+-- bytea[] on the same table is the correct shape and must keep working
+create foreign table db15_bcol_list_arr(key text, value bytea[])
+       server localredis
+       options (database '15', tabletype 'list', tablekeyprefix 'bcol_list');
+select key, value from db15_bcol_list_arr;
+    key    |           value           
+-----------+---------------------------
+ bcol_list | {"\\x61","\\x62","\\x63"}
+(1 row)
+
+-- a singleton collection with a scalar bytea column is the feature's main
+-- use case and must keep working
+create foreign table db15_bcol_sing_set(member bytea)
+       server localredis
+       options (database '15', tabletype 'set', singleton_key 'bcol_set');
+select member from db15_bcol_sing_set order by member;
+ member 
+--------
+ \x78
+ \x79
+(2 rows)
+
+create foreign table db15_bcol_sing_list(member bytea)
+       server localredis
+       options (database '15', tabletype 'list', singleton_key 'bcol_list');
+select member from db15_bcol_sing_list;
+ member 
+--------
+ \x61
+ \x62
+ \x63
+(3 rows)
+
+-- a scalar table with a bytea value column must keep working
+\! redis-cli -n 15 set bcol_scalar_k hello > /dev/null
+create foreign table db15_bcol_scalar(key text, value bytea)
+       server localredis
+       options (database '15', tablekeyprefix 'bcol_scalar');
+select key, value from db15_bcol_scalar;
+      key      |    value     
+---------------+--------------
+ bcol_scalar_k | \x68656c6c6f
+(1 row)
+
+drop foreign table db15_bcol_list;
+drop foreign table db15_bcol_set;
+drop foreign table db15_bcol_hash;
+drop foreign table db15_bcol_zset;
+drop foreign table db15_bcol_list_arr;
+drop foreign table db15_bcol_sing_set;
+drop foreign table db15_bcol_sing_list;
+drop foreign table db15_bcol_scalar;
+\i test/common/epilogue.sql
+-- Shared epilogue for every redis_fdw test module: leave nothing behind, so
+-- the next module starts from nothing and any module can run on its own.
+\! redis-cli < test/redis_clean
+OK
+OK
+set client_min_messages = warning;
+drop server localredis cascade;
+reset client_min_messages;

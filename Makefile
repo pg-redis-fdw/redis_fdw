@@ -21,7 +21,7 @@ EXTENSION = redis_fdw
 DATA = redis_fdw--1.0.sql redis_fdw--2.0.sql redis_fdw--1.0--2.0.sql
 
 ifndef REGRESS
-REGRESS = geo joins_and_cursors connection validation scalar hash set redis_fdw
+REGRESS = geo joins_and_cursors connection validation scalar hash set list redis_fdw
 endif
 REGRESS_OPTS = --inputdir=test --outputdir=test \
       --load-extension=hstore \

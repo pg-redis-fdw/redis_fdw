@@ -8,6 +8,11 @@
 -- about two scans sharing one cache entry, not about joins.
 \i test/common/prologue.sql
 
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+
 -- a self-join opens two concurrent ForeignScans sharing the same cache key
 -- (same connection options); results must be correct regardless.
 -- ALTER SERVER (even a no-op value change) exercises the connection cache's

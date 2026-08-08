@@ -3,6 +3,11 @@
 -- rename semantics, shape validation and dropped-column handling.
 \i test/common/prologue.sql
 
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+
 -- singleton geo table
 
 create foreign table db15_w_1key_geo(value text, lat double precision, long double precision)

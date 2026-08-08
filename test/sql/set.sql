@@ -3,6 +3,11 @@
 -- in arbitrary order, so results are wrapped in atsort().
 \i test/common/prologue.sql
 
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+
 \! redis-cli < test/redis_setup
 
 -- set

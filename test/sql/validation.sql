@@ -6,6 +6,11 @@
 -- geo.sql for the geo column-shape and dropped-column cases.
 \i test/common/prologue.sql
 
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+
 -- a table declared with the wrong number of columns for its type/shape is
 -- rejected on first use, for every table type this FDW supports
 

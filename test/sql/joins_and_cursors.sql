@@ -5,6 +5,11 @@
 -- split it rather than adding to it.
 \i test/common/prologue.sql
 
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+
 -- cursor tests
 
 create foreign table db15bigprefixscalar (

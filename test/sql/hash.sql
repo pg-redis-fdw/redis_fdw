@@ -3,6 +3,11 @@
 -- values. Contains the suite's only uses of hstore.
 \i test/common/prologue.sql
 
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+
 \! redis-cli < test/redis_setup
 
 -- hash

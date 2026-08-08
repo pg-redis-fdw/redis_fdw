@@ -7,6 +7,30 @@
 --
 -- Adding a module? See test/README.md. This file cannot guard db 15 on your
 -- behalf: it only sets db15_not_empty, and your module must act on it.
+-- Refuse by default, and only clear the flag once we have positively counted an
+-- empty keyspace. Everything below can fail -- redis-cli missing, redis down --
+-- and a \gset that never runs leaves the variable unset, at which point \if
+-- skips its entire block, \q included, and the module would run on and flush a
+-- database it was meant to protect. Starting from "not empty" makes every such
+-- failure refuse instead.
+\set db15_not_empty true
+-- DBSIZE, rather than counting rows through the foreign tables, for two
+-- reasons: it sees keys of every type, including ones this FDW cannot read and
+-- would silently skip; and it does not route the safety check through the code
+-- under test. \copy runs the program client-side, like the \! calls elsewhere
+-- in this suite, so it needs no server-side execution privilege.
+create temp table redis_dbsize(n bigint);
+\copy redis_dbsize from program 'redis-cli -n 15 dbsize'
+select n <> 0 as db15_not_empty from redis_dbsize \gset
+drop table redis_dbsize;
+create server localredis foreign data wrapper redis_fdw;
+create user mapping for public server localredis;
+-- the default scalar view of db 15, used by the scalar and joins_and_cursors
+-- modules
+create foreign table db15(key text, value text)
+       server localredis
+       options (database '15');
+-- set results come back in arbitrary order; atsort() makes them predictable
 CREATE OR REPLACE FUNCTION atsort( a text[])
  RETURNS text[]
  LANGUAGE sql
@@ -14,35 +38,6 @@ CREATE OR REPLACE FUNCTION atsort( a text[])
 AS $function$
   select array(select unnest($1) order by 1)
 $function$;
-create server localredis foreign data wrapper redis_fdw;
-create user mapping for public server localredis;
--- tables for all 5 data types (4 structured plus scalar)
-create foreign table db15(key text, value text)
-       server localredis
-       options (database '15');
-create foreign table db15_hash(key text, value text)
-       server localredis
-       options (database '15', tabletype 'hash');
-create foreign table db15_set(key text, value text)
-       server localredis
-       options (database '15', tabletype 'set');
-create foreign table db15_list(key text, value text)
-       server localredis
-       options (database '15', tabletype 'list');
-create foreign table db15_zset(key text, value text)
-       server localredis
-       options (database '15', tabletype 'zset');
--- Decide whether db 15 is empty, but leave acting on it to the module: psql's
--- \q and ON_ERROR_STOP both terminate only the script they appear in, so a
--- guard placed in this include would abort the include and let the module run
--- on -- seeding and flushing a database it was supposed to protect.
-select
-    (select count(*) from db15) +
-    (select count(*) from db15_hash) +
-    (select count(*) from db15_set) +
-    (select count(*) from db15_list) +
-    (select count(*) from db15_zset) <> 0 as db15_not_empty
-\gset
 \if :db15_not_empty
 \echo 'db 15 is not empty - refusing to run rather than destroy data'
 \q

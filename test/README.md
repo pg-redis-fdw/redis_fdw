@@ -30,8 +30,8 @@ Then add the module name to `REGRESS` in the `Makefile`.
 
 ## The four guard lines are not boilerplate you can drop
 
-`prologue.sql` counts db 15 and sets `db15_not_empty`, but it cannot act on it
-for you. **psql's `\q` and `ON_ERROR_STOP` both terminate only the script they
+`prologue.sql` asks Redis for `DBSIZE` and sets `db15_not_empty`, but it cannot
+act on it for you. **psql's `\q` and `ON_ERROR_STOP` both terminate only the script they
 appear in.** A guard placed inside the include would abort the include and hand
 control straight back to your module, which would then run on and — if it seeds
 the fixture — flush a database that was never ours to flush.
@@ -44,6 +44,19 @@ happened to die at their own first deliberate error before reaching the flush.
 So the `\if` / `\q` must sit at the top level of *your* module file, where `\q`
 really does stop psql. Nothing checks that you remembered it. If you leave it
 out, your module will run against whatever it finds and destroy it.
+
+Two details of the prologue exist because the guard has to fail *closed*, and
+are worth knowing before you change it:
+
+- `db15_not_empty` is preset to true and only cleared once an empty keyspace has
+  been positively counted. If the count cannot run at all, `\gset` sets nothing,
+  and `\if` on an unset variable skips its whole block — `\q` included — so the
+  module would carry on. Refusing by default turns every such failure into a
+  refusal.
+- The count comes from `DBSIZE`, not from `count(*)` over the foreign tables.
+  Going through the FDW misses key types it cannot read: a stream, for instance,
+  answers `WRONGTYPE`, which the scan loop skips, so a database holding one
+  would have been reported empty and then flushed.
 
 ## If your module needs the shared fixture
 

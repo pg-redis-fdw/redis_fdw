@@ -1950,6 +1950,8 @@ create foreign table db15_ssc(key text, value text, scores numeric[])
 
 select * from db15_ssc;
 
+delete from db15_ssc;
+
 drop foreign table db15_ssc;
 
 -- infinite scores round-trip both ways. numeric has accepted inf since PG 14,
@@ -1971,11 +1973,15 @@ delete from db15_inf;
 
 drop foreign table db15_inf;
 
--- The bytea-members-with-scores test above seeds bsc_z directly in Redis and
--- only ever drops the foreign tables over it, so the key outlives the suite.
--- That is invisible against a throwaway Redis, but the buildfarm runs every
--- branch against one long-lived server, where anything left behind trips the
--- "db 15 not empty" guard on the next run - and keeps tripping it, because the
--- guard refuses to flush a database it did not create.
+-- Every test above is expected to leave db 15 as it found it. Listing the
+-- keyspace here asserts that, and names anything left behind: a leak becomes a
+-- failure attributed to the commit that caused it, with the offending keys
+-- recorded in regression.diffs, instead of a "db 15 not empty" failure in
+-- whatever runs next, pointing at innocent code. bsc_z leaked exactly that way
+-- and went unnoticed until it had wedged every branch of a buildfarm animal.
+--
+-- Deliberately non-destructive: the database is left as the failing run left
+-- it, so it can be inspected. Like the guard at the top of this file, this
+-- reports rather than flushes.
 
-\! redis-cli < test/sql/redis_clean
+\! redis-cli -n 15 keys '*' | sort

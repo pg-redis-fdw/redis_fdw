@@ -27,8 +27,6 @@ REGRESS_OPTS = --inputdir=test --outputdir=test \
       --load-extension=hstore \
 	  --load-extension=$(EXTENSION)
 
-EXTRA_CLEAN =
-
 SHLIB_LINK += -lhiredis
 
 USE_PGXS = 1

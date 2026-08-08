@@ -1,3 +1,8 @@
+-- The FDW as part of a larger query plan: cursors, UPDATE ... FROM and
+-- DELETE ... USING, a forced merge join on the key column, and EXPLAIN.
+--
+-- Two subjects in one file, which is tolerable at this size. If it grows,
+-- split it rather than adding to it.
 \i test/common/prologue.sql
 
 -- cursor tests

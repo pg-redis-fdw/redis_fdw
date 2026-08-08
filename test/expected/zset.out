@@ -1,10 +1,26 @@
+-- Sorted-set tables: reads, the scores column read and written, singleton
+-- forms with and without scores, tablekeyprefix and tablekeyset, bytea
+-- members, numeric[] scores, and infinite scores.
 \i test/common/prologue.sql
 -- Shared prologue for every redis_fdw test module.
 -- psql -a echoes this file into every expected output, so keep it short.
 -- Refuse to run against a database that is not empty, rather than risk
--- flushing real data. Expected output is (integer) 0.
-\! redis-cli -n 15 dbsize
-0
+-- destroying real data: ON_ERROR_STOP makes the exception terminate the script
+-- before the epilogue's flush can run. DBSIZE counts keys of every type, so
+-- this is stricter than counting rows through a handful of foreign tables.
+\set ON_ERROR_STOP
+create temp table redis_dbsize(n bigint);
+copy redis_dbsize from program 'redis-cli -n 15 dbsize';
+do $$
+  begin
+    if (select n from redis_dbsize) <> 0
+    then
+       raise EXCEPTION 'db 15 not empty';
+    end if;
+  end;
+$$;
+drop table redis_dbsize;
+\unset ON_ERROR_STOP
 create server localredis foreign data wrapper redis_fdw;
 create user mapping for public server localredis;
 -- the default scalar view of db 15, used by the scalar and joins_and_cursors
@@ -539,7 +555,6 @@ select * from db15_szs order by score;
 drop foreign table db15_zs3;
 drop foreign table db15_zs2;
 drop foreign table db15_szs;
--- all done, so now blow everything in the db away again
 -- singleton zset table with bytea member and scores
 create foreign table db15_bytea_zset(member bytea, score numeric)
        server localredis

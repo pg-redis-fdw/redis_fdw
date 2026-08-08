@@ -1,3 +1,6 @@
+-- List tables: reads, singleton and non-singleton forms, tablekeyprefix and
+-- tablekeyset, and bytea values. Unlike sets, list order is determinate and is
+-- asserted directly.
 \i test/common/prologue.sql
 
 \! redis-cli < test/redis_setup

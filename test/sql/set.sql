@@ -1,3 +1,6 @@
+-- Set tables: reads, singleton and non-singleton forms, tablekeyprefix and
+-- tablekeyset, bytea members and bytea[] array columns. Set members come back
+-- in arbitrary order, so results are wrapped in atsort().
 \i test/common/prologue.sql
 
 \! redis-cli < test/redis_setup

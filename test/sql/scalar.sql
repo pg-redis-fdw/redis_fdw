@@ -1,3 +1,6 @@
+-- Scalar (Redis string) tables: reads, singleton and non-singleton
+-- forms, tablekeyprefix and tablekeyset, a name-typed key column, and bytea
+-- values.
 \i test/common/prologue.sql
 
 \! redis-cli < test/redis_setup

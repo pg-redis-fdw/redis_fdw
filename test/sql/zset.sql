@@ -1,3 +1,6 @@
+-- Sorted-set tables: reads, the scores column read and written, singleton
+-- forms with and without scores, tablekeyprefix and tablekeyset, bytea
+-- members, numeric[] scores, and infinite scores.
 \i test/common/prologue.sql
 
 \! redis-cli < test/redis_setup
@@ -337,9 +340,6 @@ select * from db15_szs order by score;
 drop foreign table db15_zs3;
 drop foreign table db15_zs2;
 drop foreign table db15_szs;
-
--- all done, so now blow everything in the db away again
-
 
 -- singleton zset table with bytea member and scores
 create foreign table db15_bytea_zset(member bytea, score numeric)

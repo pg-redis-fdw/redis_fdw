@@ -1,3 +1,6 @@
+-- Hash tables: reads, singleton and non-singleton forms, tablekeyprefix and
+-- tablekeyset, preservation of values containing embedded NULs, and bytea
+-- values. Contains the suite's only uses of hstore.
 \i test/common/prologue.sql
 
 \! redis-cli < test/redis_setup
@@ -174,9 +177,6 @@ select key, val from db15_w_hash_kset order by key;
 delete from db15_w_hash_kset;
 
 select * from db15_w_hash_kset;
-
--- now clean up for the cursor tests
-
 
 -- singleton hash table with bytea value column (key must be text)
 create foreign table db15_bytea_hash(key text, val bytea)

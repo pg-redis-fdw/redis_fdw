@@ -1,3 +1,11 @@
+-- The Redis connection itself: cache reuse and invalidation, recovery from a
+-- statement abort and from a server-side CLIENT KILL, and username/password
+-- and ACL authentication.
+--
+-- Glob-metacharacter escaping in tablekeyprefix is here rather than with the
+-- per-type keyprefix tests because the prefix is embedded in the pattern this
+-- connection sends to KEYS/SCAN. The self-join that opens the file is likewise
+-- about two scans sharing one cache entry, not about joins.
 \i test/common/prologue.sql
 
 -- a self-join opens two concurrent ForeignScans sharing the same cache key

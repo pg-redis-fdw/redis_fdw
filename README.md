@@ -602,14 +602,30 @@ Limitations
 Tests
 -----
 
-The tests for PostgreSQL assume that you have access to a Redis server
-on the local machine with no password, and uses PostgreSQL 15 server with
-*english* locale. This database must be empty, and that the `redis-cli` program
-is in the `PATH` envireonment variable when tests is run.
-The [test](test) script checks that the database is empty before it tries to
-populate it, and it cleans up afterwards.
+The tests assume you have access to a Redis server on the local machine with
+no password, and that the `redis-cli` program is on the `PATH`. They use Redis
+database 15, which must be empty: each test module refuses to run rather than
+risk destroying data it did not create.
 
-Some tests as `psql` expected outputs can be found in [test/expected](test/expected) directory.
+The suite is split into one module per subject, in
+[test/sql](test/sql), with expected output in
+[test/expected](test/expected):
+
+| module | covers |
+|---|---|
+| `scalar`, `hash`, `set`, `list`, `zset`, `geo` | one Redis table type each, end to end |
+| `validation` | rejections not specific to a table type: column counts, dropped columns, NULL keys and values |
+| `connection` | connection caching, reconnection, authentication, key-pattern escaping |
+| `joins_and_cursors` | the FDW inside a larger query plan: cursors, joins, EXPLAIN |
+
+Run them all with `make installcheck`, or one at a time:
+
+    make installcheck REGRESS=zset
+
+Every module sets up and tears down independently, so any of them can be run
+on its own. `test/common/prologue.sql` and `test/common/epilogue.sql` hold the
+shared setup and teardown; `test/redis_setup` and `test/redis_clean` seed and
+flush the fixture.
 
 Contributing
 ------------

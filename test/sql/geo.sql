@@ -1,3 +1,6 @@
+-- Geo tables: both supported column shapes -- (text, float8, float8) for
+-- separate latitude and longitude, and (text, text) for an EWKT point -- plus
+-- rename semantics, shape validation and dropped-column handling.
 \i test/common/prologue.sql
 
 -- singleton geo table

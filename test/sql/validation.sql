@@ -1,3 +1,9 @@
+-- Rejections that are not specific to one table type: the declared column
+-- count for every type, dropped columns, NULL keys and values, and a scalar
+-- bytea column on a collection table.
+--
+-- Rejections that ARE specific to one type live with that type instead; see
+-- geo.sql for the geo column-shape and dropped-column cases.
 \i test/common/prologue.sql
 
 -- a table declared with the wrong number of columns for its type/shape is

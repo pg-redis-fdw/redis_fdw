@@ -6,6 +6,9 @@
 \i test/common/prologue.sql
 -- Shared prologue for every redis_fdw test module.
 -- psql -a echoes this file into every expected output.
+--
+-- Adding a module? See test/README.md. This file cannot guard db 15 on your
+-- behalf: it only sets db15_not_empty, and your module must act on it.
 CREATE OR REPLACE FUNCTION atsort( a text[])
  RETURNS text[]
  LANGUAGE sql

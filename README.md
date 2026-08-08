@@ -623,7 +623,9 @@ Run them all with `make installcheck`, or one at a time:
     make installcheck REGRESS=zset
 
 Every module sets up and tears down independently, so any of them can be run
-on its own. `test/common/prologue.sql` and `test/common/epilogue.sql` hold the
+on its own. [test/README.md](test/README.md) documents what a new module has
+to do, including the guard each one must carry to avoid running against — and
+destroying — a database that is not empty. `test/common/prologue.sql` and `test/common/epilogue.sql` hold the
 shared setup and teardown; `test/redis_setup` and `test/redis_clean` seed and
 flush the fixture.
 

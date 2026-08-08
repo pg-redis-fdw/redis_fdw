@@ -412,6 +412,8 @@ create foreign table db15_ssc(key text, value text, scores numeric[])
 
 select * from db15_ssc;
 
+delete from db15_ssc;
+
 drop foreign table db15_ssc;
 
 -- infinite scores round-trip both ways. numeric has accepted inf since PG 14,

@@ -79,10 +79,11 @@ Modules that seed everything they need inline — `geo`, `validation`,
 ## Clean up after yourself
 
 Delete the Redis keys your tests create, using `delete from <foreign table>`
-before you drop the table. `epilogue.sql` currently also flushes db 15, so a
-module that forgets will still pass — but that flush is being removed, because
-it destroys the evidence you need when a test fails. Write new modules as if it
-were already gone.
+before you drop the table. `epilogue.sql` also flushes db 15, so a module that
+forgets will still pass — do not rely on that. The flush runs whether the module
+succeeded or failed, so a module that leans on it destroys the very state you
+would need to diagnose its own failure. Write yours to leave db 15 empty on its
+own.
 
 ## Generating expected output
 

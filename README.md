@@ -11,8 +11,6 @@ This code was originally experimental, and largely intended as a pet project
 for [Dave](#license-and-authors) to experiment with and learn about FDWs in PostgreSQL.
 It has now been extended for production use by [Andrew](#license-and-authors).
 
-![image](img/experimental.png)
-
 **By all means use it, but do so entirely at your own risk!** You have been
 warned!
 

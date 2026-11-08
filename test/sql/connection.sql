@@ -32,6 +32,8 @@ alter server localredis options (add address '127.0.0.1');
 
 select value from db15_cachetest where key = 'cachetest_a';
 
+delete from db15_cachetest;
+
 drop foreign table db15_cachetest;
 
 -- A tablekeyprefix is a literal prefix, not a glob pattern. It is embedded in
@@ -78,6 +80,11 @@ drop foreign table db15_glob_star;
 drop foreign table db15_glob_quest;
 drop foreign table db15_glob_class;
 drop foreign table db15_glob_plain;
+
+-- seeded from outside, and the metacharacters are part of the key names, so
+-- delete them literally rather than through a table whose prefix is a pattern
+\! redis-cli -n 15 del 'g*b_star' 'gXb_other' 'gzzb_two' 'q?b_quest' 'qQb_other' 'c[xy]b_class' 'cxb_other' > /dev/null
+
 -- An aborted statement must not wedge the backend's Redis connection.
 -- The abort skips the executor End nodes, so anything the FDW expects those
 -- nodes to clean up is never cleaned up; a connection cache that relies on
@@ -119,6 +126,8 @@ $$;
 rollback to s;
 select value from db15_conntest;
 commit;
+
+delete from db15_conntest;
 
 drop foreign table db15_conntest;
 
@@ -194,6 +203,7 @@ drop server aclsrv cascade;
 drop server aclbad cascade;
 
 \! redis-cli ACL DELUSER fdwtest > /dev/null
+\! redis-cli -n 15 del acltest_k > /dev/null
 
 \i test/common/epilogue.sql
 

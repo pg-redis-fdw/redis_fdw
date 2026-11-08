@@ -44,7 +44,7 @@ select * from db15_1key_list order by value;
 
 
 
-\! redis-cli < test/redis_clean
+\! redis-cli < test/redis_teardown
 
 -- singleton list
 
@@ -69,6 +69,11 @@ insert into db15_w_1key_list values ('b'), ('d'),('f'),('a'); -- dups allowed he
 select * from db15_w_1key_list /* order by val */;
 
 update db15_w_1key_list set val = 'y';
+
+-- the FDW cannot delete from a SINGLETON list table (see below), so this key
+-- has to go from outside. The non-singleton list tables further down clean up
+-- through the FDW, since deleting a whole key is supported.
+\! redis-cli -n 15 del w_1key_list > /dev/null
 
 
 -- non-singleton list table keyprefix
@@ -161,6 +166,8 @@ insert into db15_bytea_list values
     (E'list\\000item3'::bytea);
 
 select length(val), val from db15_bytea_list;
+
+\! redis-cli -n 15 del bytea_list > /dev/null
 
 -- a bytea key column on a non-singleton table is rejected for DELETE too,
 -- not just INSERT/UPDATE

@@ -73,7 +73,7 @@ select * from db15_1key_zset_scores order by score desc;
 -- first clean the database again
 
 
-\! redis-cli < test/redis_clean
+\! redis-cli < test/redis_teardown
 
 -- singleton zset with scores
 
@@ -310,6 +310,10 @@ update db15_zsnum set key = 'zsnumrenamed', members = '{a,b,d}', scores = '{4,5,
 
 select * from db15_zsnum where key = 'zsnumrenamed';
 
+-- named, not unqualified: this table has no prefix and no keyset, so an
+-- unqualified DELETE would take every zset in db 15
+delete from db15_zsnum where key = 'zsnumrenamed';
+
 drop foreign table db15_zsnum;
 
 -- a two-column non-singleton zset is unaffected: members-only UPDATE is
@@ -341,6 +345,12 @@ update db15_szs set score = 55 where value = 'a';
 update db15_szs set value = 'bb' where value = 'b';
 
 select * from db15_szs order by score;
+
+delete from db15_zs3 where key in ('zs3renamed', 'zs3inf');
+delete from db15_zs2 where key = 'zs2';
+-- zs1 was seeded from outside, but the singleton table can still empty it, and
+-- a zset loses its key with its last member
+delete from db15_szs;
 
 drop foreign table db15_zs3;
 drop foreign table db15_zs2;

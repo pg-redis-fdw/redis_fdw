@@ -54,7 +54,7 @@ select * from db15_1key_hash order by key;
 
 
 
-\! redis-cli < test/redis_clean
+\! redis-cli < test/redis_teardown
 
 -- singleton hash
 
@@ -98,6 +98,11 @@ select * from db15_w_1key_hash order by key;
 \! printf 'ab\000cdefghij' | redis-cli -n 15 -x hset w_1key_hash binkey_orig
 update db15_w_1key_hash set key = 'binkey2' where key = 'binkey';
 \! redis-cli -n 15 eval "return (redis.call('HGET',KEYS[1],ARGV[1]) == redis.call('HGET',KEYS[1],ARGV[2])) and 'value preserved' or 'value CORRUPTED'" 1 w_1key_hash binkey2 binkey_orig
+
+-- emptying a singleton hash removes the Redis key with its last field
+delete from db15_w_1key_hash;
+
+select * from db15_w_1key_hash;
 
 
 -- non-singleton hash table prefix

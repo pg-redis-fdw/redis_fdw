@@ -200,5 +200,9 @@ drop foreign table db15_bcol_sing_set;
 drop foreign table db15_bcol_sing_list;
 drop foreign table db15_bcol_scalar;
 
+-- these keys were seeded from outside, and every table that could reach them
+-- is a rejection case, so drop them the same way they were made
+\! redis-cli -n 15 del bcol_list bcol_set bcol_hash bcol_zset bcol_scalar_k > /dev/null
+
 \i test/common/epilogue.sql
 

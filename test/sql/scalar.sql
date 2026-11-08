@@ -24,7 +24,7 @@ create foreign table db15_1key(value text)
 select * from db15_1key;
 
 
-\! redis-cli < test/redis_clean
+\! redis-cli < test/redis_teardown
 
 -- singleton scalar table
 
@@ -87,6 +87,12 @@ select * from db15_w_scalar order by key;
 
 select * from db15_w_scalar;
 */
+
+-- so name the keys instead: this table has no prefix and no keyset, and an
+-- unqualified DELETE through it would take the whole of db 15 with it
+delete from db15_w_scalar where key in ('x_ws', 'z_ws');
+
+select * from db15_w_scalar;
 
 -- non-singleton scalar table keyprefix
 

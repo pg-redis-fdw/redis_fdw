@@ -49,7 +49,7 @@ select * from db15_1key_set order by value;
 
 
 
-\! redis-cli < test/redis_clean
+\! redis-cli < test/redis_teardown
 
 -- singleton set
 
@@ -72,6 +72,11 @@ select * from db15_w_1key_set order by key;
 update db15_w_1key_set set key = 'x' where key = 'e';
 
 select * from db15_w_1key_set order by key;
+
+-- emptying a singleton set removes the Redis key with its last member
+delete from db15_w_1key_set;
+
+select * from db15_w_1key_set;
 
 
 -- non-singleton set table no prefix no keyset

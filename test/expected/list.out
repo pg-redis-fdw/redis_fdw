@@ -122,9 +122,14 @@ select * from db15_1key_list order by value;
  e6
 (6 rows)
 
-\! redis-cli < test/redis_clean
+\! redis-cli < test/redis_teardown
 OK
-OK
+2
+2
+2
+2
+2
+4
 -- singleton list
 create foreign table db15_w_1key_list(val text)
        server localredis
@@ -163,6 +168,10 @@ select * from db15_w_1key_list /* order by val */;
 
 update db15_w_1key_list set val = 'y';
 ERROR:  update not supported for this type of table
+-- the FDW cannot delete from a SINGLETON list table (see below), so this key
+-- has to go from outside. The non-singleton list tables further down clean up
+-- through the FDW, since deleting a whole key is supported.
+\! redis-cli -n 15 del w_1key_list > /dev/null
 -- non-singleton list table keyprefix
 create foreign table db15_w_list_pfx(key text, val text[])
        server localredis
@@ -307,6 +316,7 @@ select length(val), val from db15_bytea_list;
      10 | \x6c697374006974656d33
 (3 rows)
 
+\! redis-cli -n 15 del bytea_list > /dev/null
 -- a bytea key column on a non-singleton table is rejected for DELETE too,
 -- not just INSERT/UPDATE
 create foreign table db15_bytea_key_ns(key bytea, val text)
@@ -316,11 +326,19 @@ delete from db15_bytea_key_ns where key = E'anything'::bytea; -- bytea key error
 ERROR:  bytea key column not supported
 drop foreign table db15_bytea_key_ns;
 \i test/common/epilogue.sql
--- Shared epilogue for every redis_fdw test module: leave nothing behind, so
--- the next module starts from nothing and any module can run on its own.
-\! redis-cli < test/redis_clean
-OK
-OK
+-- Shared epilogue for every redis_fdw test module: assert that the module left
+-- db 15 empty, so the next module starts from nothing and any module can run on
+-- its own.
+--
+-- This asserts rather than flushes. A flush would make the assertion true by
+-- destroying the evidence a failing module left behind. Every key printed below
+-- is a line that is not in the expected file, so the module that leaked is the
+-- first to fail and names the key, instead of the cause being buried in a
+-- refusal from whatever runs next. KEYS, like the prologue's DBSIZE, sees keys
+-- of every type. LC_ALL so a leak of several keys reads the same on every
+-- machine; the passing output is empty either way. See test/README.md.
+\! redis-cli -n 15 keys '*' | LC_ALL=C sort
+
 set client_min_messages = warning;
 drop server localredis cascade;
 reset client_min_messages;

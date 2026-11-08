@@ -81,9 +81,14 @@ select * from db15_1key;
  bar
 (1 row)
 
-\! redis-cli < test/redis_clean
+\! redis-cli < test/redis_teardown
 OK
-OK
+2
+2
+2
+2
+2
+4
 -- singleton scalar table
 create foreign table db15_w_1key_scalar(val text)
        server localredis
@@ -178,6 +183,14 @@ select * from db15_w_scalar order by key;
 
 select * from db15_w_scalar;
 */
+-- so name the keys instead: this table has no prefix and no keyset, and an
+-- unqualified DELETE through it would take the whole of db 15 with it
+delete from db15_w_scalar where key in ('x_ws', 'z_ws');
+select * from db15_w_scalar;
+ key | val 
+-----+-----
+(0 rows)
+
 -- non-singleton scalar table keyprefix
 create foreign table db15_w_scalar_pfx(key text, val text)
        server localredis
@@ -401,11 +414,19 @@ select * from db15_bytea_scalar_ns;
 (0 rows)
 
 \i test/common/epilogue.sql
--- Shared epilogue for every redis_fdw test module: leave nothing behind, so
--- the next module starts from nothing and any module can run on its own.
-\! redis-cli < test/redis_clean
-OK
-OK
+-- Shared epilogue for every redis_fdw test module: assert that the module left
+-- db 15 empty, so the next module starts from nothing and any module can run on
+-- its own.
+--
+-- This asserts rather than flushes. A flush would make the assertion true by
+-- destroying the evidence a failing module left behind. Every key printed below
+-- is a line that is not in the expected file, so the module that leaked is the
+-- first to fail and names the key, instead of the cause being buried in a
+-- refusal from whatever runs next. KEYS, like the prologue's DBSIZE, sees keys
+-- of every type. LC_ALL so a leak of several keys reads the same on every
+-- machine; the passing output is empty either way. See test/README.md.
+\! redis-cli -n 15 keys '*' | LC_ALL=C sort
+
 set client_min_messages = warning;
 drop server localredis cascade;
 reset client_min_messages;

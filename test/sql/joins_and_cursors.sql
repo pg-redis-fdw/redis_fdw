@@ -95,9 +95,37 @@ select * from db15_joinupd order by key;
 reset enable_hashjoin;
 reset enable_nestloop;
 
+delete from db15_joinupd;
+
 drop table joinupd_src;
 drop foreign table db15_joinupd;
 
+-- The 60k keys the cursor tests made. Deleting them through the FDW costs one
+-- Redis round trip per key -- measured at 5.5s, a third of this module's
+-- runtime -- to re-cover a delete path that scalar, hash, set and zset already
+-- test. This module is about the plan shapes above, and its own delete tests
+-- (DELETE ... USING, and db15_joinupd just now) stay as they are.
+--
+-- So do the loop server-side, in one round trip. THE QUOTED ARGUMENT BELOW IS
+-- A LUA SCRIPT: redis-cli does not interpret it, it ships it to the server as
+-- a string and the server's own embedded Lua runs it. Nothing Lua is installed
+-- or linked by this suite -- EVAL is just a Redis command, present since 2.6.
+-- hash.sql reaches past the FDW the same way. See test/README.md.
+--
+-- The script names the three patterns this module created plus the keyset,
+-- which none of them match now that the SREMs that would have emptied it are
+-- gone. The count it returns is 20000 three times over plus the keyset, so it
+-- asserts the cleanup took exactly what the inserts above made, and nothing
+-- else.
+--
+-- Two constraints this script carries: writing after KEYS makes it a write
+-- after a non-deterministic command, which needs effects replication (the
+-- default since Redis 5.0); and KEYS inside a script, with no declared keys,
+-- is not valid on a cluster node. Neither binds this suite, which is
+-- single-node throughout, but both bind anyone copying the idiom.
+\! redis-cli -n 15 eval "local n=0 for _,p in ipairs(ARGV) do for _,k in ipairs(redis.call('keys',p)) do redis.call('del',k) n=n+1 end end return n" 0 'junk*' 'w_scalar_*' 'key_*' 'w_kset'
+
+select count(*) from db15;
 
 \i test/common/epilogue.sql
 

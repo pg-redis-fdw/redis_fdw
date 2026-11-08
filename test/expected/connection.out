@@ -70,6 +70,7 @@ select value from db15_cachetest where key = 'cachetest_a';
  1
 (1 row)
 
+delete from db15_cachetest;
 drop foreign table db15_cachetest;
 -- A tablekeyprefix is a literal prefix, not a glob pattern. It is embedded in
 -- the KEYS/SCAN MATCH pattern used to find the table's keys, so any glob
@@ -123,6 +124,9 @@ drop foreign table db15_glob_star;
 drop foreign table db15_glob_quest;
 drop foreign table db15_glob_class;
 drop foreign table db15_glob_plain;
+-- seeded from outside, and the metacharacters are part of the key names, so
+-- delete them literally rather than through a table whose prefix is a pattern
+\! redis-cli -n 15 del 'g*b_star' 'gXb_other' 'gzzb_two' 'q?b_quest' 'qQb_other' 'c[xy]b_class' 'cxb_other' > /dev/null
 -- An aborted statement must not wedge the backend's Redis connection.
 -- The abort skips the executor End nodes, so anything the FDW expects those
 -- nodes to clean up is never cleaned up; a connection cache that relies on
@@ -175,6 +179,7 @@ select value from db15_conntest;
 (1 row)
 
 commit;
+delete from db15_conntest;
 drop foreign table db15_conntest;
 -- A username with no password must be rejected. Authentication is gated on
 -- the password being set, so accepting a lone username would silently connect
@@ -237,12 +242,21 @@ NOTICE:  drop cascades to user mapping for public on server aclsrv
 drop server aclbad cascade;
 NOTICE:  drop cascades to user mapping for public on server aclbad
 \! redis-cli ACL DELUSER fdwtest > /dev/null
+\! redis-cli -n 15 del acltest_k > /dev/null
 \i test/common/epilogue.sql
--- Shared epilogue for every redis_fdw test module: leave nothing behind, so
--- the next module starts from nothing and any module can run on its own.
-\! redis-cli < test/redis_clean
-OK
-OK
+-- Shared epilogue for every redis_fdw test module: assert that the module left
+-- db 15 empty, so the next module starts from nothing and any module can run on
+-- its own.
+--
+-- This asserts rather than flushes. A flush would make the assertion true by
+-- destroying the evidence a failing module left behind. Every key printed below
+-- is a line that is not in the expected file, so the module that leaked is the
+-- first to fail and names the key, instead of the cause being buried in a
+-- refusal from whatever runs next. KEYS, like the prologue's DBSIZE, sees keys
+-- of every type. LC_ALL so a leak of several keys reads the same on every
+-- machine; the passing output is empty either way. See test/README.md.
+\! redis-cli -n 15 keys '*' | LC_ALL=C sort
+
 set client_min_messages = warning;
 drop server localredis cascade;
 reset client_min_messages;

@@ -43,8 +43,14 @@ jobs:
       # only redis_fdw itself is built from source here. Valkey is the
       # actively-developed, license-compatible fork of Redis; libhiredis
       # still works against it since Valkey speaks the same RESP wire
-      # protocol, and valkey-redis-compat provides the redis-cli symlink
-      # our test scripts use.
+      # protocol.
+      #
+      # The test scripts invoke `redis-cli`, which Valkey ships as
+      # `valkey-cli`. We used to get that name from valkey-redis-compat, but
+      # that package is in noble only: when ubuntu-latest moved to 26.04 it
+      # stopped existing and every job in the matrix died at this step. Make
+      # the symlink ourselves instead, from valkey-tools, which is present in
+      # every release that has valkey-server at all.
       - name: Remove any preinstalled Redis
         run: sudo apt-get purge -y 'redis-*' || true
 
@@ -55,8 +61,11 @@ jobs:
             postgresql-server-dev-${{ matrix.pg }} \
             postgresql-client-${{ matrix.pg }} \
             valkey-server \
-            valkey-redis-compat \
+            valkey-tools \
             libhiredis-dev
+
+      - name: Provide the redis-cli name the test scripts expect
+        run: sudo ln -sf "$(command -v valkey-cli)" /usr/local/bin/redis-cli
 
       - name: Put the PostgreSQL binaries on PATH
         run: echo "/usr/lib/postgresql/${{ matrix.pg }}/bin" >> "$GITHUB_PATH"
@@ -79,10 +88,24 @@ jobs:
       - name: Create a superuser role for the CI user
         run: sudo -u postgres createuser -s "$(whoami)"
 
-      - name: Confirm Valkey is available
+      # Record what we are actually testing against. The expected files are
+      # compared byte for byte, and some of them assert text and ordering that
+      # the server chooses, so a distro server upgrade can turn the suite red
+      # on its own. When that happens the version in this log is the first
+      # thing you want.
+      - name: Confirm Valkey is available, and say which one
         run: |
+          lsb_release -ds
           valkey-cli ping
           redis-cli ping
+          valkey-cli info server | grep -E 'valkey_version|redis_version'
 
+      # pg_regress aborts without writing regression.diffs if its own diff
+      # cannot run - a missing expected file does that - so dump whatever
+      # exists rather than letting `cat` fail and hide the real cause.
       - name: Run regression tests
-        run: make installcheck || { cat test/regression.diffs; exit 1; }
+        run: |
+          make installcheck || {
+            cat test/regression.diffs test/log/*.log 2>/dev/null
+            exit 1
+          }

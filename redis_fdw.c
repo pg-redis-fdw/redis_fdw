@@ -2709,8 +2709,20 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 			datums = (Datum *) palloc(sizeof(Datum) * festate->natts);
 			nulls = (bool *) palloc0(sizeof(bool) * festate->natts);
 
-			/* Column 0: key (always text) */
-			datums[0] = CStringGetTextDatum(key);
+			/*
+			 * Column 0: the key. It is usually text, but any type with an
+			 * input function is accepted when the table is created, and the
+			 * BuildTupleFromCStrings branch below already converts it with
+			 * that function. Do the same here: a text datum stored in, say,
+			 * an integer column would be read as the pointer it holds.
+			 */
+			if (festate->val_types[0] == REDIS_VAL_TEXT)
+				datums[0] = CStringGetTextDatum(key);
+			else
+				datums[0] = InputFunctionCall(&festate->attinmeta->attinfuncs[0],
+											  key,
+											  festate->attinmeta->attioparams[0],
+											  festate->attinmeta->atttypmods[0]);
 
 			/* Column 1: value */
 			if (has_array)

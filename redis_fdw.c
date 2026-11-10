@@ -477,6 +477,7 @@ static redisReply *redis_command2_impl(redisContext *context,
 #define redis_command2(ctx, cmd, arg1, arg1_len, arg2, arg2_len) \
 	redis_command2_impl(ctx, cmd, sizeof(cmd) - 1, arg1, arg1_len, arg2, arg2_len)
 static inline redis_val_type classify_type(Oid typid);
+static inline void redis_verify_text(const char *str);
 static inline bool redis_zset_has_scores_column(redis_table_type table_type,
 									const char *singleton_key, int natts);
 static void get_datum_as_string(Datum datum, redis_val_type valtype,
@@ -2683,6 +2684,15 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 	/* Build the tuple */
 	if (found)
 	{
+		/*
+		 * Check the encoding of every string bound for a text-like column.
+		 * An array value column has been checked element by element.
+		 */
+		if (festate->val_types[0] != REDIS_VAL_BYTEA)
+			redis_verify_text(key);
+		if (data != NULL && !has_bytea && !has_array)
+			redis_verify_text(data);
+
 		if (has_bytea || has_array || festate->with_scores)
 		{
 			/* Use heap_form_tuple for bytea or array columns */
@@ -2932,6 +2942,17 @@ redisIterateForeignScanSingleton(ForeignScanState *node)
 	/* Build the tuple */
 	if (found)
 	{
+		/*
+		 * Check the encoding of every string bound for a text-like column:
+		 * key fills column 0 and data column 1. A geo table's coordinates
+		 * are numbers formatted by Redis.
+		 */
+		if (key != NULL && festate->val_types[0] != REDIS_VAL_BYTEA)
+			redis_verify_text(key);
+		if (data != NULL && festate->natts > 1 &&
+			festate->val_types[1] != REDIS_VAL_BYTEA)
+			redis_verify_text(data);
+
 		if (has_bytea)
 		{
 			/* Use heap_form_tuple for bytea columns to preserve binary data */
@@ -3222,6 +3243,25 @@ redisGetQual(Node *node, TupleDesc tupdesc, PlanState *planstate,
 		}
 	}
 	return;
+}
+
+/*
+ * redis_verify_text
+ *		Reject a Redis string that is not valid in the database encoding.
+ *
+ *		Redis stores bytes. The text input functions, and CStringGetTextDatum,
+ *		take a C string as it is, so a value that is not valid in the
+ *		database encoding would otherwise reach a text column unchecked, and
+ *		anything that later copies it into a table stores the invalid bytes.
+ *		Array elements already get this check in
+ *		append_quoted_array_element() and process_redis_array(); this applies
+ *		it to the scalar key and value as well. Values that are not text
+ *		belong in a bytea column, which keeps the bytes as they are.
+ */
+static inline void
+redis_verify_text(const char *str)
+{
+	pg_verifymbstr(str, strlen(str), false);
 }
 
 /*

@@ -243,19 +243,20 @@ typedef struct RedisFdwModifyState
 #define COUNT " COUNT 1000"
 
 /*
- * Prefix for the staging key a zset UPDATE rebuilds into before swapping it
- * in with RENAME (see redisExecForeignUpdate).  The backend pid is folded
- * into the key (built at the use site) so concurrent updates of the same
- * row use different staging keys rather than racing to reuse one.
+ * Prefix for the staging key an UPDATE of a set, list, hash or zset row
+ * rebuilds into before swapping it in with RENAME (see
+ * redisExecForeignUpdate).  The backend pid is folded into the key (built at
+ * the use site) so concurrent updates of the same row use different staging
+ * keys rather than racing to reuse one.
  *
  * The prefix goes in front rather than behind the real key name so it can
  * never satisfy a tablekeyprefix- or tablekeyset-restricted scan for that
  * key.  It is not hidden from a plain, unrestricted scan: a table with
  * neither option walks the whole keyspace with SCAN, and the staging key is
- * a real zset, so such a scan can return it as a row for the moment it
- * exists.
+ * a real key of the table's type, so such a scan can return it as a row for
+ * the moment it exists.
  */
-#define ZSET_REBUILD_PREFIX "\x01redis_fdw_zset_rebuild\x01"
+#define REBUILD_PREFIX "\x01redis_fdw_zset_rebuild\x01"
 
 /*
  * Connection cache structures
@@ -4912,15 +4913,7 @@ redisExecForeignUpdate(EState *estate,
 						else
 							nval_len = newval_len;
 
-						ereply = redis_command(context, "HDEL",
-											   fmstate->singleton_key, fmstate->singleton_key_len,
-											   NULL, 0, key_data, key_len);
-						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"removing hash element %s", keyval);
-						freeReplyObject(ereply);
-
-						/* Add new entry */
+						/* add before removing - see the keyset case above */
 						if (value_is_bytea)
 							get_datum_as_string(bytea_datum, REDIS_VAL_BYTEA,
 												NULL, &val_data, &val_len);
@@ -4935,6 +4928,14 @@ redisExecForeignUpdate(EState *estate,
 						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 									"adding hash element %s", newkey);
+						freeReplyObject(ereply);
+
+						ereply = redis_command(context, "HDEL",
+											   fmstate->singleton_key, fmstate->singleton_key_len,
+											   NULL, 0, key_data, key_len);
+						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
+									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+									"removing hash element %s", keyval);
 						freeReplyObject(ereply);
 					}
 					break;
@@ -5021,20 +5022,20 @@ redisExecForeignUpdate(EState *estate,
 		freeReplyObject(ereply);
 	}
 
-	if (array_elems && fmstate->table_type == PG_REDIS_ZSET_TABLE)
+	if (array_elems)
 	{
 		/*
-		 * A zset rebuild cannot use the DEL-then-repopulate approach below:
-		 * unlike SADD/RPUSH/HSET, ZADD can reject one of the caller's own
-		 * arguments (an invalid score), and by that point the DEL would
-		 * already have destroyed the row it was rebuilding.  Build the new
-		 * contents in a private staging key instead, with a single ZADD --
-		 * Redis parses every score before touching the object, so a bad
-		 * score fails the whole command and never even reaches the staging
-		 * key -- and only swap it in with RENAME once that succeeds.
-		 * RENAME replaces the destination atomically, so this never runs a
-		 * command against newkey that could fail because of the caller's
-		 * data.
+		 * Rebuild the collection in a private staging key and swap it in with
+		 * RENAME, rather than deleting the row and repopulating it in place.
+		 * Redis gives us nothing to roll back with: once the row is deleted,
+		 * any failure of the commands that write it back - Redis refusing
+		 * writes because it has reached maxmemory, a lost connection, or for
+		 * a zset an invalid score among the caller's own arguments - leaves
+		 * it empty or half built, and the UPDATE that failed has destroyed
+		 * the row it was updating. The new contents go in with a single
+		 * command, so the staging key is either complete or absent, and
+		 * RENAME replaces the destination atomically: the row is the old one
+		 * until it is the new one.
 		 */
 		int			i;
 		int			ibuff_len;
@@ -5043,25 +5044,53 @@ redisExecForeignUpdate(EState *estate,
 		int			pidlen;
 		char	   *stagingkey;
 		size_t		stagingkey_len;
-		int			zargc = 2 + 2 * nitems;
-		const char **zargv = (const char **) palloc(sizeof(char *) * zargc);
-		size_t	   *zargvlen = (size_t *) palloc(sizeof(size_t) * zargc);
+		bool		is_zset = fmstate->table_type == PG_REDIS_ZSET_TABLE;
+		int			argc = 2 + (is_zset ? 2 * nitems : nitems);
+		const char **argv = (const char **) palloc(sizeof(char *) * argc);
+		size_t	   *argvlen = (size_t *) palloc(sizeof(size_t) * argc);
+		char	   *failmsg;
 
 		Assert(!fmstate->singleton_key);
+
+		switch (fmstate->table_type)
+		{
+			case PG_REDIS_ZSET_TABLE:
+				argv[0] = "ZADD";
+				failmsg = "could not add zset members";
+				break;
+			case PG_REDIS_SET_TABLE:
+				argv[0] = "SADD";
+				failmsg = "could not add element";
+				break;
+			case PG_REDIS_LIST_TABLE:
+				argv[0] = "RPUSH";
+				failmsg = "could not add value";
+				break;
+			case PG_REDIS_HASH_TABLE:
+				argv[0] = "HSET";
+				failmsg = "could not add hash field";
+				break;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("update not supported for this type of table")
+						 ));
+		}
+		argvlen[0] = strlen(argv[0]);
 
 		/*
 		 * Fold the backend pid into the staging key: without it, two
 		 * backends updating the same row would share one staging key, and
-		 * whichever ZADD ran last would win the RENAME with the other
-		 * backend's contents instead of its own.
+		 * whichever wrote last would win the RENAME with the other backend's
+		 * contents instead of its own.
 		 */
 		pidlen = snprintf(pidbuf, sizeof(pidbuf), "%d\x01", (int) MyProcPid);
 
-		stagingkey_len = strlen(ZSET_REBUILD_PREFIX) + pidlen + newkey_len;
+		stagingkey_len = strlen(REBUILD_PREFIX) + pidlen + newkey_len;
 		stagingkey = palloc(stagingkey_len);
-		memcpy(stagingkey, ZSET_REBUILD_PREFIX, strlen(ZSET_REBUILD_PREFIX));
-		memcpy(stagingkey + strlen(ZSET_REBUILD_PREFIX), pidbuf, pidlen);
-		memcpy(stagingkey + strlen(ZSET_REBUILD_PREFIX) + pidlen, newkey_data, newkey_len);
+		memcpy(stagingkey, REBUILD_PREFIX, strlen(REBUILD_PREFIX));
+		memcpy(stagingkey + strlen(REBUILD_PREFIX), pidbuf, pidlen);
+		memcpy(stagingkey + strlen(REBUILD_PREFIX) + pidlen, newkey_data, newkey_len);
 
 		/* clear any staging key a previous failed attempt left behind */
 		ereply = redis_command1(context, "DEL", stagingkey, stagingkey_len);
@@ -5070,43 +5099,49 @@ redisExecForeignUpdate(EState *estate,
 					"could not clear staging key for %s", newkey);
 		freeReplyObject(ereply);
 
-		zargv[0] = "ZADD";
-		zargvlen[0] = 4;
-		zargv[1] = stagingkey;
-		zargvlen[1] = stagingkey_len;
+		argv[1] = stagingkey;
+		argvlen[1] = stagingkey_len;
 
 		for (i = 0; i < nitems; i++)
 		{
-			const char *data;
-			size_t		len;
-			const char *score_data;
-			size_t		score_len;
-
-			if (fmstate->with_scores)
-				get_datum_as_string(score_elements[i], score_valtype,
-									&fmstate->p_flinfo[fmstate->scores_pidx],
-									&score_data, &score_len);
-			else
+			if (is_zset)
 			{
-				ibuff_len = sprintf(ibuff, "%d", i);
-				score_data = pnstrdup(ibuff, ibuff_len);
-				score_len = ibuff_len;
+				const char *score_data;
+				size_t		score_len;
+
+				if (fmstate->with_scores)
+					get_datum_as_string(score_elements[i], score_valtype,
+										&fmstate->p_flinfo[fmstate->scores_pidx],
+										&score_data, &score_len);
+				else
+				{
+					ibuff_len = sprintf(ibuff, "%d", i);
+					score_data = pnstrdup(ibuff, ibuff_len);
+					score_len = ibuff_len;
+				}
+
+				/* score comes BEFORE value in ZADD */
+				argv[2 + 2 * i] = score_data;
+				argvlen[2 + 2 * i] = score_len;
+				get_datum_as_string(array_elems[i], array_elem_valtype,
+									&fmstate->p_flinfo[1],
+									&argv[2 + 2 * i + 1], &argvlen[2 + 2 * i + 1]);
 			}
-
-			/* score comes BEFORE value in ZADD */
-			get_datum_as_string(array_elems[i], array_elem_valtype,
-								&fmstate->p_flinfo[1], &data, &len);
-
-			zargv[2 + 2 * i] = score_data;
-			zargvlen[2 + 2 * i] = score_len;
-			zargv[2 + 2 * i + 1] = data;
-			zargvlen[2 + 2 * i + 1] = len;
+			else
+				get_datum_as_string(array_elems[i], array_elem_valtype,
+									&fmstate->p_flinfo[1],
+									&argv[2 + i], &argvlen[2 + i]);
 		}
 
-		ereply = redisCommandArgv(context, zargc, zargv, zargvlen);
+		/*
+		 * One command for all of it. For a zset this also means Redis parses
+		 * every score before adding any member, so a bad score fails the
+		 * whole command and the staging key is never created.
+		 */
+		ereply = redisCommandArgv(context, argc, argv, argvlen);
 		check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
 					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-					"could not add zset members", NULL);
+					failmsg, NULL);
 		freeReplyObject(ereply);
 
 		ereply = redis_command2(context, "RENAME", stagingkey, stagingkey_len,
@@ -5115,107 +5150,6 @@ redisExecForeignUpdate(EState *estate,
 					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 					"could not replace key %s", newkey);
 		freeReplyObject(ereply);
-	}
-	else if (array_elems)
-	{
-		Assert(!fmstate->singleton_key);
-
-		{
-			const char *argv[2] = {"DEL", newkey_data};
-			size_t		argvlen[2] = {3, newkey_len};
-
-			ereply = redisCommandArgv(context, 2, argv, argvlen);
-		}
-		check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-					"could not delete key %s", newkey);
-		freeReplyObject(ereply);
-
-		switch (fmstate->table_type)
-		{
-			case PG_REDIS_SET_TABLE:
-				{
-					int			i;
-
-					for (i = 0; i < nitems; i++)
-					{
-						const char *data;
-						size_t		len;
-
-						get_datum_as_string(array_elems[i], array_elem_valtype,
-											&fmstate->p_flinfo[1], &data, &len);
-						ereply = redis_command(context, "SADD",
-											   newkey_data, newkey_len,
-											   NULL, 0, data, len);
-						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add element", NULL);
-						freeReplyObject(ereply);
-					}
-				}
-				break;
-			case PG_REDIS_LIST_TABLE:
-				{
-					int			i;
-
-					for (i = 0; i < nitems; i++)
-					{
-						const char *data;
-						size_t		len;
-
-						get_datum_as_string(array_elems[i], array_elem_valtype,
-											&fmstate->p_flinfo[1], &data, &len);
-						ereply = redis_command(context, "RPUSH",
-											   newkey_data, newkey_len,
-											   NULL, 0, data, len);
-						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add value", NULL);
-						freeReplyObject(ereply);
-					}
-				}
-				break;
-			case PG_REDIS_HASH_TABLE:
-				{
-					int			i;
-
-					for (i = 0; i < nitems; i += 2)
-					{
-						const char *hk_data, *hv_data;
-						size_t		hk_len, hv_len;
-
-						get_datum_as_string(array_elems[i], array_elem_valtype,
-											&fmstate->p_flinfo[1], &hk_data, &hk_len);
-						get_datum_as_string(array_elems[i + 1], array_elem_valtype,
-											&fmstate->p_flinfo[1], &hv_data, &hv_len);
-						{
-							const char *argv[4];
-							size_t		argvlen[4];
-
-							argv[0] = "HSET";
-							argvlen[0] = 4;
-							argv[1] = newkey_data;
-							argvlen[1] = newkey_len;
-							argv[2] = hk_data;
-							argvlen[2] = hk_len;
-							argv[3] = hv_data;
-							argvlen[3] = hv_len;
-							ereply = redisCommandArgv(context, 4, argv, argvlen);
-						}
-						check_reply(ereply, context, RTYPE(REDIS_REPLY_INTEGER),
-									ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-									"could not add hash field", NULL);
-						freeReplyObject(ereply);
-					}
-				}
-				break;
-			default:
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("update not supported for this type of table")
-						 ));
-		}
-
 	}
 	return slot;
 }

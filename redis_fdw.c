@@ -370,6 +370,7 @@ static TupleTableSlot *redisExecForeignUpdate(EState *estate,
  */
 static bool redisIsValidOption(const char *option, Oid context);
 static void redisGetOptions(Oid foreigntableid, redisTableOptions *options);
+static void redis_start_scan(RedisFdwExecutionState *festate);
 static void redisGetQual(Node *node, TupleDesc tupdesc, char **key,
 						 char **value, bool *pushdown);
 static char *redis_escape_glob(const char *str);
@@ -1677,7 +1678,6 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 {
 	redisTableOptions table_options;
 	redisContext *context;
-	redisReply *reply = NULL;
 	char	   *qual_key = NULL;
 	char	   *qual_value = NULL;
 	bool		pushdown = false;
@@ -1806,8 +1806,24 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	 */
 	festate->mctxt = CurrentMemoryContext;
 
-	/* Execute the query */
-	reply = NULL;
+	redis_start_scan(festate);
+}
+
+/*
+ * redis_start_scan
+ *		Issue the commands that begin a scan: fetch a singleton table's
+ *		contents, check a pushed-down key, or open a SCAN cursor. Called by
+ *		redisBeginForeignScan, and again by redisReScanForeignScan, so that a
+ *		rescan starts from the beginning instead of from wherever the previous
+ *		pass stopped.
+ */
+static void
+redis_start_scan(RedisFdwExecutionState *festate)
+{
+	redisReply *reply = NULL;
+	MemoryContext oldcontext = MemoryContextSwitchTo(festate->mctxt);
+
+	festate->row = 0;
 
 	if (festate->singleton_key)
 	{
@@ -1819,29 +1835,29 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		 * like scannoing the whole Redis database could.
 		 */
 
-		switch (table_options.table_type)
+		switch (festate->table_type)
 		{
 			case PG_REDIS_SCALAR_TABLE:
-				reply = redisCommand(context, "GET %s", festate->singleton_key);
+				reply = redisCommand(festate->context, "GET %s", festate->singleton_key);
 				break;
 			case PG_REDIS_HASH_TABLE:
 				/* the singleton case where a qual pushdown makes most sense */
-				if (qual_value && pushdown)
-					reply = redis_command2(context, "HGET",
+				if (festate->qual_value)
+					reply = redis_command2(festate->context, "HGET",
 										   festate->singleton_key, strlen(festate->singleton_key),
-										   qual_value, strlen(qual_value));
+										   festate->qual_value, strlen(festate->qual_value));
 				else
-					reply = redis_command1(context, "HGETALL",
+					reply = redis_command1(festate->context, "HGETALL",
 										   festate->singleton_key, strlen(festate->singleton_key));
 				break;
 			case PG_REDIS_LIST_TABLE:
-				reply = redisCommand(context, "LRANGE %s 0 -1", table_options.singleton_key);
+				reply = redisCommand(festate->context, "LRANGE %s 0 -1", festate->singleton_key);
 				break;
 			case PG_REDIS_SET_TABLE:
-				reply = redisCommand(context, "SMEMBERS %s", table_options.singleton_key);
+				reply = redisCommand(festate->context, "SMEMBERS %s", festate->singleton_key);
 				break;
 			case PG_REDIS_ZSET_TABLE:
-				reply = redisCommand(context, "ZRANGEBYSCORE %s -inf inf WITHSCORES", table_options.singleton_key);
+				reply = redisCommand(festate->context, "ZRANGEBYSCORE %s -inf inf WITHSCORES", festate->singleton_key);
 				break;
 			case PG_REDIS_GEO_TABLE:
 				/*
@@ -1849,15 +1865,15 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 				 * so search a box large enough to cover the whole Earth
 				 * from an arbitrary origin.
 				 */
-				reply = redisCommand(context,
+				reply = redisCommand(festate->context,
 									 "GEOSEARCH %s FROMLONLAT 0 0 BYBOX 40075 40075 km ASC WITHCOORD",
-									 table_options.singleton_key);
+									 festate->singleton_key);
 				break;
 			default:
 				;
 		}
 	}
-	else if (qual_value && pushdown)
+	else if (festate->qual_value)
 	{
 		/*
 		 * if we have a qual, make sure it's a member of the keyset or has the
@@ -1869,10 +1885,10 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		{
 			redisReply *sreply;
 
-			sreply = redis_command2(context, "SISMEMBER",
+			sreply = redis_command2(festate->context, "SISMEMBER",
 									festate->keyset, strlen(festate->keyset),
-									qual_value, strlen(qual_value));
-			check_reply(sreply, context, RTYPE(REDIS_REPLY_INTEGER),
+									festate->qual_value, strlen(festate->qual_value));
+			check_reply(sreply, festate->context, RTYPE(REDIS_REPLY_INTEGER),
 						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 						"failed to list keys", NULL);
 
@@ -1883,7 +1899,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		}
 		else if (festate->keyprefix)
 		{
-			if (strncmp(qual_value, festate->keyprefix,
+			if (strncmp(festate->qual_value, festate->keyprefix,
 						festate->keyprefix_len) != 0)
 				festate->row = -1;
 		}
@@ -1894,10 +1910,10 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		 * checks, is any, so we know the item is really there.
 		 */
 
-		reply = redis_command1(context, "EXISTS", qual_value, strlen(qual_value));
-		check_reply(reply, context, RTYPE(REDIS_REPLY_INTEGER),
+		reply = redis_command1(festate->context, "EXISTS", festate->qual_value, strlen(festate->qual_value));
+		check_reply(reply, festate->context, RTYPE(REDIS_REPLY_INTEGER),
 					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-					"failed to check key existence for %s", qual_value);
+					"failed to check key existence for %s", festate->qual_value);
 		if (reply->integer == 0)
 			festate->row = -1;
 
@@ -1908,19 +1924,19 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		if (festate->keyset)
 		{
 			festate->cursor_search_string = "SSCAN %s %s" COUNT;
-			reply = redisCommand(context, festate->cursor_search_string,
+			reply = redisCommand(festate->context, festate->cursor_search_string,
 								 festate->keyset, ZERO);
 		}
 		else if (festate->keyprefix)
 		{
 			festate->cursor_search_string = "SCAN %s MATCH %s*" COUNT;
-			reply = redisCommand(context, festate->cursor_search_string,
+			reply = redisCommand(festate->context, festate->cursor_search_string,
 								 ZERO, redis_escape_glob(festate->keyprefix));
 		}
 		else
 		{
 			festate->cursor_search_string = "SCAN %s" COUNT;
-			reply = redisCommand(context, festate->cursor_search_string, ZERO);
+			reply = redisCommand(festate->context, festate->cursor_search_string, ZERO);
 		}
 	}
 
@@ -2001,6 +2017,8 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 		 */
 		freeReplyObject(reply);
 	}
+
+	MemoryContextSwitchTo(oldcontext);
 }
 
 /*
@@ -2662,8 +2680,24 @@ redisReScanForeignScan(ForeignScanState *node)
 	elog(NOTICE, "redisReScanForeignScan");
 #endif
 
-	if (festate->row > -1)
-		festate->row = 0;
+	/*
+	 * Start over. Resetting the row counter is not enough: a cursor scan has
+	 * moved on to later batches, and a scalar, a pushed-down key or a
+	 * singleton hash lookup has marked its one row as consumed.
+	 */
+	if (festate->owned_reply)
+	{
+		freeReplyObject(festate->owned_reply);
+		festate->owned_reply = NULL;
+	}
+	festate->reply = NULL;
+	if (festate->cursor_id)
+	{
+		pfree(festate->cursor_id);
+		festate->cursor_id = NULL;
+	}
+
+	redis_start_scan(festate);
 }
 
 static void

@@ -28,6 +28,7 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -759,29 +760,46 @@ redis_build_cache_key(RedisConnCacheKey *key, redisTableOptions *options)
 
 /*
  * redis_validate_connection
- *		Check if a cached connection is still alive using PING.
+ *		Check, without a round trip, that a cached connection can be used.
+ *
+ *		An idle connection has nothing to read: Redis only ever answers a
+ *		command. So the socket is polled, with no wait, and the connection is
+ *		usable when it is not readable. Readable means either the server has
+ *		closed it - a restart, or its idle timeout - or a reply is waiting
+ *		that nobody read, which the next command would take for its own; a
+ *		reply already buffered by hiredis is the same. In every such case
+ *		the caller reconnects.
+ *
+ *		This replaces a PING that cost one network round trip on the first
+ *		checkout in every transaction - every statement, in autocommit. Like
+ *		the PING, it cannot see a peer that vanished without closing the
+ *		connection; the next command then fails and the connection is
+ *		discarded, as it was before.
  */
 static bool
 redis_validate_connection(redisContext *context)
 {
-	redisReply *reply;
-	bool		valid = false;
+	struct pollfd pfd;
+	int			rc;
 
-	if (!context)
+	if (!context || context->err || context->fd < 0)
 		return false;
 
-	reply = redisCommand(context, "PING");
+	if (context->reader && context->reader->len > context->reader->pos)
+		return false;
 
-	if (reply && reply->type == REDIS_REPLY_STATUS &&
-		strcmp(reply->str, "PONG") == 0)
-	{
-		valid = true;
-	}
+	pfd.fd = context->fd;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
 
-	if (reply)
-		freeReplyObject(reply);
+	do
+		rc = poll(&pfd, 1, 0);
+	while (rc < 0 && errno == EINTR);
 
-	return valid;
+	if (rc < 0)
+		return false;
+
+	return (pfd.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) == 0;
 }
 
 /*

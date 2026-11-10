@@ -329,6 +329,7 @@ static inline TupleTableSlot *redisIterateForeignScanMulti(ForeignScanState *nod
 static inline TupleTableSlot *redisIterateForeignScanSingleton(ForeignScanState *node);
 static void redisReScanForeignScan(ForeignScanState *node);
 static void redisEndForeignScan(ForeignScanState *node);
+static void redis_start_scan(RedisFdwExecutionState *festate);
 
 
 static List *redisPlanForeignModify(PlannerInfo *root,
@@ -370,7 +371,6 @@ static TupleTableSlot *redisExecForeignUpdate(EState *estate,
  */
 static bool redisIsValidOption(const char *option, Oid context);
 static void redisGetOptions(Oid foreigntableid, redisTableOptions *options);
-static void redis_start_scan(RedisFdwExecutionState *festate);
 static void redisGetQual(Node *node, TupleDesc tupdesc, char **key,
 						 char **value, bool *pushdown);
 static char *redis_escape_glob(const char *str);

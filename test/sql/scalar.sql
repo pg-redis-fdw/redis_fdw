@@ -52,6 +52,25 @@ delete from db15_w_1key_scalar;
 
 select * from db15_w_1key_scalar;
 
+-- a rescan must start the scan over, so the singleton's one row comes back on
+-- every pass. redisReScanForeignScan() used to reset the row counter and
+-- nothing else, leaving the row it had already marked consumed consumed, so
+-- the second and later passes of the correlated subquery below -- which
+-- rescans the foreign scan once per outer row -- returned NULL. Issue #71.
+-- The cursor-scan and pushed-down-key forms of the same bug live in
+-- joins_and_cursors.sql, with the rest of this suite's rescan coverage.
+\! redis-cli -n 15 set rsc_scalar v1
+
+create foreign table db15_rsc_single(value text)
+       server localredis
+       options (singleton_key 'rsc_scalar', database '15');
+
+select g, (select value from db15_rsc_single where g > 0) from generate_series(1, 3) g;
+
+delete from db15_rsc_single;
+
+drop foreign table db15_rsc_single;
+
 
 -- non-singleton scalar table no prefix no keyset
 

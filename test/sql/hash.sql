@@ -104,6 +104,32 @@ delete from db15_w_1key_hash;
 
 select * from db15_w_1key_hash;
 
+-- a rescan must start the scan over, so a singleton hash answers with its own
+-- rows on every pass. redisReScanForeignScan() used to reset the row counter
+-- and nothing else: a pushed-down field lookup had already marked its single
+-- row consumed, so the second and later passes of the first correlated
+-- subquery below -- which rescans the foreign scan once per outer row --
+-- returned NULL. Issue #71. The cursor-scan and pushed-down-key forms of the
+-- same bug live in joins_and_cursors.sql.
+--
+-- The full scan of the same table is the control: it walks the whole HGETALL
+-- reply by row number, so it was already correct before the fix and must stay
+-- correct. If it ever fails, suspect this test before the code.
+\! redis-cli -n 15 hset rsc_h f1 a f2 b
+
+create foreign table db15_rsc_hs(key text, value text)
+       server localredis
+       options (tabletype 'hash', singleton_key 'rsc_h', database '15');
+
+select g, (select value from db15_rsc_hs where key = 'f1' and g > 0) from generate_series(1, 3) g;
+
+select g, (select count(*) from db15_rsc_hs where g > 0) from generate_series(1, 3) g;
+
+-- emptying it removes the Redis key, as above
+delete from db15_rsc_hs;
+
+drop foreign table db15_rsc_hs;
+
 
 -- non-singleton hash table prefix
 

@@ -46,6 +46,9 @@ Features
   - `INSERT` and `UPDATE` only work for singleton key `ZSET` tables if they have the
   priority column
   - non-singleton non-scalar tables must have an array type for the second column
+  - `UPDATE` of a non-singleton collection table sends the whole new value in a
+  single Redis command, so it is bounded by Redis's 1024*1024-argument protocol
+  limit, which an `INSERT` of the same array is not.
   - `GEO` tables are only supported with `singleton_key`
 
 ### Binary data (bytea) support

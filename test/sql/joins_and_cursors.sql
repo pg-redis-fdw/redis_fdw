@@ -163,5 +163,57 @@ drop foreign table db15_scan_skip;
 
 select count(*) from db15;
 
+-- A rescan must start the scan over from the beginning. A foreign scan on the
+-- inner side of a nested loop, in a LATERAL join, or in a correlated subquery
+-- as below, is rescanned once per outer row. redisReScanForeignScan() used to
+-- reset the row counter and nothing else, so a cursor scan carried on from
+-- whichever SCAN batch it had ended on, and a pushed-down key lookup had
+-- already marked its single row consumed. The second and later passes
+-- therefore returned one trailing batch, or nothing at all, with no error.
+-- Issue #71.
+--
+-- Here rather than with the per-type modules because this module owns rescan
+-- and plan-shape behaviour -- and after the 60k cleanup above rather than
+-- among it, because 2,500 keys in an otherwise empty keyspace take exactly
+-- three SCAN batches of COUNT 1000. That makes the batch boundaries the bug
+-- needs certain without the sparse-match seeding the truncation test above
+-- requires. Do not move it back up; it would still fail, but for a count that
+-- depends on how the 60k keys happen to be spread over buckets.
+--
+-- rsc_h is a hash, deliberately seeded under the key prefix of a *scalar*
+-- table. A differently-typed key answers WRONGTYPE and has to be skipped --
+-- but skipping it must not end the scan early, which was issue #78 (fixed in
+-- 683c3c4); this incidental fixture, carried over from the PR for #71, is what
+-- exposed it. So the count below reads 2500 rather than 2501 only because the
+-- hash is skipped, and reads 2500 rather than some fraction only because
+-- skipping it does not truncate the scan. It is live coverage of both, not
+-- noise: leave it in place.
+\! redis-cli -n 15 eval "for i=1,2500 do redis.call('set','rsc_'..i,'v'..i) end redis.call('hset','rsc_h','f1','a','f2','b') return redis.call('dbsize')" 0
+
+create foreign table db15_rsc(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'rsc_');
+
+-- Every pass must see all 2,500 keys, not just the batch the pass before it
+-- happened to stop on.
+--
+-- count(distinct key), not count(*): SCAN promises only that a key present
+-- throughout is returned at *least* once, and it returns some of them twice
+-- while the keyspace dict is rehashing -- which it is here, shrinking from the
+-- 60,000 keys deleted just above. count(*) came back as 2505 on this machine.
+-- The number of distinct keys is the invariant; how many times SCAN mentions
+-- each is not ours to assert.
+select g, (select count(distinct key) from db15_rsc where g > 0) from generate_series(1, 3) g;
+
+-- and a pushed-down key qual must find its row again on every pass
+select g, (select value from db15_rsc where key = 'rsc_1' and g > 0) from generate_series(1, 3) g;
+
+drop foreign table db15_rsc;
+
+-- Bulk again, so server-side in one round trip, for the reason given above.
+-- The returned count is the 2,500 strings plus the hash, so it asserts the
+-- cleanup took exactly what was seeded and nothing else.
+\! redis-cli -n 15 eval "local n=0 for _,k in ipairs(redis.call('keys','rsc_*')) do redis.call('del',k) n=n+1 end return n" 0
+
 \i test/common/epilogue.sql
 

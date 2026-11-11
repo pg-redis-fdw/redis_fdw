@@ -32,12 +32,20 @@ jobs:
       - name: Remove any preinstalled PostgreSQL
         run: sudo apt-get purge -y 'postgresql*' || true
 
+      # --retry-all-errors is the flag that matters, not --retry. curl only
+      # retries what it considers transient - timeouts and 408/429/5xx - so a
+      # dropped TLS connection (exit 55, "SSL_read: unexpected eof") is NOT
+      # retried by --retry alone, and that is the failure this guards against.
+      # Acquire::Retries covers the same class of blip in the apt-get fetch
+      # that follows.
       - name: Add the PostgreSQL APT repository
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail \
+               --retry 5 --retry-delay 2 --retry-all-errors \
+               https://www.postgresql.org/media/keys/ACCC4CF8.asc
           sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 update
 
       # Install PostgreSQL and Valkey from their standard release packages -
       # only redis_fdw itself is built from source here. Valkey is the

@@ -3,7 +3,10 @@ Redis Foreign Data Wrapper for PostgreSQL
 
 This is a foreign data wrapper (FDW) to connect [PostgreSQL](https://www.postgresql.org/)
 to [Redis](http://redis.io/) key/value databases. This FDW works with PostgreSQL 10+
-and confirmed with some Redis versions near 6.0.
+and requires Redis 6.0 or later; any Valkey release qualifies too, since the
+Valkey version series begins at 7.2.0, above that floor. Note that CI tests
+against Valkey only, currently 9.0.4, so other servers and older versions are
+supported but not continuously verified.
 
 <img src="img/Postgres.svg" align="center" height="100" alt="PostgreSQL"/>	+	<img src="img/Redis.png" align="center" height="100" alt="Redis"/>
 

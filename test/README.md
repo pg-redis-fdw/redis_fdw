@@ -130,7 +130,10 @@ Keys are not the only shared state on such a server, and the rest of it is
 outside what db 15's guard and this epilogue can see. `connection.sql` runs
 `CLIENT KILL TYPE normal`, which kills every normal client on the whole server
 across all 16 databases, and provisions a server-global ACL user `fdwtest`.
-Within one run that is safe, because `REGRESS` is a serial list. Two runs of
+`oom.sql` sets `maxmemory` and `maxmemory-policy` server-wide, and
+`commands.sql` runs `CONFIG RESETSTAT`, so command-statistics assertions see
+traffic from every client on the server, not just this backend. Within one
+run that is safe, because `REGRESS` is a serial list. Two runs of
 this suite against the same server at the same time would interfere — one
 run's `ACL DELUSER` pulling the user out from under the other, and each
 killing the other's connections at arbitrary points. Do not run the suite

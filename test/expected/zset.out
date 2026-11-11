@@ -1,0 +1,716 @@
+-- Sorted-set tables: reads, the scores column read and written, singleton
+-- forms with and without scores, tablekeyprefix and tablekeyset, bytea
+-- members, numeric[] scores, and infinite scores.
+\i test/common/prologue.sql
+-- Shared prologue for every redis_fdw test module.
+-- psql -a echoes this file into every expected output.
+--
+-- Adding a module? See test/README.md. This file cannot guard db 15 on your
+-- behalf: it only sets db15_not_empty, and your module must act on it.
+-- Refuse by default, and only clear the flag once we have positively counted an
+-- empty keyspace. Everything below can fail -- redis-cli missing, redis down --
+-- and a \gset that never runs leaves the variable unset, at which point \if
+-- skips its entire block, \q included, and the module would run on and flush a
+-- database it was meant to protect. Starting from "not empty" makes every such
+-- failure refuse instead.
+\set db15_not_empty true
+-- DBSIZE, rather than counting rows through the foreign tables, for two
+-- reasons: it sees keys of every type, including ones this FDW cannot read and
+-- would silently skip; and it does not route the safety check through the code
+-- under test. \copy runs the program client-side, like the \! calls elsewhere
+-- in this suite, so it needs no server-side execution privilege.
+create temp table redis_dbsize(n bigint);
+\copy redis_dbsize from program 'redis-cli -n 15 dbsize'
+select n <> 0 as db15_not_empty from redis_dbsize \gset
+drop table redis_dbsize;
+create server localredis foreign data wrapper redis_fdw;
+create user mapping for public server localredis;
+-- the default scalar view of db 15, used by the scalar and joins_and_cursors
+-- modules
+create foreign table db15(key text, value text)
+       server localredis
+       options (database '15');
+-- set results come back in arbitrary order; atsort() makes them predictable
+CREATE OR REPLACE FUNCTION atsort( a text[])
+ RETURNS text[]
+ LANGUAGE sql
+ IMMUTABLE  STRICT
+AS $function$
+  select array(select unnest($1) order by 1)
+$function$;
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+\! redis-cli < test/redis_setup
+OK
+OK
+OK
+8
+5
+6
+4
+OK
+OK
+6
+6
+2
+2
+2
+2
+-- zset
+create foreign table db15_zset_prefix(key text, value text)
+       server localredis
+       options (tabletype 'zset', tablekeyprefix 'zset', database '15');
+create foreign table db15_zset_prefix_array(key text, value text[])
+       server localredis
+       options (tabletype 'zset', tablekeyprefix 'zset', database '15');
+create foreign table db15_zset_keyset_array(key text, value text[])
+       server localredis
+       options (tabletype 'zset', tablekeyset 'zkeys', database '15');
+select * from db15_zset_prefix order by key;
+  key  |               value                
+-------+------------------------------------
+ zset1 | {"z1","z2","z3","z4","z5","z6"}
+ zset2 | {"z7","z8","z9","z10","z11","z12"}
+(2 rows)
+
+select * from db15_zset_prefix where key = 'zset1';
+  key  |              value              
+-------+---------------------------------
+ zset1 | {"z1","z2","z3","z4","z5","z6"}
+(1 row)
+
+select * from db15_zset_prefix_array order by key;
+  key  |         value          
+-------+------------------------
+ zset1 | {z1,z2,z3,z4,z5,z6}
+ zset2 | {z7,z8,z9,z10,z11,z12}
+(2 rows)
+
+select * from db15_zset_prefix_array where key = 'zset1';
+  key  |        value        
+-------+---------------------
+ zset1 | {z1,z2,z3,z4,z5,z6}
+(1 row)
+
+select * from db15_zset_keyset_array order by key;
+  key  |         value          
+-------+------------------------
+ zset1 | {z1,z2,z3,z4,z5,z6}
+ zset2 | {z7,z8,z9,z10,z11,z12}
+(2 rows)
+
+select * from db15_zset_keyset_array where key = 'zset1';
+  key  |        value        
+-------+---------------------
+ zset1 | {z1,z2,z3,z4,z5,z6}
+(1 row)
+
+-- zset with a parallel scores array column
+create foreign table db15_zset_prefix_array_scores(key text, value text[], scores numeric[])
+       server localredis
+       options (tabletype 'zset', tablekeyprefix 'zset', database '15');
+create foreign table db15_zset_keyset_array_scores(key text, value text[], scores numeric[])
+       server localredis
+       options (tabletype 'zset', tablekeyset 'zkeys', database '15');
+select * from db15_zset_prefix_array_scores order by key;
+  key  |         value          |    scores     
+-------+------------------------+---------------
+ zset1 | {z1,z2,z3,z4,z5,z6}    | {1,2,3,4,5,6}
+ zset2 | {z7,z8,z9,z10,z11,z12} | {1,2,3,4,5,6}
+(2 rows)
+
+select * from db15_zset_prefix_array_scores where key = 'zset1';
+  key  |        value        |    scores     
+-------+---------------------+---------------
+ zset1 | {z1,z2,z3,z4,z5,z6} | {1,2,3,4,5,6}
+(1 row)
+
+select * from db15_zset_keyset_array_scores order by key;
+  key  |         value          |    scores     
+-------+------------------------+---------------
+ zset1 | {z1,z2,z3,z4,z5,z6}    | {1,2,3,4,5,6}
+ zset2 | {z7,z8,z9,z10,z11,z12} | {1,2,3,4,5,6}
+(2 rows)
+
+select * from db15_zset_keyset_array_scores where key = 'zset1';
+  key  |        value        |    scores     
+-------+---------------------+---------------
+ zset1 | {z1,z2,z3,z4,z5,z6} | {1,2,3,4,5,6}
+(1 row)
+
+-- singleton zset
+create foreign table db15_1key_zset(value text)
+       server localredis
+       options (tabletype 'zset', singleton_key 'zset1', database '15');
+select * from db15_1key_zset order by value;
+ value 
+-------
+ z1
+ z2
+ z3
+ z4
+ z5
+ z6
+(6 rows)
+
+-- singleton zset with scores
+create foreign table db15_1key_zset_scores(value text, score numeric)
+       server localredis
+       options (tabletype 'zset', singleton_key 'zset1', database '15');
+select * from db15_1key_zset_scores order by score desc;
+ value | score 
+-------+-------
+ z6    |     6
+ z5    |     5
+ z4    |     4
+ z3    |     3
+ z2    |     2
+ z1    |     1
+(6 rows)
+
+-- insert delete update
+-- first clean the database again
+\! redis-cli < test/redis_teardown
+OK
+2
+2
+2
+2
+2
+4
+-- singleton zset with scores
+create foreign table db15_w_1key_zset(key text, priority numeric)
+       server localredis
+       options (singleton_key 'w_1key_zset', tabletype 'zset', database '15');
+select * from db15_w_1key_zset;
+ key | priority 
+-----+----------
+(0 rows)
+
+insert into db15_w_1key_zset values ('a',1), ('c',5),('e',-5), ('h',10);
+select * from db15_w_1key_zset order by priority;
+ key | priority 
+-----+----------
+ e   |       -5
+ a   |        1
+ c   |        5
+ h   |       10
+(4 rows)
+
+insert into db15_w_1key_zset values ('a',99);
+ERROR:  key already exists: a
+delete from db15_w_1key_zset where key = 'a';
+select * from db15_w_1key_zset order by priority;
+ key | priority 
+-----+----------
+ e   |       -5
+ c   |        5
+ h   |       10
+(3 rows)
+
+delete from db15_w_1key_zset where priority = '5';
+select * from db15_w_1key_zset order by priority;
+ key | priority 
+-----+----------
+ e   |       -5
+ h   |       10
+(2 rows)
+
+update db15_w_1key_zset set key = 'x', priority = 99 where priority = '-5';
+select * from db15_w_1key_zset order by priority;
+ key | priority 
+-----+----------
+ h   |       10
+ x   |       99
+(2 rows)
+
+update db15_w_1key_zset set key = 'y' where key = 'h';
+select * from db15_w_1key_zset order by priority;
+ key | priority 
+-----+----------
+ y   |       10
+ x   |       99
+(2 rows)
+
+update db15_w_1key_zset set priority = 20 where key = 'y';
+select * from db15_w_1key_zset order by priority;
+ key | priority 
+-----+----------
+ y   |       20
+ x   |       99
+(2 rows)
+
+-- singleton zset no scores
+-- use set from last step
+delete from db15_w_1key_zset;
+insert into db15_w_1key_zset values ('e',-5);
+create foreign table db15_w_1key_zsetx(key text)
+       server localredis
+       options (singleton_key 'w_1key_zset', tabletype 'zset', database '15');
+select * from db15_w_1key_zsetx;
+ key 
+-----
+ e
+(1 row)
+
+insert into db15_w_1key_zsetx values ('a'), ('c'),('e'); -- can't insert
+ERROR:  operation not supported for singleton zset table without priorities column
+update db15_w_1key_zsetx set key = 'z' where key = 'e';
+select * from db15_w_1key_zsetx order by key;
+ key 
+-----
+ z
+(1 row)
+
+delete from db15_w_1key_zsetx where key = 'z';
+select * from db15_w_1key_zsetx order by key;
+ key 
+-----
+(0 rows)
+
+-- non-singleton zset table keyprefix
+create foreign table db15_w_zset_pfx(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'w_zset_');
+select * from db15_w_zset_pfx;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_w_zset_pfx values ('w_zset_a','{b,c,d}'), ('w_zset_c','{d,e,f}'),('w_zset_e','{f,g,h}');
+insert into db15_w_zset_pfx values ('x','{y}'); -- prefix error
+ERROR:  key 'x' does not match table key prefix 'w_zset_'
+insert into db15_w_zset_pfx values ('w_zset_a','{x,y,z}'); -- dup error
+ERROR:  key already exists: w_zset_a
+select * from db15_w_zset_pfx order by key;
+   key    |   val   
+----------+---------
+ w_zset_a | {b,c,d}
+ w_zset_c | {d,e,f}
+ w_zset_e | {f,g,h}
+(3 rows)
+
+delete from db15_w_zset_pfx where key = 'w_zset_a';
+select * from db15_w_zset_pfx order by key;
+   key    |   val   
+----------+---------
+ w_zset_c | {d,e,f}
+ w_zset_e | {f,g,h}
+(2 rows)
+
+update db15_w_zset_pfx set key = 'x' where key = 'w_zset_c'; -- prefix err
+ERROR:  key prefix condition violation: x
+update db15_w_zset_pfx set key = 'x', val = '{y}' where key = 'w_zset_c'; -- prefix err
+ERROR:  key prefix condition violation: x
+update db15_w_zset_pfx set key = 'w_zset_x', val = '{x,y,z}' where key = 'w_zset_c';
+select key, atsort(val) as val from db15_w_zset_pfx order by key;
+   key    |   val   
+----------+---------
+ w_zset_e | {f,g,h}
+ w_zset_x | {x,y,z}
+(2 rows)
+
+update db15_w_zset_pfx set key = 'w_zset_z' where key = 'w_zset_x';
+select key, atsort(val) as val from db15_w_zset_pfx order by key;
+   key    |   val   
+----------+---------
+ w_zset_e | {f,g,h}
+ w_zset_z | {x,y,z}
+(2 rows)
+
+update db15_w_zset_pfx set val = '{q,r,s}' where key = 'w_zset_e';
+select key, atsort(val) as val from db15_w_zset_pfx order by key;
+   key    |   val   
+----------+---------
+ w_zset_e | {q,r,s}
+ w_zset_z | {x,y,z}
+(2 rows)
+
+delete from db15_w_zset_pfx;
+select * from db15_w_zset_pfx;
+ key | val 
+-----+-----
+(0 rows)
+
+-- a three-column zset table requires the scores column on INSERT, and a
+-- tablekeyprefix does not change that
+create foreign table db15_w_zset_pfx_scores(key text, val text[], scores numeric[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'w_zset_');
+insert into db15_w_zset_pfx_scores (key, val, scores) values ('w_zset_a','{b,c,d}','{1,2,3}');
+select key, val, scores from db15_w_zset_pfx_scores order by key;
+   key    |   val   | scores  
+----------+---------+---------
+ w_zset_a | {b,c,d} | {1,2,3}
+(1 row)
+
+-- the "set both together" error names this table's own columns, not the
+-- generic "members"/"scores"
+update db15_w_zset_pfx_scores set val = '{b,c,e}' where key = 'w_zset_a';
+ERROR:  updating "val" or "scores" requires setting both
+HINT:  A zset table's members and scores columns are written as a pair.
+delete from db15_w_zset_pfx_scores;
+drop foreign table db15_w_zset_pfx_scores;
+-- non-singleton zset table keyset
+create foreign table db15_w_zset_kset(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyset 'w_zset_kset');
+select * from db15_w_zset_kset;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_w_zset_kset values ('a_wzk','{b,c,d}'), ('c_wzk','{d,e,f}'),('e_wzk','{f,g,h}');
+insert into db15_w_zset_kset values ('a_wzk','{x}'); -- dup error
+ERROR:  key already exists: a_wzk
+select * from db15_w_zset_kset order by key;
+  key  |   val   
+-------+---------
+ a_wzk | {b,c,d}
+ c_wzk | {d,e,f}
+ e_wzk | {f,g,h}
+(3 rows)
+
+delete from db15_w_zset_kset where key = 'a_wzk';
+select * from db15_w_zset_kset order by key;
+  key  |   val   
+-------+---------
+ c_wzk | {d,e,f}
+ e_wzk | {f,g,h}
+(2 rows)
+
+update db15_w_zset_kset set key = 'x_wlk', val = '{x,y,z}' where key = 'c_wzk';
+select key, atsort(val) as val from db15_w_zset_kset order by key;
+  key  |   val   
+-------+---------
+ e_wzk | {f,g,h}
+ x_wlk | {x,y,z}
+(2 rows)
+
+update db15_w_zset_kset set key = 'z_wzk' where key = 'x_wzk';
+select key, atsort(val) as val from db15_w_zset_kset order by key;
+  key  |   val   
+-------+---------
+ e_wzk | {f,g,h}
+ x_wlk | {x,y,z}
+(2 rows)
+
+update db15_w_zset_kset set val = '{q,r,s}' where key = 'e_wzk';
+select key, atsort(val) as val from db15_w_zset_kset order by key;
+  key  |   val   
+-------+---------
+ e_wzk | {q,r,s}
+ x_wlk | {x,y,z}
+(2 rows)
+
+delete from db15_w_zset_kset;
+select * from db15_w_zset_kset;
+ key | val 
+-----+-----
+(0 rows)
+
+-- Writable zset scores. The write path used to ignore the scores column and
+-- store the array index as the score, so an INSERT silently discarded the
+-- supplied scores and an UPDATE of the scores column wrote the score values
+-- as members.
+create foreign table db15_zs3(key text, members text[], scores text[])
+       server localredis
+       options (database '15', tabletype 'zset');
+-- INSERT must store the supplied scores, not 0,1,2
+insert into db15_zs3 values ('zs3', '{a,b,c}', '{10,20,30}');
+select * from db15_zs3 where key = 'zs3';
+ key | members |   scores   
+-----+---------+------------
+ zs3 | {a,b,c} | {10,20,30}
+(1 row)
+
+-- UPDATE setting both arrays rewrites members and scores together
+update db15_zs3 set members = '{a,b,d}', scores = '{11,21,41}' where key = 'zs3';
+select * from db15_zs3 where key = 'zs3';
+ key | members |   scores   
+-----+---------+------------
+ zs3 | {a,b,d} | {11,21,41}
+(1 row)
+
+-- a rename touches neither array and stays legal
+update db15_zs3 set key = 'zs3renamed' where key = 'zs3';
+select * from db15_zs3 where key = 'zs3renamed';
+    key     | members |   scores   
+------------+---------+------------
+ zs3renamed | {a,b,d} | {11,21,41}
+(1 row)
+
+-- setting only one of the pair is rejected
+update db15_zs3 set members = '{x,y,z}' where key = 'zs3renamed';
+ERROR:  updating "members" or "scores" requires setting both
+HINT:  A zset table's members and scores columns are written as a pair.
+update db15_zs3 set scores = '{1,2,3}' where key = 'zs3renamed';
+ERROR:  updating "members" or "scores" requires setting both
+HINT:  A zset table's members and scores columns are written as a pair.
+-- and the rejected updates must leave the key untouched, since the update
+-- path only replaces the key once the new contents are known to be valid
+select * from db15_zs3 where key = 'zs3renamed';
+    key     | members |   scores   
+------------+---------+------------
+ zs3renamed | {a,b,d} | {11,21,41}
+(1 row)
+
+-- mismatched array lengths are rejected, on UPDATE and on INSERT
+update db15_zs3 set members = '{a,b}', scores = '{1,2,3}' where key = 'zs3renamed';
+ERROR:  members and scores arrays must have the same length
+DETAIL:  members has 2 elements, scores has 3
+select * from db15_zs3 where key = 'zs3renamed';
+    key     | members |   scores   
+------------+---------+------------
+ zs3renamed | {a,b,d} | {11,21,41}
+(1 row)
+
+-- an invalid score is rejected by Redis itself, not by anything client
+-- side, so it is caught deep inside the rebuild; it must still leave the
+-- key exactly as it was rather than destroying part of the row
+update db15_zs3 set members = '{a,b,d}', scores = '{1,abc,3}' where key = 'zs3renamed';
+ERROR:  could not add zset members: ERR value is not a valid float
+select * from db15_zs3 where key = 'zs3renamed';
+    key     | members |   scores   
+------------+---------+------------
+ zs3renamed | {a,b,d} | {11,21,41}
+(1 row)
+
+-- NaN is likewise rejected by Redis, and likewise must not touch the row
+update db15_zs3 set members = '{a,b,d}', scores = '{1,NaN,3}' where key = 'zs3renamed';
+ERROR:  could not add zset members: ERR value is not a valid float
+select * from db15_zs3 where key = 'zs3renamed';
+    key     | members |   scores   
+------------+---------+------------
+ zs3renamed | {a,b,d} | {11,21,41}
+(1 row)
+
+insert into db15_zs3 values ('zs3bad', '{a,b,c}', '{1,2}');
+ERROR:  members and scores arrays must have the same length
+DETAIL:  members has 3 elements, scores has 2
+-- infinite scores round-trip; Redis accepts the spelling PostgreSQL emits
+insert into db15_zs3 values ('zs3inf', '{lo,mid,hi}', '{-Infinity,5,Infinity}');
+select * from db15_zs3 where key = 'zs3inf';
+  key   |   members   |    scores    
+--------+-------------+--------------
+ zs3inf | {lo,mid,hi} | {-inf,5,inf}
+(1 row)
+
+-- an INSERT that omits the scores column is rejected rather than falling
+-- back to positional scores
+insert into db15_zs3 (key, members) values ('zs3partial', '{a,b}');
+ERROR:  cannot insert NULL into a Redis table
+HINT:  A zset table's members and scores columns are written as a pair.
+-- a scores column that isn't an array is rejected outright, not
+-- reinterpreted as an array datum
+create foreign table db15_zsbad(key text, members text[], scores text)
+       server localredis
+       options (database '15', tabletype 'zset');
+insert into db15_zsbad values ('zsbadkey', '{a,b,c}', '{1,2,3}');
+ERROR:  scores column must be an array
+drop foreign table db15_zsbad;
+-- a numeric[] scores column exercises a non-text output function on
+-- UPDATE, not just INSERT; renaming the key in the same statement that
+-- sets both arrays shifts scores_pidx from 2 to 3
+create foreign table db15_zsnum(key text, members text[], scores numeric[])
+       server localredis
+       options (database '15', tabletype 'zset');
+insert into db15_zsnum values ('zsnum', '{a,b,c}', '{1,2,3}');
+update db15_zsnum set key = 'zsnumrenamed', members = '{a,b,d}', scores = '{4,5,6}' where key = 'zsnum';
+select * from db15_zsnum where key = 'zsnumrenamed';
+     key      | members | scores  
+--------------+---------+---------
+ zsnumrenamed | {a,b,d} | {4,5,6}
+(1 row)
+
+-- named, not unqualified: this table has no prefix and no keyset, so an
+-- unqualified DELETE would take every zset in db 15
+delete from db15_zsnum where key = 'zsnumrenamed';
+drop foreign table db15_zsnum;
+-- a two-column non-singleton zset is unaffected: members-only UPDATE is
+-- still allowed and scores are still positional
+create foreign table db15_zs2(key text, members text[])
+       server localredis
+       options (database '15', tabletype 'zset');
+insert into db15_zs2 values ('zs2', '{p,q,r}');
+update db15_zs2 set members = '{p,q,s}' where key = 'zs2';
+select * from db15_zs2 where key = 'zs2';
+ key | members 
+-----+---------
+ zs2 | {p,q,s}
+(1 row)
+
+\! redis-cli -n 15 zrange zs2 0 -1 withscores
+p
+0
+q
+1
+s
+2
+-- and a singleton zset is unaffected: its score column stays writable on
+-- its own
+\! redis-cli -n 15 zadd zs1 10 a 20 b > /dev/null
+create foreign table db15_szs(value text, score numeric)
+       server localredis
+       options (database '15', tabletype 'zset', singleton_key 'zs1');
+insert into db15_szs values ('c', 99);
+update db15_szs set score = 55 where value = 'a';
+update db15_szs set value = 'bb' where value = 'b';
+select * from db15_szs order by score;
+ value | score 
+-------+-------
+ bb    |    20
+ a     |    55
+ c     |    99
+(3 rows)
+
+delete from db15_zs3 where key in ('zs3renamed', 'zs3inf');
+delete from db15_zs2 where key = 'zs2';
+-- zs1 was seeded from outside, but the singleton table can still empty it, and
+-- a zset loses its key with its last member
+delete from db15_szs;
+drop foreign table db15_zs3;
+drop foreign table db15_zs2;
+drop foreign table db15_szs;
+-- singleton zset table with bytea member and scores
+create foreign table db15_bytea_zset(member bytea, score numeric)
+       server localredis
+       options (singleton_key 'bytea_zset', tabletype 'zset', database '15');
+select * from db15_bytea_zset;
+ member | score 
+--------+-------
+(0 rows)
+
+insert into db15_bytea_zset values
+    (E'zset\\000m1'::bytea, 1),
+    (E'zset\\000m2'::bytea, 2),
+    (E'zset\\000m3'::bytea, 3);
+select length(member), member, score from db15_bytea_zset order by score;
+ length |      member      | score 
+--------+------------------+-------
+      7 | \x7a736574006d31 |     1
+      7 | \x7a736574006d32 |     2
+      7 | \x7a736574006d33 |     3
+(3 rows)
+
+delete from db15_bytea_zset where member = E'zset\\000m2'::bytea;
+select length(member), member, score from db15_bytea_zset order by score;
+ length |      member      | score 
+--------+------------------+-------
+      7 | \x7a736574006d31 |     1
+      7 | \x7a736574006d33 |     3
+(2 rows)
+
+update db15_bytea_zset set score = 10 where member = E'zset\\000m1'::bytea;
+select length(member), member, score from db15_bytea_zset order by score;
+ length |      member      | score 
+--------+------------------+-------
+      7 | \x7a736574006d33 |     3
+      7 | \x7a736574006d31 |    10
+(2 rows)
+
+delete from db15_bytea_zset;
+select * from db15_bytea_zset;
+ member | score 
+--------+-------
+(0 rows)
+
+-- non-singleton zset table with bytea[] array column
+create foreign table db15_bytea_zset_arr(key text, val bytea[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'bzset_');
+select * from db15_bytea_zset_arr;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_bytea_zset_arr values
+    ('bzset_a', array[E'x\\000'::bytea, E'y\\000'::bytea, E'z\\000'::bytea]);
+select key, val from db15_bytea_zset_arr order by key;
+   key   |               val               
+---------+---------------------------------
+ bzset_a | {"\\x7800","\\x7900","\\x7a00"}
+(1 row)
+
+delete from db15_bytea_zset_arr;
+select * from db15_bytea_zset_arr;
+ key | val 
+-----+-----
+(0 rows)
+
+-- bytea[] members with a scores column: binary members must survive intact and
+-- keep their scores. Neither PR could express this shape on its own.
+-- -x reads the member from stdin, which is the only way to get real binary
+-- through redis-cli: an escape passed via argv arrives as literal characters.
+\! printf 'bin\001a' | redis-cli -n 15 -x zadd bsc_z 1 > /dev/null
+\! printf 'bin\002b' | redis-cli -n 15 -x zadd bsc_z 2 > /dev/null
+create foreign table db15_bsc(key text, value bytea[], scores numeric[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'bsc_');
+select key, scores from db15_bsc;
+  key  | scores 
+-------+--------
+ bsc_z | {1,2}
+(1 row)
+
+select octet_length(value[1]) as len1, octet_length(value[2]) as len2 from db15_bsc;
+ len1 | len2 
+------+------
+    5 |    5
+(1 row)
+
+drop foreign table db15_bsc;
+-- a scores column beside a scalar text members column: legal, because the
+-- scores column requires only zset, non-singleton and three columns
+create foreign table db15_ssc(key text, value text, scores numeric[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'bsc_');
+select * from db15_ssc;
+  key  |          value          | scores 
+-------+-------------------------+--------
+ bsc_z | {"bin\x01a","bin\x02b"} | {1,2}
+(1 row)
+
+delete from db15_ssc;
+drop foreign table db15_ssc;
+-- infinite scores round-trip both ways. numeric has accepted inf since PG 14,
+-- and Redis accepts PostgreSQL's Infinity rendering back again.
+\! redis-cli -n 15 zadd inf_z inf a -inf b 2.5 c > /dev/null
+create foreign table db15_inf(key text, value text[], scores numeric[])
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'inf_');
+select * from db15_inf;
+  key  |  value  |          scores          
+-------+---------+--------------------------
+ inf_z | {b,c,a} | {-Infinity,2.5,Infinity}
+(1 row)
+
+insert into db15_inf values ('inf_z2', '{x,y}', '{inf,-inf}');
+select * from db15_inf order by key;
+  key   |  value  |          scores          
+--------+---------+--------------------------
+ inf_z  | {b,c,a} | {-Infinity,2.5,Infinity}
+ inf_z2 | {y,x}   | {-Infinity,Infinity}
+(2 rows)
+
+delete from db15_inf;
+drop foreign table db15_inf;
+\i test/common/epilogue.sql
+-- Shared epilogue for every redis_fdw test module: assert that the module left
+-- db 15 empty, so the next module starts from nothing and any module can run on
+-- its own.
+--
+-- This asserts rather than flushes. A flush would make the assertion true by
+-- destroying the evidence a failing module left behind. Every key printed below
+-- is a line that is not in the expected file, so the module that leaked is the
+-- first to fail and names the key, instead of the cause being buried in a
+-- refusal from whatever runs next. KEYS, like the prologue's DBSIZE, sees keys
+-- of every type. LC_ALL so a leak of several keys reads the same on every
+-- machine; the passing output is empty either way. See test/README.md.
+\! redis-cli -n 15 keys '*' | LC_ALL=C sort
+
+set client_min_messages = warning;
+drop server localredis cascade;
+reset client_min_messages;

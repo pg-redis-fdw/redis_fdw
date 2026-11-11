@@ -1,0 +1,432 @@
+-- Scalar (Redis string) tables: reads, singleton and non-singleton
+-- forms, tablekeyprefix and tablekeyset, a name-typed key column, and bytea
+-- values.
+\i test/common/prologue.sql
+-- Shared prologue for every redis_fdw test module.
+-- psql -a echoes this file into every expected output.
+--
+-- Adding a module? See test/README.md. This file cannot guard db 15 on your
+-- behalf: it only sets db15_not_empty, and your module must act on it.
+-- Refuse by default, and only clear the flag once we have positively counted an
+-- empty keyspace. Everything below can fail -- redis-cli missing, redis down --
+-- and a \gset that never runs leaves the variable unset, at which point \if
+-- skips its entire block, \q included, and the module would run on and flush a
+-- database it was meant to protect. Starting from "not empty" makes every such
+-- failure refuse instead.
+\set db15_not_empty true
+-- DBSIZE, rather than counting rows through the foreign tables, for two
+-- reasons: it sees keys of every type, including ones this FDW cannot read and
+-- would silently skip; and it does not route the safety check through the code
+-- under test. \copy runs the program client-side, like the \! calls elsewhere
+-- in this suite, so it needs no server-side execution privilege.
+create temp table redis_dbsize(n bigint);
+\copy redis_dbsize from program 'redis-cli -n 15 dbsize'
+select n <> 0 as db15_not_empty from redis_dbsize \gset
+drop table redis_dbsize;
+create server localredis foreign data wrapper redis_fdw;
+create user mapping for public server localredis;
+-- the default scalar view of db 15, used by the scalar and joins_and_cursors
+-- modules
+create foreign table db15(key text, value text)
+       server localredis
+       options (database '15');
+-- set results come back in arbitrary order; atsort() makes them predictable
+CREATE OR REPLACE FUNCTION atsort( a text[])
+ RETURNS text[]
+ LANGUAGE sql
+ IMMUTABLE  STRICT
+AS $function$
+  select array(select unnest($1) order by 1)
+$function$;
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+\! redis-cli < test/redis_setup
+OK
+OK
+OK
+8
+5
+6
+4
+OK
+OK
+6
+6
+2
+2
+2
+2
+select * from db15 order by key;
+ key | value  
+-----+--------
+ baz | blurfl
+ foo | bar
+(2 rows)
+
+select * from db15 where key = 'foo';
+ key | value 
+-----+-------
+ foo | bar
+(1 row)
+
+-- singleton scalar
+create foreign table db15_1key(value text)
+       server localredis
+       options (singleton_key 'foo', database '15');
+select * from db15_1key;
+ value 
+-------
+ bar
+(1 row)
+
+\! redis-cli < test/redis_teardown
+OK
+2
+2
+2
+2
+2
+4
+-- singleton scalar table
+create foreign table db15_w_1key_scalar(val text)
+       server localredis
+       options (singleton_key 'w_1key_scalar', database '15');
+select * from db15_w_1key_scalar;
+ val 
+-----
+(0 rows)
+
+insert into db15_w_1key_scalar values ('only row');
+select * from db15_w_1key_scalar;
+   val    
+----------
+ only row
+(1 row)
+
+insert into db15_w_1key_scalar values ('only row');
+ERROR:  key already exists: w_1key_scalar
+delete from db15_w_1key_scalar where val = 'not only row';
+select * from db15_w_1key_scalar;
+   val    
+----------
+ only row
+(1 row)
+
+update db15_w_1key_scalar set val = 'new scalar val';
+select * from db15_w_1key_scalar;
+      val       
+----------------
+ new scalar val
+(1 row)
+
+delete from db15_w_1key_scalar;
+select * from db15_w_1key_scalar;
+ val 
+-----
+(0 rows)
+
+-- non-singleton scalar table no prefix no keyset
+create foreign table db15_w_scalar(key text, val text)
+       server localredis
+       options (database '15');
+select * from db15_w_scalar;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_w_scalar values ('a_ws','b'), ('c_ws','d'),('e_ws','f');
+select * from db15_w_scalar order by key;
+ key  | val 
+------+-----
+ a_ws | b
+ c_ws | d
+ e_ws | f
+(3 rows)
+
+delete from db15_w_scalar where key = 'a_ws';
+select * from db15_w_scalar order by key;
+ key  | val 
+------+-----
+ c_ws | d
+ e_ws | f
+(2 rows)
+
+update db15_w_scalar set key = 'x_ws', val='y' where key = 'e_ws';
+select * from db15_w_scalar order by key;
+ key  | val 
+------+-----
+ c_ws | d
+ x_ws | y
+(2 rows)
+
+update db15_w_scalar set key = 'z_ws' where key = 'c_ws';
+select * from db15_w_scalar order by key;
+ key  | val 
+------+-----
+ x_ws | y
+ z_ws | d
+(2 rows)
+
+update db15_w_scalar set val = 'z' where key = 'z_ws';
+select * from db15_w_scalar order by key;
+ key  | val 
+------+-----
+ x_ws | y
+ z_ws | z
+(2 rows)
+
+/*
+-- don't delete the whole namespace
+ delete from db15_w_scalar;
+
+select * from db15_w_scalar;
+*/
+-- so name the keys instead: this table has no prefix and no keyset, and an
+-- unqualified DELETE through it would take the whole of db 15 with it
+delete from db15_w_scalar where key in ('x_ws', 'z_ws');
+select * from db15_w_scalar;
+ key | val 
+-----+-----
+(0 rows)
+
+-- non-singleton scalar table keyprefix
+create foreign table db15_w_scalar_pfx(key text, val text)
+       server localredis
+       options (database '15', tablekeyprefix 'w_scalar_');
+select * from db15_w_scalar_pfx;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_w_scalar_pfx values ('w_scalar_a','b'), ('w_scalar_c','d'),('w_scalar_e','f');
+insert into db15_w_scalar_pfx values ('x','y'); -- prefix error
+ERROR:  key 'x' does not match table key prefix 'w_scalar_'
+-- a key that is a genuine (but shorter) prefix of the table's configured
+-- key prefix must still be rejected as a mismatch
+insert into db15_w_scalar_pfx values ('w','y'); -- prefix error, key shorter than prefix
+ERROR:  key 'w' does not match table key prefix 'w_scalar_'
+insert into db15_w_scalar_pfx values ('w_scalar_a','x'); -- dup error
+ERROR:  key already exists: w_scalar_a
+select * from db15_w_scalar_pfx order by key;
+    key     | val 
+------------+-----
+ w_scalar_a | b
+ w_scalar_c | d
+ w_scalar_e | f
+(3 rows)
+
+delete from db15_w_scalar_pfx where key = 'w_scalar_a';
+select * from db15_w_scalar_pfx order by key;
+    key     | val 
+------------+-----
+ w_scalar_c | d
+ w_scalar_e | f
+(2 rows)
+
+update db15_w_scalar_pfx set key = 'x', val = 'y' where key = 'w_scalar_c'; -- prefix err
+ERROR:  key prefix condition violation: x
+update db15_w_scalar_pfx set key = 'x'  where key = 'w_scalar_c'; -- prefix err
+ERROR:  key prefix condition violation: x
+update db15_w_scalar_pfx set key = 'w_scalar_x', val = 'y' where key = 'w_scalar_c';
+select * from db15_w_scalar_pfx order by key;
+    key     | val 
+------------+-----
+ w_scalar_e | f
+ w_scalar_x | y
+(2 rows)
+
+update db15_w_scalar_pfx set key = 'w_scalar_z' where key = 'w_scalar_x';
+select * from db15_w_scalar_pfx order by key;
+    key     | val 
+------------+-----
+ w_scalar_e | f
+ w_scalar_z | y
+(2 rows)
+
+update db15_w_scalar_pfx set val = 'w' where key = 'w_scalar_e';
+select * from db15_w_scalar_pfx order by key;
+    key     | val 
+------------+-----
+ w_scalar_e | w
+ w_scalar_z | y
+(2 rows)
+
+delete from db15_w_scalar_pfx;
+select * from db15_w_scalar_pfx order by key;
+ key | val 
+-----+-----
+(0 rows)
+
+-- a name-typed key column round-trips correctly
+create foreign table db15_nametest(key name, val text)
+       server localredis
+       options (database '15', tablekeyprefix 'nametest_');
+insert into db15_nametest values ('nametest_a', 'v1'), ('nametest_b', 'v2');
+select * from db15_nametest order by key;
+    key     | val 
+------------+-----
+ nametest_a | v1
+ nametest_b | v2
+(2 rows)
+
+delete from db15_nametest;
+drop foreign table db15_nametest;
+-- non-singleton scalar table keyset
+create foreign table db15_w_scalar_kset(key text, val text)
+       server localredis
+       options (database '15', tablekeyset 'w_scalar_kset');
+select * from db15_w_scalar_kset order by key;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_w_scalar_kset values ('a_wsks','b'), ('c_wsks','d'),('e_wsks','f');
+insert into db15_w_scalar_kset values ('a_wsks','x'); -- dup error
+ERROR:  key already exists: a_wsks
+select * from db15_w_scalar_kset order by key;
+  key   | val 
+--------+-----
+ a_wsks | b
+ c_wsks | d
+ e_wsks | f
+(3 rows)
+
+delete from db15_w_scalar_kset where key = 'a_wsks';
+select * from db15_w_scalar_kset order by key;
+  key   | val 
+--------+-----
+ c_wsks | d
+ e_wsks | f
+(2 rows)
+
+update db15_w_scalar_kset set key = 'x_wsks', val = 'y' where key = 'c_wsks';
+select * from db15_w_scalar_kset order by key;
+  key   | val 
+--------+-----
+ e_wsks | f
+ x_wsks | y
+(2 rows)
+
+update db15_w_scalar_kset set key = 'z_wsks' where key = 'x_wsks';
+select * from db15_w_scalar_kset order by key;
+  key   | val 
+--------+-----
+ e_wsks | f
+ z_wsks | y
+(2 rows)
+
+update db15_w_scalar_kset set val = 'w' where key = 'e_wsks';
+select * from db15_w_scalar_kset order by key;
+  key   | val 
+--------+-----
+ e_wsks | w
+ z_wsks | y
+(2 rows)
+
+delete from db15_w_scalar_kset;
+select * from db15_w_scalar_kset order by key;
+ key | val 
+-----+-----
+(0 rows)
+
+-- =====================================================
+-- bytea column tests
+-- =====================================================
+-- Test that bytea columns work correctly for storing binary data
+-- including data with embedded NUL bytes
+-- singleton scalar table with bytea value
+create foreign table db15_bytea_scalar(val bytea)
+       server localredis
+       options (singleton_key 'bytea_scalar', database '15');
+select * from db15_bytea_scalar;
+ val 
+-----
+(0 rows)
+
+-- insert binary data with embedded NUL bytes
+insert into db15_bytea_scalar values (E'hello\\000world'::bytea);
+select * from db15_bytea_scalar;
+           val            
+--------------------------
+ \x68656c6c6f00776f726c64
+(1 row)
+
+select length(val), val from db15_bytea_scalar;
+ length |           val            
+--------+--------------------------
+     11 | \x68656c6c6f00776f726c64
+(1 row)
+
+-- update with different binary data
+update db15_bytea_scalar set val = E'binary\\000data\\000here'::bytea;
+select length(val), val from db15_bytea_scalar;
+ length |                val                 
+--------+------------------------------------
+     16 | \x62696e61727900646174610068657265
+(1 row)
+
+delete from db15_bytea_scalar;
+select * from db15_bytea_scalar;
+ val 
+-----
+(0 rows)
+
+-- non-singleton scalar table with bytea value column
+create foreign table db15_bytea_scalar_ns(key text, val bytea)
+       server localredis
+       options (database '15', tablekeyprefix 'bscalar_');
+select * from db15_bytea_scalar_ns;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_bytea_scalar_ns values
+    ('bscalar_a', E'binary\\000a'::bytea),
+    ('bscalar_b', E'binary\\000b'::bytea);
+select key, length(val), val from db15_bytea_scalar_ns order by key;
+    key    | length |        val         
+-----------+--------+--------------------
+ bscalar_a |      8 | \x62696e6172790061
+ bscalar_b |      8 | \x62696e6172790062
+(2 rows)
+
+update db15_bytea_scalar_ns set val = E'updated\\000val'::bytea where key = 'bscalar_a';
+select key, length(val), val from db15_bytea_scalar_ns order by key;
+    key    | length |           val            
+-----------+--------+--------------------------
+ bscalar_a |     11 | \x757064617465640076616c
+ bscalar_b |      8 | \x62696e6172790062
+(2 rows)
+
+delete from db15_bytea_scalar_ns where key = 'bscalar_a';
+select key, length(val), val from db15_bytea_scalar_ns order by key;
+    key    | length |        val         
+-----------+--------+--------------------
+ bscalar_b |      8 | \x62696e6172790062
+(1 row)
+
+delete from db15_bytea_scalar_ns;
+select * from db15_bytea_scalar_ns;
+ key | val 
+-----+-----
+(0 rows)
+
+\i test/common/epilogue.sql
+-- Shared epilogue for every redis_fdw test module: assert that the module left
+-- db 15 empty, so the next module starts from nothing and any module can run on
+-- its own.
+--
+-- This asserts rather than flushes. A flush would make the assertion true by
+-- destroying the evidence a failing module left behind. Every key printed below
+-- is a line that is not in the expected file, so the module that leaked is the
+-- first to fail and names the key, instead of the cause being buried in a
+-- refusal from whatever runs next. KEYS, like the prologue's DBSIZE, sees keys
+-- of every type. LC_ALL so a leak of several keys reads the same on every
+-- machine; the passing output is empty either way. See test/README.md.
+\! redis-cli -n 15 keys '*' | LC_ALL=C sort
+
+set client_min_messages = warning;
+drop server localredis cascade;
+reset client_min_messages;

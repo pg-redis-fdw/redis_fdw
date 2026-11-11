@@ -1,0 +1,8 @@
+select 15
+
+del foo baz
+del set1 set2
+del list1 list2
+del hash1 hash2
+del zset1 zset2
+del hkeys lkeys skeys zkeys

@@ -1,0 +1,435 @@
+-- Set tables: reads, singleton and non-singleton forms, tablekeyprefix and
+-- tablekeyset, bytea members and bytea[] array columns. Set members come back
+-- in arbitrary order, so results are wrapped in atsort().
+\i test/common/prologue.sql
+-- Shared prologue for every redis_fdw test module.
+-- psql -a echoes this file into every expected output.
+--
+-- Adding a module? See test/README.md. This file cannot guard db 15 on your
+-- behalf: it only sets db15_not_empty, and your module must act on it.
+-- Refuse by default, and only clear the flag once we have positively counted an
+-- empty keyspace. Everything below can fail -- redis-cli missing, redis down --
+-- and a \gset that never runs leaves the variable unset, at which point \if
+-- skips its entire block, \q included, and the module would run on and flush a
+-- database it was meant to protect. Starting from "not empty" makes every such
+-- failure refuse instead.
+\set db15_not_empty true
+-- DBSIZE, rather than counting rows through the foreign tables, for two
+-- reasons: it sees keys of every type, including ones this FDW cannot read and
+-- would silently skip; and it does not route the safety check through the code
+-- under test. \copy runs the program client-side, like the \! calls elsewhere
+-- in this suite, so it needs no server-side execution privilege.
+create temp table redis_dbsize(n bigint);
+\copy redis_dbsize from program 'redis-cli -n 15 dbsize'
+select n <> 0 as db15_not_empty from redis_dbsize \gset
+drop table redis_dbsize;
+create server localredis foreign data wrapper redis_fdw;
+create user mapping for public server localredis;
+-- the default scalar view of db 15, used by the scalar and joins_and_cursors
+-- modules
+create foreign table db15(key text, value text)
+       server localredis
+       options (database '15');
+-- set results come back in arbitrary order; atsort() makes them predictable
+CREATE OR REPLACE FUNCTION atsort( a text[])
+ RETURNS text[]
+ LANGUAGE sql
+ IMMUTABLE  STRICT
+AS $function$
+  select array(select unnest($1) order by 1)
+$function$;
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+\! redis-cli < test/redis_setup
+OK
+OK
+OK
+8
+5
+6
+4
+OK
+OK
+6
+6
+2
+2
+2
+2
+-- set
+create foreign table db15_set_prefix(key text, value text)
+       server localredis
+       options (tabletype 'set', tablekeyprefix 'set', database '15');
+create foreign table db15_set_prefix_array(key text, value text[])
+       server localredis
+       options (tabletype 'set', tablekeyprefix 'set', database '15');
+create foreign table db15_set_keyset_array(key text, value text[])
+       server localredis
+       options (tabletype 'set', tablekeyset 'skeys', database '15');
+-- need to use atsort() on set results to get predicable output
+-- since redis will give them back in arbitrary order
+-- means we can't show the actual value for db15_set_prefix which has it as a
+-- single text field
+select key, atsort(value::text[]) as value from db15_set_prefix order by key;
+ key  |           value           
+------+---------------------------
+ set1 | {m1,m2,m3,m4,m5,m6,m7,m8}
+ set2 | {m10,m11,m12,m8,m9}
+(2 rows)
+
+select key, atsort(value::text[]) as value from db15_set_prefix where key = 'set1';
+ key  |           value           
+------+---------------------------
+ set1 | {m1,m2,m3,m4,m5,m6,m7,m8}
+(1 row)
+
+select key, atsort(value) as value from db15_set_prefix_array order by key;
+ key  |           value           
+------+---------------------------
+ set1 | {m1,m2,m3,m4,m5,m6,m7,m8}
+ set2 | {m10,m11,m12,m8,m9}
+(2 rows)
+
+select key, atsort(value) as value from db15_set_prefix_array where key = 'set1';
+ key  |           value           
+------+---------------------------
+ set1 | {m1,m2,m3,m4,m5,m6,m7,m8}
+(1 row)
+
+select key, atsort(value) as value from db15_set_keyset_array order by key;
+ key  |           value           
+------+---------------------------
+ set1 | {m1,m2,m3,m4,m5,m6,m7,m8}
+ set2 | {m10,m11,m12,m8,m9}
+(2 rows)
+
+select key, atsort(value) as value from db15_set_keyset_array where key = 'set1';
+ key  |           value           
+------+---------------------------
+ set1 | {m1,m2,m3,m4,m5,m6,m7,m8}
+(1 row)
+
+-- singleton set
+create foreign table db15_1key_set(value text)
+       server localredis
+       options (tabletype 'set', singleton_key 'set1', database '15');
+select * from db15_1key_set order by value;
+ value 
+-------
+ m1
+ m2
+ m3
+ m4
+ m5
+ m6
+ m7
+ m8
+(8 rows)
+
+\! redis-cli < test/redis_teardown
+OK
+2
+2
+2
+2
+2
+4
+-- singleton set
+create foreign table db15_w_1key_set(key text)
+       server localredis
+       options (singleton_key 'w_1key_set', tabletype 'set', database '15');
+select * from db15_w_1key_set;
+ key 
+-----
+(0 rows)
+
+insert into db15_w_1key_set values ('a'), ('c'),('e');
+select * from db15_w_1key_set order by key;
+ key 
+-----
+ a
+ c
+ e
+(3 rows)
+
+insert into db15_w_1key_set values ('a'); -- error - dup
+ERROR:  key already exists: a
+delete from db15_w_1key_set where key = 'c';
+select * from db15_w_1key_set order by key;
+ key 
+-----
+ a
+ e
+(2 rows)
+
+update db15_w_1key_set set key = 'x' where key = 'e';
+select * from db15_w_1key_set order by key;
+ key 
+-----
+ a
+ x
+(2 rows)
+
+-- emptying a singleton set removes the Redis key with its last member
+delete from db15_w_1key_set;
+select * from db15_w_1key_set;
+ key 
+-----
+(0 rows)
+
+-- non-singleton set table no prefix no keyset
+-- non-array case -- fails
+create foreign table db15_w_set_nonarr(key text, val text)
+       server localredis
+       options (database '15', tabletype 'set');
+insert into db15_w_set_nonarr values ('nkseta','{b,c,d}'), ('nksetc','{d,e,f}'),('nksete','{f,g,h}');
+ERROR:  cannot insert into this type of Redis table - needs an array
+/*
+-- namespace too polluted for this case
+create foreign table db15_w_set(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'set');
+
+select * from db15_w_set;
+
+insert into db15_w_set values ('nkseta','{b,c,d}'), ('nksetc','{d,e,f}'),('nksete','{f,g,h}');
+
+select * from db15_w_set;
+
+delete from db15_w_set where key = 'nkseta';
+
+select * from db15_w_set;
+
+delete from db15_w_set;
+
+select * from db15_w_set;
+
+*/
+-- non-singleton set table keyprefix
+create foreign table db15_w_set_pfx(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'set', tablekeyprefix 'w_set_');
+select * from db15_w_set_pfx;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_w_set_pfx values ('w_set_a','{b,c,d}'), ('w_set_c','{d,e,f}'),('w_set_e','{f,g,h}');
+insert into db15_w_set_pfx values ('x','{y}'); -- prefix error
+ERROR:  key 'x' does not match table key prefix 'w_set_'
+insert into db15_w_set_pfx values ('w_set_a','{x,y,z}'); -- dup error
+ERROR:  key already exists: w_set_a
+select key, atsort(val) as val from db15_w_set_pfx order by key;
+   key   |   val   
+---------+---------
+ w_set_a | {b,c,d}
+ w_set_c | {d,e,f}
+ w_set_e | {f,g,h}
+(3 rows)
+
+delete from db15_w_set_pfx where key = 'w_set_a';
+select key, atsort(val) as val from db15_w_set_pfx order by key;
+   key   |   val   
+---------+---------
+ w_set_c | {d,e,f}
+ w_set_e | {f,g,h}
+(2 rows)
+
+update db15_w_set_pfx set key = 'x' where key = 'w_set_c'; -- prefix err
+ERROR:  key prefix condition violation: x
+update db15_w_set_pfx set key = 'x', val = '{y}' where key = 'w_set_c'; -- prefix err
+ERROR:  key prefix condition violation: x
+update db15_w_set_pfx set key = 'w_set_x', val = '{x,y,z}' where key = 'w_set_c';
+select key, atsort(val) as val from db15_w_set_pfx order by key;
+   key   |   val   
+---------+---------
+ w_set_e | {f,g,h}
+ w_set_x | {x,y,z}
+(2 rows)
+
+update db15_w_set_pfx set key = 'w_set_z' where key = 'w_set_x';
+select key, atsort(val) as val from db15_w_set_pfx order by key;
+   key   |   val   
+---------+---------
+ w_set_e | {f,g,h}
+ w_set_z | {x,y,z}
+(2 rows)
+
+update db15_w_set_pfx set val = '{q,r,s}' where key = 'w_set_e';
+select key, atsort(val) as val from db15_w_set_pfx order by key;
+   key   |   val   
+---------+---------
+ w_set_e | {q,r,s}
+ w_set_z | {x,y,z}
+(2 rows)
+
+delete from db15_w_set_pfx;
+select key, atsort(val) as val from db15_w_set_pfx order by key;
+ key | val 
+-----+-----
+(0 rows)
+
+-- non-singleton set table keyset
+create foreign table db15_w_set_kset(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'set', tablekeyset 'w_set_kset');
+select * from db15_w_set_kset;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_w_set_kset values ('a_wsk','{b,c,d}'), ('c_wsk','{d,e,f}'),('e_wsk','{f,g,h}');
+insert into db15_w_set_kset values ('a_wsk','{x}'); -- dup error
+ERROR:  key already exists: a_wsk
+select key, atsort(val) as val from db15_w_set_kset order by key;
+  key  |   val   
+-------+---------
+ a_wsk | {b,c,d}
+ c_wsk | {d,e,f}
+ e_wsk | {f,g,h}
+(3 rows)
+
+delete from db15_w_set_kset where key = 'a_wsk';
+select key, atsort(val) as val from db15_w_set_kset order by key;
+  key  |   val   
+-------+---------
+ c_wsk | {d,e,f}
+ e_wsk | {f,g,h}
+(2 rows)
+
+update db15_w_set_kset set key = 'x_wsk', val = '{x,y,z}' where key = 'c_wsk';
+select key, atsort(val) as val from db15_w_set_kset order by key;
+  key  |   val   
+-------+---------
+ e_wsk | {f,g,h}
+ x_wsk | {x,y,z}
+(2 rows)
+
+update db15_w_set_kset set key = 'z_wsk' where key = 'x_wsk';
+select key, atsort(val) as val from db15_w_set_kset order by key;
+  key  |   val   
+-------+---------
+ e_wsk | {f,g,h}
+ z_wsk | {x,y,z}
+(2 rows)
+
+update db15_w_set_kset set val = '{q,r,s}' where key = 'e_wsk';
+select key, atsort(val) as val from db15_w_set_kset order by key;
+  key  |   val   
+-------+---------
+ e_wsk | {q,r,s}
+ z_wsk | {x,y,z}
+(2 rows)
+
+delete from db15_w_set_kset;
+select * from db15_w_set_kset;
+ key | val 
+-----+-----
+(0 rows)
+
+-- singleton set table with bytea member
+create foreign table db15_bytea_set(member bytea)
+       server localredis
+       options (singleton_key 'bytea_set', tabletype 'set', database '15');
+select * from db15_bytea_set;
+ member 
+--------
+(0 rows)
+
+insert into db15_bytea_set values
+    (E'set\\000member1'::bytea),
+    (E'set\\000member2'::bytea),
+    (E'set\\000member3'::bytea);
+select length(member), member from db15_bytea_set order by member;
+ length |          member          
+--------+--------------------------
+     11 | \x736574006d656d62657231
+     11 | \x736574006d656d62657232
+     11 | \x736574006d656d62657233
+(3 rows)
+
+delete from db15_bytea_set where member = E'set\\000member2'::bytea;
+select length(member), member from db15_bytea_set order by member;
+ length |          member          
+--------+--------------------------
+     11 | \x736574006d656d62657231
+     11 | \x736574006d656d62657233
+(2 rows)
+
+-- update member
+update db15_bytea_set set member = E'set\\000updated'::bytea where member = E'set\\000member1'::bytea;
+select length(member), member from db15_bytea_set order by member;
+ length |          member          
+--------+--------------------------
+     11 | \x736574006d656d62657233
+     11 | \x7365740075706461746564
+(2 rows)
+
+delete from db15_bytea_set;
+select * from db15_bytea_set;
+ member 
+--------
+(0 rows)
+
+-- non-singleton set table with bytea[] array column
+create foreign table db15_bytea_set_arr(key text, val bytea[])
+       server localredis
+       options (database '15', tabletype 'set', tablekeyprefix 'bset_');
+select * from db15_bytea_set_arr;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_bytea_set_arr values
+    ('bset_a', array[E'a\\000'::bytea, E'b\\000'::bytea, E'c\\000'::bytea]);
+select key, val from db15_bytea_set_arr order by key;
+  key   |               val               
+--------+---------------------------------
+ bset_a | {"\\x6100","\\x6200","\\x6300"}
+(1 row)
+
+delete from db15_bytea_set_arr;
+select * from db15_bytea_set_arr;
+ key | val 
+-----+-----
+(0 rows)
+
+-- updating a singleton set member to a bytea value that already exists in
+-- the set is rejected as a duplicate
+create foreign table db15_bytea_set_dup(member bytea)
+       server localredis
+       options (singleton_key 'bytea_set_dup', tabletype 'set', database '15');
+insert into db15_bytea_set_dup values
+    (E'dup\\000existing'::bytea), (E'other\\000member'::bytea);
+update db15_bytea_set_dup set member = E'dup\\000existing'::bytea
+       where member = E'other\\000member'::bytea; -- must fail: key already exists
+ERROR:  key already exists: 
+select length(member), member from db15_bytea_set_dup order by member;
+ length |           member           
+--------+----------------------------
+     12 | \x647570006578697374696e67
+     12 | \x6f74686572006d656d626572
+(2 rows)
+
+delete from db15_bytea_set_dup;
+drop foreign table db15_bytea_set_dup;
+-- clean up bytea tests
+\i test/common/epilogue.sql
+-- Shared epilogue for every redis_fdw test module: assert that the module left
+-- db 15 empty, so the next module starts from nothing and any module can run on
+-- its own.
+--
+-- This asserts rather than flushes. A flush would make the assertion true by
+-- destroying the evidence a failing module left behind. Every key printed below
+-- is a line that is not in the expected file, so the module that leaked is the
+-- first to fail and names the key, instead of the cause being buried in a
+-- refusal from whatever runs next. KEYS, like the prologue's DBSIZE, sees keys
+-- of every type. LC_ALL so a leak of several keys reads the same on every
+-- machine; the passing output is empty either way. See test/README.md.
+\! redis-cli -n 15 keys '*' | LC_ALL=C sort
+
+set client_min_messages = warning;
+drop server localredis cascade;
+reset client_min_messages;

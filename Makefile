@@ -20,12 +20,12 @@ OBJS = redis_fdw.o
 EXTENSION = redis_fdw
 DATA = redis_fdw--1.0.sql redis_fdw--2.0.sql redis_fdw--1.0--2.0.sql
 
-REGRESS = redis_fdw
+ifndef REGRESS
+REGRESS = scalar hash set list zset geo validation connection joins_and_cursors
+endif
 REGRESS_OPTS = --inputdir=test --outputdir=test \
       --load-extension=hstore \
 	  --load-extension=$(EXTENSION)
-
-EXTRA_CLEAN = sql/redis_fdw.sql expected/redis_fdw.out
 
 SHLIB_LINK += -lhiredis
 

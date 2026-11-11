@@ -1,0 +1,417 @@
+-- Hash tables: reads, singleton and non-singleton forms, tablekeyprefix and
+-- tablekeyset, preservation of values containing embedded NULs, and bytea
+-- values. Contains the suite's only uses of hstore.
+\i test/common/prologue.sql
+-- Shared prologue for every redis_fdw test module.
+-- psql -a echoes this file into every expected output.
+--
+-- Adding a module? See test/README.md. This file cannot guard db 15 on your
+-- behalf: it only sets db15_not_empty, and your module must act on it.
+-- Refuse by default, and only clear the flag once we have positively counted an
+-- empty keyspace. Everything below can fail -- redis-cli missing, redis down --
+-- and a \gset that never runs leaves the variable unset, at which point \if
+-- skips its entire block, \q included, and the module would run on and flush a
+-- database it was meant to protect. Starting from "not empty" makes every such
+-- failure refuse instead.
+\set db15_not_empty true
+-- DBSIZE, rather than counting rows through the foreign tables, for two
+-- reasons: it sees keys of every type, including ones this FDW cannot read and
+-- would silently skip; and it does not route the safety check through the code
+-- under test. \copy runs the program client-side, like the \! calls elsewhere
+-- in this suite, so it needs no server-side execution privilege.
+create temp table redis_dbsize(n bigint);
+\copy redis_dbsize from program 'redis-cli -n 15 dbsize'
+select n <> 0 as db15_not_empty from redis_dbsize \gset
+drop table redis_dbsize;
+create server localredis foreign data wrapper redis_fdw;
+create user mapping for public server localredis;
+-- the default scalar view of db 15, used by the scalar and joins_and_cursors
+-- modules
+create foreign table db15(key text, value text)
+       server localredis
+       options (database '15');
+-- set results come back in arbitrary order; atsort() makes them predictable
+CREATE OR REPLACE FUNCTION atsort( a text[])
+ RETURNS text[]
+ LANGUAGE sql
+ IMMUTABLE  STRICT
+AS $function$
+  select array(select unnest($1) order by 1)
+$function$;
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+\! redis-cli < test/redis_setup
+OK
+OK
+OK
+8
+5
+6
+4
+OK
+OK
+6
+6
+2
+2
+2
+2
+-- hash
+create foreign table db15_hash_prefix(key text, value text)
+       server localredis
+       options (tabletype 'hash', tablekeyprefix 'hash', database '15');
+create foreign table db15_hash_prefix_array(key text, value text[])
+       server localredis
+       options (tabletype 'hash', tablekeyprefix 'hash', database '15');
+create foreign table db15_hash_keyset_array(key text, value text[])
+       server localredis
+       options (tabletype 'hash', tablekeyset 'hkeys', database '15');
+select * from db15_hash_prefix order by key;
+  key  |                   value                   
+-------+-------------------------------------------
+ hash1 | {"k1","v1","k2","v2","k3","v3","k4","v4"}
+ hash2 | {"k1","v5","k2","v6","k3","v7","k4","v8"}
+(2 rows)
+
+select * from db15_hash_prefix where key = 'hash1';
+  key  |                   value                   
+-------+-------------------------------------------
+ hash1 | {"k1","v1","k2","v2","k3","v3","k4","v4"}
+(1 row)
+
+select * from db15_hash_prefix_array order by key;
+  key  |           value           
+-------+---------------------------
+ hash1 | {k1,v1,k2,v2,k3,v3,k4,v4}
+ hash2 | {k1,v5,k2,v6,k3,v7,k4,v8}
+(2 rows)
+
+select * from db15_hash_prefix_array where key = 'hash1';
+  key  |           value           
+-------+---------------------------
+ hash1 | {k1,v1,k2,v2,k3,v3,k4,v4}
+(1 row)
+
+select * from db15_hash_keyset_array order by key;
+  key  |           value           
+-------+---------------------------
+ hash1 | {k1,v1,k2,v2,k3,v3,k4,v4}
+ hash2 | {k1,v5,k2,v6,k3,v7,k4,v8}
+(2 rows)
+
+select * from db15_hash_keyset_array where key = 'hash1';
+  key  |           value           
+-------+---------------------------
+ hash1 | {k1,v1,k2,v2,k3,v3,k4,v4}
+(1 row)
+
+-- a couple of nifty things we an do with hash tables
+select key, hstore(value) from db15_hash_prefix_array order by key;
+  key  |                     hstore                     
+-------+------------------------------------------------
+ hash1 | "k1"=>"v1", "k2"=>"v2", "k3"=>"v3", "k4"=>"v4"
+ hash2 | "k1"=>"v5", "k2"=>"v6", "k3"=>"v7", "k4"=>"v8"
+(2 rows)
+
+create type atab as (k1 text, k2 text, k3 text);
+select key, (populate_record(null::atab, hstore(value))).*
+from db15_hash_prefix_array
+order by key;
+  key  | k1 | k2 | k3 
+-------+----+----+----
+ hash1 | v1 | v2 | v3
+ hash2 | v5 | v6 | v7
+(2 rows)
+
+-- singleton hash
+create foreign table db15_1key_hash(key text, value text)
+       server localredis
+       options (tabletype 'hash', singleton_key 'hash1', database '15');
+select * from db15_1key_hash order by key;
+ key | value 
+-----+-------
+ k1  | v1
+ k2  | v2
+ k3  | v3
+ k4  | v4
+(4 rows)
+
+\! redis-cli < test/redis_teardown
+OK
+2
+2
+2
+2
+2
+4
+-- singleton hash
+create foreign table db15_w_1key_hash(key text, val text)
+       server localredis
+       options (singleton_key 'w_1key_hash', tabletype 'hash', database '15');
+select * from db15_w_1key_hash;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_w_1key_hash values ('a','b'), ('c','d'),('e','f');
+select * from db15_w_1key_hash order by key;
+ key | val 
+-----+-----
+ a   | b
+ c   | d
+ e   | f
+(3 rows)
+
+insert into db15_w_1key_hash values ('a','b');
+ERROR:  key already exists: a
+delete from db15_w_1key_hash where key = 'a';
+delete from db15_w_1key_hash where key = 'a';
+select * from db15_w_1key_hash order by key;
+ key | val 
+-----+-----
+ c   | d
+ e   | f
+(2 rows)
+
+update db15_w_1key_hash set key = 'x', val = 'y' where key = 'c';
+select * from db15_w_1key_hash order by key;
+ key | val 
+-----+-----
+ e   | f
+ x   | y
+(2 rows)
+
+update db15_w_1key_hash set val = 'z' where key = 'e';
+select * from db15_w_1key_hash order by key;
+ key | val 
+-----+-----
+ e   | z
+ x   | y
+(2 rows)
+
+update db15_w_1key_hash set key = 'w' where key = 'e';
+select * from db15_w_1key_hash order by key;
+ key | val 
+-----+-----
+ w   | z
+ x   | y
+(2 rows)
+
+-- a key-only UPDATE re-stores the existing value using its full Redis length,
+-- so a value containing an embedded NUL must survive byte-for-byte (copying it
+-- with pstrdup would truncate at the NUL while the length stayed full, reading
+-- past the buffer and corrupting the value).  Seed a binary value plus a
+-- pristine copy directly in Redis, rename the field via the FDW, then compare
+-- server-side.
+\! printf 'ab\000cdefghij' | redis-cli -n 15 -x hset w_1key_hash binkey
+1
+\! printf 'ab\000cdefghij' | redis-cli -n 15 -x hset w_1key_hash binkey_orig
+1
+update db15_w_1key_hash set key = 'binkey2' where key = 'binkey';
+\! redis-cli -n 15 eval "return (redis.call('HGET',KEYS[1],ARGV[1]) == redis.call('HGET',KEYS[1],ARGV[2])) and 'value preserved' or 'value CORRUPTED'" 1 w_1key_hash binkey2 binkey_orig
+value preserved
+-- emptying a singleton hash removes the Redis key with its last field
+delete from db15_w_1key_hash;
+select * from db15_w_1key_hash;
+ key | val 
+-----+-----
+(0 rows)
+
+-- non-singleton hash table prefix
+create foreign table db15_w_hash_pfx(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'hash', tablekeyprefix 'w_hash_');
+select * from db15_w_hash_pfx;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_w_hash_pfx values ('w_hash_e','{f,g,h}'); -- error
+ERROR:  cannot decompose odd number of items into a Redis hash
+insert into db15_w_hash_pfx values ('w_hash_e','{}'); -- error
+ERROR:  cannot store empty list in a Redis table
+insert into db15_w_hash_pfx values ('w_hash_a','{b,c,d,e}'), ('w_hash_c','{f,g,h,i}'),('w_hash_e','{j,k}');
+insert into db15_w_hash_pfx values ('x','{y,z}'); -- prefix error
+ERROR:  key 'x' does not match table key prefix 'w_hash_'
+insert into db15_w_hash_pfx values ('w_hash_a','{y,z}'); -- dup error
+ERROR:  key already exists: w_hash_a
+select * from db15_w_hash_pfx order by key;
+   key    |    val    
+----------+-----------
+ w_hash_a | {b,c,d,e}
+ w_hash_c | {f,g,h,i}
+ w_hash_e | {j,k}
+(3 rows)
+
+delete from db15_w_hash_pfx where key = 'w_hash_a';
+select * from db15_w_hash_pfx order by key;
+   key    |    val    
+----------+-----------
+ w_hash_c | {f,g,h,i}
+ w_hash_e | {j,k}
+(2 rows)
+
+update db15_w_hash_pfx set key = 'x' where key = 'w_hash_c'; -- prefix err
+ERROR:  key prefix condition violation: x
+update db15_w_hash_pfx set key = 'x', val = '{y,z}' where key = 'w_hash_c'; -- prefix err
+ERROR:  key prefix condition violation: x
+update db15_w_hash_pfx set key = 'w_hash_x', val = '{x,y,z}' where key = 'w_hash_c'; -- err
+ERROR:  cannot decompose odd number of items into a Redis hash
+update db15_w_hash_pfx set key = 'w_hash_x', val = '{w,x,y,z}' where key = 'w_hash_c';
+select key, val from db15_w_hash_pfx order by key;
+   key    |    val    
+----------+-----------
+ w_hash_e | {j,k}
+ w_hash_x | {w,x,y,z}
+(2 rows)
+
+update db15_w_hash_pfx set key = 'w_hash_z' where key = 'w_hash_x';
+select key, val from db15_w_hash_pfx order by key;
+   key    |    val    
+----------+-----------
+ w_hash_e | {j,k}
+ w_hash_z | {w,x,y,z}
+(2 rows)
+
+update db15_w_hash_pfx set val = '{q,r,s}' where key = 'w_hash_e';
+ERROR:  cannot decompose odd number of items into a Redis hash
+select key, val from db15_w_hash_pfx order by key;
+   key    |    val    
+----------+-----------
+ w_hash_e | {j,k}
+ w_hash_z | {w,x,y,z}
+(2 rows)
+
+delete from db15_w_hash_pfx;
+select * from db15_w_hash_pfx;
+ key | val 
+-----+-----
+(0 rows)
+
+--non-singleton hash table keyset
+create foreign table db15_w_hash_kset(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'hash', tablekeyset 'w_hash_kset');
+select * from db15_w_hash_kset;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_w_hash_pfx values ('e_whk','{f,g,h}'); -- error
+ERROR:  key 'e_whk' does not match table key prefix 'w_hash_'
+insert into db15_w_hash_pfx values ('e_whk','{}'); -- error
+ERROR:  key 'e_whk' does not match table key prefix 'w_hash_'
+insert into db15_w_hash_kset values ('a_whk','{b,c,d,e}'), ('c_whk','{f,g,h,i}'),('e_whk','{j,k}');
+insert into db15_w_hash_kset values ('a_whk','{x,y}'); -- dup error
+ERROR:  key already exists: a_whk
+select * from db15_w_hash_kset order by key;
+  key  |    val    
+-------+-----------
+ a_whk | {b,c,d,e}
+ c_whk | {f,g,h,i}
+ e_whk | {j,k}
+(3 rows)
+
+delete from db15_w_hash_kset where key = 'a_whk';
+select * from db15_w_hash_kset order by key;
+  key  |    val    
+-------+-----------
+ c_whk | {f,g,h,i}
+ e_whk | {j,k}
+(2 rows)
+
+update db15_w_hash_kset set key = 'x_whk', val = '{w,x,y,z}' where key = 'c_whk';
+select key, val from db15_w_hash_kset order by key;
+  key  |    val    
+-------+-----------
+ e_whk | {j,k}
+ x_whk | {w,x,y,z}
+(2 rows)
+
+update db15_w_hash_kset set key = 'z_whk' where key = 'x_whk';
+select key, val from db15_w_hash_kset order by key;
+  key  |    val    
+-------+-----------
+ e_whk | {j,k}
+ z_whk | {w,x,y,z}
+(2 rows)
+
+update db15_w_hash_kset set val = '{q,r}' where key = 'e_whk';
+select key, val from db15_w_hash_kset order by key;
+  key  |    val    
+-------+-----------
+ e_whk | {q,r}
+ z_whk | {w,x,y,z}
+(2 rows)
+
+delete from db15_w_hash_kset;
+select * from db15_w_hash_kset;
+ key | val 
+-----+-----
+(0 rows)
+
+-- singleton hash table with bytea value column (key must be text)
+create foreign table db15_bytea_hash(key text, val bytea)
+       server localredis
+       options (singleton_key 'bytea_hash', tabletype 'hash', database '15');
+select * from db15_bytea_hash;
+ key | val 
+-----+-----
+(0 rows)
+
+insert into db15_bytea_hash values
+    ('field1', E'hash\\000val1'::bytea),
+    ('field2', E'hash\\000val2'::bytea);
+select key, length(val), val from db15_bytea_hash order by key;
+  key   | length |         val          
+--------+--------+----------------------
+ field1 |      9 | \x686173680076616c31
+ field2 |      9 | \x686173680076616c32
+(2 rows)
+
+update db15_bytea_hash set val = E'new\\000hash\\000val'::bytea where key = 'field1';
+select key, length(val), val from db15_bytea_hash order by key;
+  key   | length |            val             
+--------+--------+----------------------------
+ field1 |     12 | \x6e657700686173680076616c
+ field2 |      9 | \x686173680076616c32
+(2 rows)
+
+delete from db15_bytea_hash where key = 'field2';
+select key, length(val), val from db15_bytea_hash order by key;
+  key   | length |            val             
+--------+--------+----------------------------
+ field1 |     12 | \x6e657700686173680076616c
+(1 row)
+
+delete from db15_bytea_hash;
+select * from db15_bytea_hash;
+ key | val 
+-----+-----
+(0 rows)
+
+-- test that bytea key column in hash is rejected
+create foreign table db15_bytea_hash_bad(key bytea, val text)
+       server localredis
+       options (singleton_key 'bytea_hash_bad', tabletype 'hash', database '15');
+insert into db15_bytea_hash_bad values (E'key'::bytea, 'val');
+ERROR:  bytea not supported for hash field column
+\i test/common/epilogue.sql
+-- Shared epilogue for every redis_fdw test module: assert that the module left
+-- db 15 empty, so the next module starts from nothing and any module can run on
+-- its own.
+--
+-- This asserts rather than flushes. A flush would make the assertion true by
+-- destroying the evidence a failing module left behind. Every key printed below
+-- is a line that is not in the expected file, so the module that leaked is the
+-- first to fail and names the key, instead of the cause being buried in a
+-- refusal from whatever runs next. KEYS, like the prologue's DBSIZE, sees keys
+-- of every type. LC_ALL so a leak of several keys reads the same on every
+-- machine; the passing output is empty either way. See test/README.md.
+\! redis-cli -n 15 keys '*' | LC_ALL=C sort
+
+set client_min_messages = warning;
+drop server localredis cascade;
+reset client_min_messages;

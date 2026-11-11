@@ -1,0 +1,218 @@
+-- The FDW as part of a larger query plan: cursors, UPDATE ... FROM and
+-- DELETE ... USING, a forced merge join on the key column, and EXPLAIN.
+--
+-- Two subjects in one file, which is tolerable at this size. If it grows,
+-- split it rather than adding to it.
+\i test/common/prologue.sql
+-- Shared prologue for every redis_fdw test module.
+-- psql -a echoes this file into every expected output.
+--
+-- Adding a module? See test/README.md. This file cannot guard db 15 on your
+-- behalf: it only sets db15_not_empty, and your module must act on it.
+-- Refuse by default, and only clear the flag once we have positively counted an
+-- empty keyspace. Everything below can fail -- redis-cli missing, redis down --
+-- and a \gset that never runs leaves the variable unset, at which point \if
+-- skips its entire block, \q included, and the module would run on and flush a
+-- database it was meant to protect. Starting from "not empty" makes every such
+-- failure refuse instead.
+\set db15_not_empty true
+-- DBSIZE, rather than counting rows through the foreign tables, for two
+-- reasons: it sees keys of every type, including ones this FDW cannot read and
+-- would silently skip; and it does not route the safety check through the code
+-- under test. \copy runs the program client-side, like the \! calls elsewhere
+-- in this suite, so it needs no server-side execution privilege.
+create temp table redis_dbsize(n bigint);
+\copy redis_dbsize from program 'redis-cli -n 15 dbsize'
+select n <> 0 as db15_not_empty from redis_dbsize \gset
+drop table redis_dbsize;
+create server localredis foreign data wrapper redis_fdw;
+create user mapping for public server localredis;
+-- the default scalar view of db 15, used by the scalar and joins_and_cursors
+-- modules
+create foreign table db15(key text, value text)
+       server localredis
+       options (database '15');
+-- set results come back in arbitrary order; atsort() makes them predictable
+CREATE OR REPLACE FUNCTION atsort( a text[])
+ RETURNS text[]
+ LANGUAGE sql
+ IMMUTABLE  STRICT
+AS $function$
+  select array(select unnest($1) order by 1)
+$function$;
+\if :db15_not_empty
+\echo 'db 15 is not empty - refusing to run rather than destroy data'
+\q
+\endif
+-- cursor tests
+create foreign table db15bigprefixscalar (
+       key text not null,
+       val text
+)
+server localredis
+options (database '15', tablekeyprefix 'w_scalar_');
+create foreign table db15bigkeysetscalar (
+       key text not null,
+       val text
+)
+server localredis
+options (database '15', tablekeyset 'w_kset');
+insert into db15
+select 'junk' || x, 'junk'
+from generate_series(1,10000) as x;
+insert into db15bigprefixscalar
+select 'w_scalar_' || x::text, 'val ' || x::text
+from generate_series (1,10000) as x;
+insert into db15bigkeysetscalar
+select 'key_' || x::text, 'val ' || x::text
+from generate_series (1,10000) as x;
+insert into db15
+select 'junk' || x, 'junk'
+from generate_series(10001, 20000) as x;
+insert into db15bigprefixscalar
+select 'w_scalar_' || x::text, 'val ' || x::text
+from generate_series (10001, 20000) as x;
+insert into db15bigkeysetscalar
+select 'key_' || x::text, 'val ' || x::text
+from generate_series (10001, 20000) as x;
+select count(*) from   db15;
+ count 
+-------
+ 60000
+(1 row)
+
+select count(*) from db15bigprefixscalar;
+ count 
+-------
+ 20000
+(1 row)
+
+select count(*) from db15bigkeysetscalar;
+ count 
+-------
+ 20000
+(1 row)
+
+-- UPDATE ... FROM / DELETE ... USING against a foreign table, including
+-- via a forced merge join on the key column. Regression test for:
+-- - EXPLAIN of INSERT/UPDATE/DELETE (no ANALYZE) must not crash the backend
+-- - a merge join on the key column must not fail with
+--   "could not find pathkey item to sort" (caused by a collation mismatch
+--   between the key column's row-identity Var and its plain references)
+create foreign table db15_joinupd(key text, val text)
+       server localredis
+       options (tablekeyprefix 'joinupd_', database '15');
+insert into db15_joinupd values
+       ('joinupd_foo', 'old1'), ('joinupd_bar', 'old2'), ('joinupd_baz', 'old3');
+create table joinupd_src(key text, val text);
+insert into joinupd_src values ('joinupd_foo', 'new1'), ('joinupd_bar', 'new2');
+explain (costs off) update db15_joinupd set val = 'x' where key = 'joinupd_foo';
+                 QUERY PLAN                  
+---------------------------------------------
+ Update on db15_joinupd
+   ->  Foreign Scan on db15_joinupd
+         Filter: (key = 'joinupd_foo'::text)
+(3 rows)
+
+explain (costs off) delete from db15_joinupd where key = 'joinupd_foo';
+                 QUERY PLAN                  
+---------------------------------------------
+ Delete on db15_joinupd
+   ->  Foreign Scan on db15_joinupd
+         Filter: (key = 'joinupd_foo'::text)
+(3 rows)
+
+explain (costs off) insert into db15_joinupd values ('joinupd_new', 'v');
+       QUERY PLAN       
+------------------------
+ Insert on db15_joinupd
+   ->  Result
+(2 rows)
+
+set enable_hashjoin = off;
+set enable_nestloop = off;
+explain (costs off) update db15_joinupd r set val = n.val
+       from joinupd_src n where r.key = n.key;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Update on db15_joinupd r
+   ->  Merge Join
+         Merge Cond: (n.key = r.key)
+         ->  Sort
+               Sort Key: n.key
+               ->  Seq Scan on joinupd_src n
+         ->  Sort
+               Sort Key: r.key
+               ->  Foreign Scan on db15_joinupd r
+(9 rows)
+
+update db15_joinupd r set val = n.val
+       from joinupd_src n where r.key = n.key;
+select * from db15_joinupd order by key;
+     key     | val  
+-------------+------
+ joinupd_bar | new2
+ joinupd_baz | old3
+ joinupd_foo | new1
+(3 rows)
+
+delete from db15_joinupd r using joinupd_src n where r.key = n.key;
+select * from db15_joinupd order by key;
+     key     | val  
+-------------+------
+ joinupd_baz | old3
+(1 row)
+
+reset enable_hashjoin;
+reset enable_nestloop;
+delete from db15_joinupd;
+drop table joinupd_src;
+drop foreign table db15_joinupd;
+-- The 60k keys the cursor tests made. Deleting them through the FDW costs one
+-- Redis round trip per key -- measured at 5.5s, a third of this module's
+-- runtime -- to re-cover a delete path that scalar, hash, set and zset already
+-- test. This module is about the plan shapes above, and its own delete tests
+-- (DELETE ... USING, and db15_joinupd just now) stay as they are.
+--
+-- So do the loop server-side, in one round trip. THE QUOTED ARGUMENT BELOW IS
+-- A LUA SCRIPT: redis-cli does not interpret it, it ships it to the server as
+-- a string and the server's own embedded Lua runs it. Nothing Lua is installed
+-- or linked by this suite -- EVAL is just a Redis command, present since 2.6.
+-- hash.sql reaches past the FDW the same way. See test/README.md.
+--
+-- The script names the three patterns this module created plus the keyset,
+-- which none of them match now that the SREMs that would have emptied it are
+-- gone. The count it returns is 20000 three times over plus the keyset, so it
+-- asserts the cleanup took exactly what the inserts above made, and nothing
+-- else.
+--
+-- Two constraints this script carries: writing after KEYS makes it a write
+-- after a non-deterministic command, which needs effects replication (the
+-- default since Redis 5.0); and KEYS inside a script, with no declared keys,
+-- is not valid on a cluster node. Neither binds this suite, which is
+-- single-node throughout, but both bind anyone copying the idiom.
+\! redis-cli -n 15 eval "local n=0 for _,p in ipairs(ARGV) do for _,k in ipairs(redis.call('keys',p)) do redis.call('del',k) n=n+1 end end return n" 0 'junk*' 'w_scalar_*' 'key_*' 'w_kset'
+60001
+select count(*) from db15;
+ count 
+-------
+     0
+(1 row)
+
+\i test/common/epilogue.sql
+-- Shared epilogue for every redis_fdw test module: assert that the module left
+-- db 15 empty, so the next module starts from nothing and any module can run on
+-- its own.
+--
+-- This asserts rather than flushes. A flush would make the assertion true by
+-- destroying the evidence a failing module left behind. Every key printed below
+-- is a line that is not in the expected file, so the module that leaked is the
+-- first to fail and names the key, instead of the cause being buried in a
+-- refusal from whatever runs next. KEYS, like the prologue's DBSIZE, sees keys
+-- of every type. LC_ALL so a leak of several keys reads the same on every
+-- machine; the passing output is empty either way. See test/README.md.
+\! redis-cli -n 15 keys '*' | LC_ALL=C sort
+
+set client_min_messages = warning;
+drop server localredis cascade;
+reset client_min_messages;

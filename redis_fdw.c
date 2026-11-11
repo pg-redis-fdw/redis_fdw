@@ -2064,210 +2064,230 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 	found = false;
 
 	/*
-	 * If we're out of rows on the cursor, fetch the next set. Keep going
-	 * until we get a result back that actually has some rows.
+	 * Keep going until we have a row to return, or the scan is finished. A
+	 * pass round this loop can come up empty without the scan being over: a
+	 * batch whose trailing keys all had to be skipped - see the do loop
+	 * below - leaves the batch exhausted with nothing found, and the
+	 * batches after it still have to be read.
 	 */
-	while (festate->cursor_id != NULL &&
-		   festate->row >= festate->reply->elements)
-	{
-		redisReply *creply;
-		redisReply *cursor;
-
-		Assert(festate->qual_value == NULL);
-
-		if (festate->keyset)
-		{
-			creply = redisCommand(festate->context,
-								  festate->cursor_search_string,
-								  festate->keyset, festate->cursor_id);
-		}
-		else if (festate->keyprefix)
-		{
-			creply = redisCommand(festate->context,
-								  festate->cursor_search_string,
-								  festate->cursor_id,
-								  redis_escape_glob(festate->keyprefix));
-		}
-		else
-		{
-			creply = redisCommand(festate->context,
-								  festate->cursor_search_string,
-								  festate->cursor_id);
-		}
-
-		if (!creply)
-		{
-			redis_discard_connection(festate->context);
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-					 errmsg("failed to list keys: %s",
-							festate->context->errstr)
-					 ));
-		}
-		else if (creply->type == REDIS_REPLY_ERROR)
-		{
-			char	   *err = pstrdup(creply->str);
-
-			freeReplyObject(creply);
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-					 errmsg("failed somehow: %s", err)
-					 ));
-		}
-
-		if (creply->type != REDIS_REPLY_ARRAY || creply->elements != 2)
-		{
-			freeReplyObject(creply);
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
-					 errmsg("unexpected reply shape from %s",
-							festate->cursor_search_string)));
-		}
-
-		cursor = creply->element[0];
-
-		if (cursor->type == REDIS_REPLY_STRING)
-		{
-
-			MemoryContext oldcontext;
-			oldcontext = MemoryContextSwitchTo(festate->mctxt);
-			pfree(festate->cursor_id);
-			if (cursor->len == 1 && cursor->str[0] == '0')
-				festate->cursor_id = NULL;
-			else
-				festate->cursor_id = pstrdup(cursor->str);
-			MemoryContextSwitchTo(oldcontext);
-		}
-		else
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
-					 errmsg("wrong reply type %d", cursor->type)
-					 ));
-		}
-
-		/* the previous batch's reply is finished with */
-		freeReplyObject(festate->owned_reply);
-		festate->owned_reply = creply;
-		festate->reply = creply->element[1];
-		festate->row = 0;
-	}
-
-	/*
-	 * -1 means we failed the qual test, so there are no rows or we've already
-	 * processed the qual
-	 */
-
-	if (festate->row > -1 &&
-		(festate->qual_value != NULL ||
-		 (festate->row < festate->reply->elements)))
+	for (;;)
 	{
 		/*
-		 * Get the row, check the result type, and handle accordingly. If it's
-		 * nil, we go ahead and get the next row.
+		 * If we're out of rows on the cursor, fetch the next set. Keep going
+		 * until we get a result back that actually has some rows.
 		 */
-		do
+		while (festate->cursor_id != NULL &&
+			   festate->row >= festate->reply->elements)
 		{
+			redisReply *creply;
+			redisReply *cursor;
 
-			key = festate->qual_value != NULL ?
-				festate->qual_value :
-				festate->reply->element[festate->row]->str;
-			switch (festate->table_type)
+			Assert(festate->qual_value == NULL);
+
+			if (festate->keyset)
 			{
-				case PG_REDIS_HASH_TABLE:
-					reply = redisCommand(festate->context,
-										 "HGETALL %s", key);
-					break;
-				case PG_REDIS_LIST_TABLE:
-					reply = redisCommand(festate->context,
-										 "LRANGE %s 0 -1", key);
-					break;
-				case PG_REDIS_SET_TABLE:
-					reply = redisCommand(festate->context,
-										 "SMEMBERS %s", key);
-					break;
-				case PG_REDIS_ZSET_TABLE:
-					if (festate->with_scores)
-						reply = redisCommand(festate->context,
-											 "ZRANGE %s 0 -1 WITHSCORES", key);
-					else
-						reply = redisCommand(festate->context,
-											 "ZRANGE %s 0 -1", key);
-					break;
-				case PG_REDIS_SCALAR_TABLE:
-				default:
-					reply = redisCommand(festate->context,
-										 "GET %s", key);
+				creply = redisCommand(festate->context,
+									  festate->cursor_search_string,
+									  festate->keyset, festate->cursor_id);
+			}
+			else if (festate->keyprefix)
+			{
+				creply = redisCommand(festate->context,
+									  festate->cursor_search_string,
+									  festate->cursor_id,
+									  redis_escape_glob(festate->keyprefix));
+			}
+			else
+			{
+				creply = redisCommand(festate->context,
+									  festate->cursor_search_string,
+									  festate->cursor_id);
 			}
 
-			if (!reply)
+			if (!creply)
 			{
-				freeReplyObject(festate->owned_reply);
 				redis_discard_connection(festate->context);
-				ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
-						 errmsg("failed to get the value for key \"%s\": %s",
-								key, festate->context->errstr)
-								));
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+						 errmsg("failed to list keys: %s",
+								festate->context->errstr)
+						 ));
 			}
-
-			festate->row++;
-
-		} while ((reply->type == REDIS_REPLY_NIL ||
-				  reply->type == REDIS_REPLY_STATUS ||
-				  reply->type == REDIS_REPLY_ERROR) &&
-				 festate->qual_value == NULL &&
-				 festate->row < festate->reply->elements);
-
-		if (festate->qual_value != NULL || festate->row <= festate->reply->elements)
-		{
-			/*
-			 * Now, deal with the different data types we might have got from
-			 * Redis.
-			 */
-
-			switch (reply->type)
+			else if (creply->type == REDIS_REPLY_ERROR)
 			{
-				case REDIS_REPLY_INTEGER:
-					data = (char *) palloc(sizeof(char) * 64);
-					data_len = snprintf(data, 64, "%lld", reply->integer);
-					found = true;
-					break;
+				char	   *err = pstrdup(creply->str);
 
-				case REDIS_REPLY_STRING:
-					data = reply->str;
-					data_len = reply->len;
-					found = true;
-					break;
-
-				case REDIS_REPLY_ARRAY:
-					{
-						int			stride = festate->with_scores ? 2 : 1;
-
-						if (has_array)
-							array_datum = process_redis_array(reply,
-															  festate->array_elem_type,
-															  0, stride);
-						else
-							data = redis_array_to_text(reply, 0, stride);
-
-						if (festate->with_scores)
-						{
-							if (festate->scores_elem_type != InvalidOid)
-								scores_datum = process_redis_array(reply,
-																   festate->scores_elem_type,
-																   1, 2);
-							else
-								scores = redis_array_to_text(reply, 1, 2);
-						}
-					}
-					found = true;
-					break;
+				freeReplyObject(creply);
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+						 errmsg("failed somehow: %s", err)
+						 ));
 			}
+
+			if (creply->type != REDIS_REPLY_ARRAY || creply->elements != 2)
+			{
+				freeReplyObject(creply);
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+						 errmsg("unexpected reply shape from %s",
+								festate->cursor_search_string)));
+			}
+
+			cursor = creply->element[0];
+
+			if (cursor->type == REDIS_REPLY_STRING)
+			{
+
+				MemoryContext oldcontext;
+				oldcontext = MemoryContextSwitchTo(festate->mctxt);
+				pfree(festate->cursor_id);
+				if (cursor->len == 1 && cursor->str[0] == '0')
+					festate->cursor_id = NULL;
+				else
+					festate->cursor_id = pstrdup(cursor->str);
+				MemoryContextSwitchTo(oldcontext);
+			}
+			else
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+						 errmsg("wrong reply type %d", cursor->type)
+						 ));
+			}
+
+			/* the previous batch's reply is finished with */
+			freeReplyObject(festate->owned_reply);
+			festate->owned_reply = creply;
+			festate->reply = creply->element[1];
+			festate->row = 0;
 		}
 
-		/* make sure we don't try to process the qual row twice */
-		if (festate->qual_value != NULL)
-			festate->row = -1;
+		/*
+		 * -1 means we failed the qual test, so there are no rows or we've already
+		 * processed the qual
+		 */
+
+		if (festate->row > -1 &&
+			(festate->qual_value != NULL ||
+			 (festate->row < festate->reply->elements)))
+		{
+			/*
+			 * Get the row, check the result type, and handle accordingly. If it's
+			 * nil, we go ahead and get the next row.
+			 */
+			do
+			{
+
+				key = festate->qual_value != NULL ?
+					festate->qual_value :
+					festate->reply->element[festate->row]->str;
+				switch (festate->table_type)
+				{
+					case PG_REDIS_HASH_TABLE:
+						reply = redisCommand(festate->context,
+											 "HGETALL %s", key);
+						break;
+					case PG_REDIS_LIST_TABLE:
+						reply = redisCommand(festate->context,
+											 "LRANGE %s 0 -1", key);
+						break;
+					case PG_REDIS_SET_TABLE:
+						reply = redisCommand(festate->context,
+											 "SMEMBERS %s", key);
+						break;
+					case PG_REDIS_ZSET_TABLE:
+						if (festate->with_scores)
+							reply = redisCommand(festate->context,
+												 "ZRANGE %s 0 -1 WITHSCORES", key);
+						else
+							reply = redisCommand(festate->context,
+												 "ZRANGE %s 0 -1", key);
+						break;
+					case PG_REDIS_SCALAR_TABLE:
+					default:
+						reply = redisCommand(festate->context,
+											 "GET %s", key);
+				}
+
+				if (!reply)
+				{
+					freeReplyObject(festate->owned_reply);
+					redis_discard_connection(festate->context);
+					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+							 errmsg("failed to get the value for key \"%s\": %s",
+									key, festate->context->errstr)
+									));
+				}
+
+				festate->row++;
+
+			} while ((reply->type == REDIS_REPLY_NIL ||
+					  reply->type == REDIS_REPLY_STATUS ||
+					  reply->type == REDIS_REPLY_ERROR) &&
+					 festate->qual_value == NULL &&
+					 festate->row < festate->reply->elements);
+
+			if (festate->qual_value != NULL || festate->row <= festate->reply->elements)
+			{
+				/*
+				 * Now, deal with the different data types we might have got from
+				 * Redis.
+				 */
+
+				switch (reply->type)
+				{
+					case REDIS_REPLY_INTEGER:
+						data = (char *) palloc(sizeof(char) * 64);
+						data_len = snprintf(data, 64, "%lld", reply->integer);
+						found = true;
+						break;
+
+					case REDIS_REPLY_STRING:
+						data = reply->str;
+						data_len = reply->len;
+						found = true;
+						break;
+
+					case REDIS_REPLY_ARRAY:
+						{
+							int			stride = festate->with_scores ? 2 : 1;
+
+							if (has_array)
+								array_datum = process_redis_array(reply,
+																  festate->array_elem_type,
+																  0, stride);
+							else
+								data = redis_array_to_text(reply, 0, stride);
+
+							if (festate->with_scores)
+							{
+								if (festate->scores_elem_type != InvalidOid)
+									scores_datum = process_redis_array(reply,
+																	   festate->scores_elem_type,
+																	   1, 2);
+								else
+									scores = redis_array_to_text(reply, 1, 2);
+							}
+						}
+						found = true;
+						break;
+				}
+			}
+
+			/* make sure we don't try to process the qual row twice */
+			if (festate->qual_value != NULL)
+				festate->row = -1;
+		}
+
+		/*
+		 * Row found, no rows at all (a qual that failed its pre-check), the
+		 * qual row consumed, or the cursor finished: nothing more to fetch.
+		 * Otherwise the batch ran out while skipping keys, so go round again
+		 * and fetch the next one.
+		 */
+		if (found || festate->row < 0 || festate->cursor_id == NULL ||
+			festate->row < festate->reply->elements)
+			break;
 	}
 
 	/* Build the tuple */

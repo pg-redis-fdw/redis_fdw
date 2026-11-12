@@ -328,6 +328,43 @@ typedef struct RedisFdwModifyState
 #define PREFETCH_WINDOW_MAX 1024
 
 /*
+ * ... and the window holds every reply of it at once, so a key count is only
+ * half a bound. 1,024 keys is nothing for scalar values of a few bytes, and
+ * gigabytes for collections of a few MB - none of it charged to work_mem or
+ * visible in EXPLAIN. Measured here on 2,000 list keys of ~100 KB, a scan took
+ * the backend's peak RSS from 22 MB to 134 MB.
+ *
+ * So the window also stops growing once the bytes it would hold exceed this
+ * budget. What that costs is round trips - the window is what turns one round
+ * trip per row into one per window - and at 4 MB it costs none of them until
+ * the values are large:
+ *
+ *	value size   steady window   bytes held   round trips per 1,000 rows
+ *	 a few bytes          1024        75 KB                          1.0
+ *	        1 KB          1024       1.07 MB                         1.0
+ *	        4 KB          1006       4.00 MB                         1.0
+ *	       16 KB           254       3.99 MB                         3.9
+ *	      100 KB            40       3.91 MB                        25.0
+ *	        1 MB             3       3.00 MB                       333.3
+ *	        4 MB             1       4.00 MB                     1,000.0
+ *
+ * 4 MB keeps essentially the whole 1,024-key window for everything up to a
+ * 4 KB value, which is the common case and where all of the speed came from;
+ * puts 100 KB values in the low tens, still a 40x cut in round trips against
+ * fetching one at a time; and gives a multi-MB value a window of one, which is
+ * the only sane answer. It is also the right order of magnitude against the
+ * other thing a scan already holds: the reply to a SCAN at COUNT 20000 is
+ * about a megabyte of key names (see COUNT above), so at this budget the
+ * window no longer dominates a scan's memory.
+ *
+ * A constant rather than an option, on the same YAGNI grounds as COUNT. It
+ * bounds memory the user cannot see from SQL in the first place, so there is
+ * nothing to tune against until a workload turns up that argues for a
+ * different number.
+ */
+#define PREFETCH_BYTE_BUDGET (4 * 1024 * 1024)
+
+/*
  * Prefix for the staging key an UPDATE of a set, list, hash or zset row
  * rebuilds into before swapping it in with RENAME (see
  * redisExecForeignUpdate).  The backend pid is folded into the key (built at
@@ -420,6 +457,9 @@ static bool redis_pushdown_collation_ok(Oid collid);
 static int	redis_append_value_command(RedisFdwExecutionState *festate,
 									   const char *key, size_t key_len);
 static void redis_prefetch_values(RedisFdwExecutionState *festate);
+static size_t redis_reply_size(const redisReply *reply);
+static void redis_bound_prefetch_window(RedisFdwExecutionState *festate,
+										redisReply **values, long long n);
 static bool redis_value_reply_skippable(redisReply *reply);
 static void redis_check_value_reply(redisReply *reply, const char *key);
 static void redis_free_prefetch(RedisFdwExecutionState *festate);
@@ -2203,6 +2243,101 @@ redis_check_value_reply(redisReply *reply, const char *key)
 }
 
 /*
+ * redis_reply_size
+ *		How much memory a reply and everything under it occupies.
+ *
+ *		The payload is reply->len, which hiredis sets alongside reply->str for
+ *		every reply type that carries bytes. The struct is charged too, along
+ *		with the pointer slot that holds it: a value command's reply here is a
+ *		string for a scalar and a flat array of strings for a hash, list, set
+ *		or zset, so a window of collections with many tiny members is almost
+ *		entirely struct, and counting only payloads would under-count it by
+ *		two orders of magnitude.
+ *
+ *		Those replies really are flat, but this recurses rather than assume so:
+ *		nesting is a property of the command, and RESP3 reply types that do
+ *		nest exist. The recursion is bounded by the reply's own depth.
+ */
+static size_t
+redis_reply_size(const redisReply *reply)
+{
+	size_t		size;
+	size_t		i;
+
+	if (reply == NULL)
+		return 0;
+
+	size = sizeof(redisReply) + sizeof(redisReply *);
+
+	if (reply->str != NULL)
+		size += reply->len;
+
+	for (i = 0; i < reply->elements; i++)
+		size += redis_reply_size(reply->element[i]);
+
+	return size;
+}
+
+/*
+ * redis_bound_prefetch_window
+ *		Narrow the window for the next round trip if the window just fetched
+ *		says the next one would hold more than PREFETCH_BYTE_BUDGET.
+ *
+ *		The geometric ramp happens before the fetch, so there is nothing to
+ *		bound it with except the size of what the previous window actually
+ *		held: the FDW does not know how large a value is until it has read it,
+ *		and asking - a STRLEN or MEMORY USAGE per key - would cost the round
+ *		trip the window exists to save. So the feedback runs the other way
+ *		round. Measure the window that just arrived, divide the budget by its
+ *		bytes per key, and cap the next window there.
+ *
+ *		That predicts rather than reacts, which matters: a rule that only
+ *		stopped growing once the bytes held had already exceeded the budget
+ *		would have to exceed it first, and since the window quadruples, by up
+ *		to 4x. Dividing instead means the first window large enough to break
+ *		the budget is the one that gets capped, so with 100 KB values the ramp
+ *		goes 1, 4, 16, 40 and never holds more than about 4 MB.
+ *
+ *		Only the cap is applied here; prefetch_window keeps quadrupling in
+ *		redis_prefetch_values. So when the values get smaller the cap rises
+ *		and the window grows back into it geometrically, instead of being
+ *		stuck at whatever the largest value of the scan deserved.
+ *
+ *		This bounds the steady state, not every individual window: a run of
+ *		tiny values followed by a huge one is measured only after the huge one
+ *		has arrived. Bounding that would mean knowing sizes in advance, which
+ *		is the round trip above. What it does rule out is the case this is
+ *		about - a scan whose values are uniformly large holding a thousand of
+ *		them at once.
+ */
+static void
+redis_bound_prefetch_window(RedisFdwExecutionState *festate,
+							redisReply **values, long long n)
+{
+	size_t		held = 0;
+	long long	cap;
+	long long	i;
+
+	for (i = 0; i < n; i++)
+		held += redis_reply_size(values[i]);
+
+	if (held == 0)
+		return;
+
+	/*
+	 * budget / (held / n), without the rounding of an integer average. n is
+	 * at most PREFETCH_WINDOW_MAX, so the product cannot overflow.
+	 */
+	cap = ((long long) PREFETCH_BYTE_BUDGET * n) / (long long) held;
+
+	if (cap < PREFETCH_WINDOW_MIN)
+		cap = PREFETCH_WINDOW_MIN;
+
+	if (festate->prefetch_window > cap)
+		festate->prefetch_window = cap;
+}
+
+/*
  * redis_free_prefetch
  *		Release whatever value replies of the current batch are still held.
  */
@@ -2269,6 +2404,9 @@ redis_scan_reset_callback(void *arg)
  *		All replies are read before anything can raise an error, so none is
  *		left in the cached connection; if reading fails the connection is
  *		discarded instead.
+ *
+ *		The window quadruples here, before the fetch, and is then bounded by
+ *		the bytes of what arrived - see redis_bound_prefetch_window().
  */
 static void
 redis_prefetch_values(RedisFdwExecutionState *festate)
@@ -2322,6 +2460,12 @@ redis_prefetch_values(RedisFdwExecutionState *festate)
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
 				 errmsg("failed to get the values of the scanned keys: %s", err)));
 	}
+
+	/*
+	 * The window the ramp above chose counts keys. Now that the replies are
+	 * in and their size is known, bound the next one by bytes as well.
+	 */
+	redis_bound_prefetch_window(festate, values, n);
 }
 
 /*

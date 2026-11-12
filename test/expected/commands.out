@@ -231,6 +231,58 @@ select count(distinct key) from (select key from db15_fl limit 6) s;
 cmdstat_get:calls=21
 delete from db15_fl;
 drop foreign table db15_fl;
+-- The window is bounded by the bytes it holds as well as by the number of
+-- keys, so a scan over large values does not hold a thousand of them at once.
+-- Issue #83.
+--
+-- The ramp above counts keys and ignores their size. 1,024 keys is nothing
+-- for scalar values of a few bytes and gigabytes for collections of a few MB,
+-- none of it charged to work_mem or visible in EXPLAIN. The window now also
+-- stops growing once the bytes measured in the previous window say the next
+-- one would exceed a budget, and narrows again if the values get larger.
+--
+-- Values of 3 MB are far enough above the budget that the window cannot hold
+-- two of them, so it stays at one key -- and that is what makes this stable
+-- enough to assert in expected output. The counts below depend only on the
+-- budget and the value size, and 3 MB is nowhere near the boundary at which
+-- the cap would come out as 2 rather than 1: the per-reply overhead the
+-- measurement adds, which is the only part that varies with the platform and
+-- the hiredis version, is a few dozen bytes against a margin of a megabyte.
+-- An assertion pinned to a window of, say, 3 keys would not survive that.
+--
+-- Exact call counts again, with the same caveat as the LIMIT block above: INFO
+-- commandstats is server-wide.
+create foreign table db15_bv(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'bv_');
+-- 15 MB of values, seeded server-side in one round trip rather than pushed
+-- through five INSERTs. The quoted argument is a Lua program run by Redis;
+-- see test/README.md.
+\! redis-cli -n 15 eval "local v = string.rep('x', 3 * 1024 * 1024) for i = 1, 5 do redis.call('set', 'bv_' .. i, v) end return redis.call('dbsize')" 0
+5
+-- The rows are still right: every key, and every value whole. count(distinct
+-- key) and the aggregates over length(), rather than a dump of the rows, so a
+-- key SCAN mentioned twice cannot fail this. See test/README.md.
+select count(distinct key), min(length(value)), max(length(value)) from db15_bv;
+ count |   min   |   max   
+-------+---------+---------
+     5 | 3145728 | 3145728
+(1 row)
+
+\! redis-cli config resetstat > /dev/null
+-- Two rows, and at a window of one key that is two value commands. Before the
+-- window was bounded by bytes it was 1 + 4 = 5, which is the whole 15 MB held
+-- at once to answer a query that wanted two rows.
+select count(distinct key) from (select key from db15_bv limit 2) s;
+ count 
+-------
+     2
+(1 row)
+
+\! redis-cli info commandstats | grep -o '^cmdstat_get:calls=[0-9]*'
+cmdstat_get:calls=2
+delete from db15_bv;
+drop foreign table db15_bv;
 -- An insert asks Redis nothing before writing. A scalar row is a single
 -- SET ... NX, which refuses an existing key by itself, so the EXISTS that used
 -- to precede the SET to find out whether the key was there is gone.

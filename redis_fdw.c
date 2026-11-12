@@ -2686,12 +2686,19 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 	{
 		/*
 		 * Check the encoding of every string bound for a text-like column.
-		 * An array value column has been checked element by element.
+		 * An array value column has been checked element by element, and so
+		 * have the elements of a scores column built as an array literal -
+		 * and Redis formats a zset score itself, so it has no byte an
+		 * encoding could reject - but the literal is what reaches the
+		 * column, so check what is stored rather than resting on either.
 		 */
 		if (festate->val_types[0] != REDIS_VAL_BYTEA)
 			redis_verify_text(key);
 		if (data != NULL && !has_bytea && !has_array)
 			redis_verify_text(data);
+		if (scores != NULL && festate->natts >= 3 &&
+			festate->val_types[2] != REDIS_VAL_BYTEA)
+			redis_verify_text(scores);
 
 		if (has_bytea || has_array || festate->with_scores)
 		{
@@ -3257,6 +3264,16 @@ redisGetQual(Node *node, TupleDesc tupdesc, PlanState *planstate,
  *		append_quoted_array_element() and process_redis_array(); this applies
  *		it to the scalar key and value as well. Values that are not text
  *		belong in a bytea column, which keeps the bytes as they are.
+ *
+ *		The length is strlen(str), not the length Redis reported, because
+ *		that is the length the callers of this store: CStringGetTextDatum()
+ *		and the type input functions both stop at the first NUL byte, so a
+ *		value holding one is stored truncated there, and the check has to
+ *		cover what is stored rather than what was read. The two array call
+ *		sites keep calling pg_verifymbstr() directly for the same reason read
+ *		the other way round: cstring_to_text_with_len() stores the full
+ *		Redis-reported length, NUL bytes and all, so all of it has to be
+ *		verified and this helper would check too little.
  */
 static inline void
 redis_verify_text(const char *str)

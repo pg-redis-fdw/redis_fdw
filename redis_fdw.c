@@ -2715,8 +2715,15 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 			 * BuildTupleFromCStrings branch below already converts it with
 			 * that function. Do the same here: a text datum stored in, say,
 			 * an integer column would be read as the pointer it holds.
+			 *
+			 * A text-like column carrying a typmod - varchar(n), char(n) -
+			 * goes through the input function too, because
+			 * CStringGetTextDatum() ignores the typmod: it stored an
+			 * over-long varchar(n) key as it stood, where the branch below
+			 * refuses it, and left a char(n) key unpadded.
 			 */
-			if (festate->val_types[0] == REDIS_VAL_TEXT)
+			if (festate->val_types[0] == REDIS_VAL_TEXT &&
+				festate->attinmeta->atttypmods[0] == -1)
 				datums[0] = CStringGetTextDatum(key);
 			else
 				datums[0] = InputFunctionCall(&festate->attinmeta->attinfuncs[0],
@@ -2746,10 +2753,20 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 			else
 			{
 				/*
-				 * with_scores can reach here with a scalar text members
-				 * column, which must not be built as a bytea.
+				 * with_scores can reach here with a scalar members column,
+				 * which must not be built as a bytea. Nothing requires that
+				 * column to be text either, so convert it the way column 0
+				 * above is converted rather than handing an integer or
+				 * numeric column a text datum to read as a pointer.
 				 */
-				datums[1] = CStringGetTextDatum(data);
+				if (festate->val_types[1] == REDIS_VAL_TEXT &&
+					festate->attinmeta->atttypmods[1] == -1)
+					datums[1] = CStringGetTextDatum(data);
+				else
+					datums[1] = InputFunctionCall(&festate->attinmeta->attinfuncs[1],
+												  data,
+												  festate->attinmeta->attioparams[1],
+												  festate->attinmeta->atttypmods[1]);
 			}
 
 			/* Column 2: scores, when the table declares one */
@@ -2765,7 +2782,20 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 				else if (scores == NULL)
 					nulls[2] = true;
 				else
-					datums[2] = CStringGetTextDatum(scores);
+				{
+					/*
+					 * A scalar scores column is no more required to be text
+					 * than column 1 is, and was type-blind the same way.
+					 */
+					if (festate->val_types[2] == REDIS_VAL_TEXT &&
+						festate->attinmeta->atttypmods[2] == -1)
+						datums[2] = CStringGetTextDatum(scores);
+					else
+						datums[2] = InputFunctionCall(&festate->attinmeta->attinfuncs[2],
+													  scores,
+													  festate->attinmeta->attioparams[2],
+													  festate->attinmeta->atttypmods[2]);
+				}
 			}
 
 			tuple = heap_form_tuple(festate->tupdesc, datums, nulls);

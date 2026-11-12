@@ -431,6 +431,34 @@ delete from db15_ssc;
 
 drop foreign table db15_ssc;
 
+-- Nothing requires either of those two columns to be text, so both reach the
+-- same heap_form_tuple branch the key does and were built the same type-blind
+-- way: CStringGetTextDatum() whatever the declared type, which is issue #65's
+-- pointer-as-value one and two columns over. What arrives at a scalar members
+-- or scores column is a PostgreSQL array literal, never a bare number, so the
+-- only right answer for a numeric or integer one is for that type's input
+-- function to refuse it -- which is already what the two-column form of the
+-- same table does. The literal is in the message, and no pointer is.
+
+\! redis-cli -n 15 zadd nsc_z 11 m1 22 m2 > /dev/null
+
+create foreign table db15_nsc_members(key text, value integer, scores text)
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'nsc_');
+
+select * from db15_nsc_members; -- error: members is not text
+
+create foreign table db15_nsc_scores(key text, value text, scores numeric)
+       server localredis
+       options (database '15', tabletype 'zset', tablekeyprefix 'nsc_');
+
+select * from db15_nsc_scores; -- error: scores is not text
+
+drop foreign table db15_nsc_members;
+drop foreign table db15_nsc_scores;
+
+\! redis-cli -n 15 del nsc_z > /dev/null
+
 -- infinite scores round-trip both ways. numeric has accepted inf since PG 14,
 -- and Redis accepts PostgreSQL's Infinity rendering back again.
 

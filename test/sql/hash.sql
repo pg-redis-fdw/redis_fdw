@@ -272,5 +272,55 @@ select * from db15_ins_hash;
 drop foreign table db15_ins_hash;
 
 
+-- A key column of a type other than text is converted with that type's input
+-- function on every scan path, including the heap_form_tuple one an array
+-- value column takes. That path built column 0 with CStringGetTextDatum()
+-- whatever the column's declared type, so an integer key column read the text
+-- datum's pointer as its value: issue #65 saw 569145120 on one run and
+-- 2103024504 on the next. The number is an address and so varies per run,
+-- which is why nothing below names one. Each key is stored as its own value
+-- instead, so the assertion is that the two agree, and a failure prints
+-- whatever pointer turned up. A hash table is the shape the issue reported.
+
+\! redis-cli -n 15 hset 10001 k 10001 > /dev/null
+\! redis-cli -n 15 hset 10002 k 10002 > /dev/null
+\! redis-cli -n 15 sadd ikeys 10001 10002 > /dev/null
+
+create foreign table db15_intkey(key integer, value text[])
+       server localredis
+       options (database '15', tabletype 'hash', tablekeyset 'ikeys');
+
+-- read in full. count(distinct key), not count(*), per test/README.md
+select count(distinct key) as keys,
+       count(distinct key) filter (where value = array['k', key::text])
+           as keys_matching_their_value
+from db15_intkey;
+
+-- and by key, which the pointer also broke: the qual is pushed down as the
+-- key's text, the row comes back, and then the recheck compares 10002 with
+-- whatever the pointer happened to be
+select key, value from db15_intkey where key = 10001;
+select key, value from db15_intkey where key = 10002;
+
+drop foreign table db15_intkey;
+
+-- A text-like key column carrying a typmod -- varchar(n), char(n) -- goes
+-- through the input function for the same reason, since CStringGetTextDatum()
+-- ignores the typmod: an over-long varchar(n) key used to be stored as it
+-- stood on this path while the BuildTupleFromCStrings path beside it refused
+-- it, and a char(n) key came back unpadded. Pre-existing, and the same single
+-- dispatch covers it.
+
+create foreign table db15_vckey(key varchar(3), value text[])
+       server localredis
+       options (database '15', tabletype 'hash', tablekeyset 'ikeys');
+
+select * from db15_vckey; -- error: the keys are five characters
+
+drop foreign table db15_vckey;
+
+\! redis-cli -n 15 del 10001 10002 ikeys > /dev/null
+
+
 \i test/common/epilogue.sql
 

@@ -170,4 +170,112 @@ delete from db15_fl;
 
 drop foreign table db15_fl;
 
+-- An insert asks Redis nothing before writing. A scalar row is a single
+-- SET ... NX, which refuses an existing key by itself, so the EXISTS that used
+-- to precede the SET to find out whether the key was there is gone.
+--
+-- Absence again, and for the same reason as the SCAN assertion at the top of
+-- this module: the grep drops the call counts, so another client on this
+-- server cannot break it, and EXISTS appearing at all means a round trip was
+-- spent asking a question the write itself answers.
+
+create foreign table db15_ins(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'ins_');
+
+\! redis-cli config resetstat > /dev/null
+
+insert into db15_ins values ('ins_1', 'one'), ('ins_2', 'two');
+
+\! redis-cli info commandstats | grep -o -E '^cmdstat_(set|exists)' | sort
+
+-- NX refuses the second write, and the error is the one the EXISTS check used
+-- to raise, with the value it left in place
+insert into db15_ins values ('ins_1', 'again');
+
+select value from db15_ins where key = 'ins_1';
+
+delete from db15_ins;
+
+drop foreign table db15_ins;
+
+-- batch_size sends that many rows' SET ... NX in one pipelined round trip.
+-- What is asserted here is the rows that arrive, not a round-trip count:
+-- commandstats counts commands, and a batch of 1000 is still 1000 SETs, so
+-- the counters cannot tell the two paths apart. The last row of each batch is
+-- read back by key, since an off-by-one in the batching would lose exactly
+-- those: 2500 rows is two full batches of 1000 and a short one of 500.
+
+create foreign table db15_bins(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'bins_', batch_size '1000');
+
+insert into db15_bins select 'bins_' || g, 'v' || g from generate_series(1, 2500) g;
+
+-- count(distinct key): a 2500-key insert makes a hash-table resize likely, and
+-- a resized SCAN may mention a key twice. See test/README.md.
+select count(distinct key) from db15_bins;
+
+select value from db15_bins where key = 'bins_1000';
+select value from db15_bins where key = 'bins_2000';
+select value from db15_bins where key = 'bins_2500';
+
+-- A key already in Redis fails the statement, and the rest of the batch stays
+-- written: Redis has no rollback, and a batch widens the window in which that
+-- shows. The five new keys are all there, and the duplicate's existing value
+-- is untouched. See README.md.
+insert into db15_bins select 'bins_x' || g, 'v' || g from generate_series(1, 5) g
+  union all select 'bins_7', 'dup';
+
+select count(distinct key) from db15_bins where key like 'bins_x%';
+
+select value from db15_bins where key = 'bins_7';
+
+drop foreign table db15_bins;
+
+-- 2505 keys, deleted in one server-side pass rather than one round trip each.
+-- The quoted argument is a Lua program run by Redis; see test/README.md.
+\! redis-cli -n 15 eval "local n=0 for _,k in ipairs(redis.call('keys','bins_*')) do redis.call('del',k) n=n+1 end return n" 0
+
+-- batch_size on a table whose insert cannot be batched must be inert, not
+-- half-applied: every row still has to arrive, exactly once, with the value it
+-- was given.
+--
+-- Two cases the batch-size callback declines to batch. RETURNING is the one
+-- postgres_fdw declines for, and this FDW refuses it outright a step earlier,
+-- when the modify is planned -- so the callback's RETURNING check can never
+-- fire here and the option cannot make RETURNING any more or less supported
+-- than it was. A row trigger is the reachable case: it needs each row as it is
+-- inserted, so the rows go one at a time however large the table's batch_size
+-- is.
+
+create foreign table db15_rins(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'rins_', batch_size '100');
+
+insert into db15_rins values ('rins_1', 'one') returning key, value;
+
+create function rins_note() returns trigger language plpgsql as $$
+begin
+  raise notice 'before insert of %', new.key;
+  return new;
+end $$;
+
+create trigger rins_trg before insert on db15_rins
+  for each row execute function rins_note();
+
+insert into db15_rins values ('rins_1', 'one'), ('rins_2', 'two'), ('rins_3', 'three');
+
+select value from db15_rins where key = 'rins_2';
+
+select count(distinct key) from db15_rins;
+
+drop trigger rins_trg on db15_rins;
+
+delete from db15_rins;
+
+drop function rins_note();
+
+drop foreign table db15_rins;
+
 \i test/common/epilogue.sql

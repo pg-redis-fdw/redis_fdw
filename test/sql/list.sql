@@ -180,6 +180,31 @@ delete from db15_bytea_key_ns where key = E'anything'::bytea; -- bytea key error
 
 drop foreign table db15_bytea_key_ns;
 
+-- A list row is written with one variadic RPUSH rather than one RPUSH per
+-- element. RPUSH appends, so the elements must come back in the order they
+-- were given, including a repeat -- which a list keeps and a set would not.
+-- This is the assertion a reordering inside the variadic argument vector
+-- would fail and nothing else in this suite would catch.
+
+create foreign table db15_ins_list(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'list', tablekeyprefix 'insl_');
+
+insert into db15_ins_list values ('insl_1', '{c,a,b,a}');
+
+select key, val from db15_ins_list where key = 'insl_1';
+
+-- a key that is already there is refused, and the list it holds is untouched
+insert into db15_ins_list values ('insl_1', '{d}');
+
+select key, val from db15_ins_list where key = 'insl_1';
+
+delete from db15_ins_list;
+
+select * from db15_ins_list;
+
+drop foreign table db15_ins_list;
+
 
 \i test/common/epilogue.sql
 

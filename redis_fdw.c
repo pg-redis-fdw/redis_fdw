@@ -90,6 +90,35 @@ PG_MODULE_MAGIC;
 #define PROCID_TEXTEQ 67
 
 /*
+ * The largest batch_size this FDW will accept.
+ *
+ * The constraint is not Redis's: a batch is one SET per row, and the protocol
+ * limit of 1024*1024 arguments applies to a single command, not to how many
+ * commands a pipeline may hold. The constraint is what the executor spends on
+ * a batch before it knows how many rows the statement has. For every INSERT
+ * against a table that batches, nodeModifyTable.c allocates two arrays of
+ * ri_BatchSize tuple-slot pointers as soon as the first row arrives, however
+ * few rows follow: batch_size 100000000 is 1.6GB of address space for a
+ * one-row insert, and anything from MaxAllocSize/8 (134217728) up asks palloc
+ * for more than it will give, failing with "invalid memory alloc request
+ * size" - an error naming neither batch_size nor the statement that set it.
+ *
+ * 10000 is chosen for what a pipelined round trip can usefully carry rather
+ * than for what fits: the gain over 1000 is already within measurement noise,
+ * while the cost scales linearly in the slot arrays, in hiredis's output
+ * buffer, which holds the whole batch before any of it is flushed, and in the
+ * replies, which are all materialized before any is examined. At the bound
+ * that is 160kB of slot pointers per INSERT statement.
+ *
+ * postgres_fdw clamps instead of rejecting, at PQ_QUERY_PARAM_MAX_LIMIT
+ * divided by the parameters per row, because its limit is a protocol limit on
+ * bind parameters it discovers only once it knows the row shape. This FDW's
+ * limit is a constant, so it can be checked when the option is set, which
+ * complains at CREATE/ALTER time rather than on somebody's first insert.
+ */
+#define REDIS_MAX_BATCH_SIZE 10000
+
+/*
  * Describes the valid options for objects that use this wrapper.
  */
 struct RedisFdwOption
@@ -1043,6 +1072,13 @@ redis_fdw_validator(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("\"batch_size\" must be a positive integer: %s", val)));
+
+			/* see REDIS_MAX_BATCH_SIZE for why there is an upper bound */
+			if (n > REDIS_MAX_BATCH_SIZE)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("\"batch_size\" must not exceed %d: %s",
+								REDIS_MAX_BATCH_SIZE, val)));
 		}
 
 		if (strcmp(def->defname, "address") == 0)
@@ -4815,7 +4851,8 @@ redis_parse_ewkt_point(const char *text,
  *		How many rows redisExecForeignBatchInsert may be given at once: the
  *		batch_size option for a plain scalar table, which is a SET ... NX per
  *		row; 1, so that rows go one by one, for every other table, and when
- *		RETURNING or a row trigger needs each row as it is inserted.
+ *		RETURNING, a WITH CHECK OPTION or a row trigger needs each row as it is
+ *		inserted.
  */
 static int
 redisGetForeignModifyBatchSize(ResultRelInfo *rinfo)
@@ -4829,13 +4866,37 @@ redisGetForeignModifyBatchSize(ResultRelInfo *rinfo)
 		fmstate->array_elem_type != InvalidOid)
 		return 1;
 
+	/*
+	 * ri_WithCheckOptions is an INSERT through an auto-updatable view declared
+	 * WITH CHECK OPTION, and postgres_fdw declines to batch for it as well.
+	 * Core runs ExecWithCheckOptions per row of a batch only after the whole
+	 * batch has been handed to the FDW, so batching would make a violating row
+	 * reject the statement with the rest of its batch already written to
+	 * Redis, which has no rollback. One row at a time the violation is found
+	 * before that row is written. The rows before it are still written either
+	 * way - see README.md - but there is no reason to widen that window when
+	 * an unbatched insert is all a view with a check option costs.
+	 *
+	 * ri_projectReturning cannot be set here: redisPlanForeignModify rejects
+	 * RETURNING outright. It is checked anyway, so that supporting RETURNING
+	 * later cannot silently start batching rows whose values core needs back
+	 * one at a time.
+	 */
 	if (rinfo->ri_projectReturning ||
+		rinfo->ri_WithCheckOptions != NIL ||
 		(rinfo->ri_TrigDesc &&
 		 (rinfo->ri_TrigDesc->trig_insert_before_row ||
 		  rinfo->ri_TrigDesc->trig_insert_after_row)))
 		return 1;
 
-	return fmstate->batch_size;
+	/*
+	 * The option validator rejects anything over REDIS_MAX_BATCH_SIZE, so this
+	 * is a backstop rather than the check: option strings are stored in the
+	 * catalogs unvalidated once accepted, so a table created by a build with a
+	 * higher bound - or none - keeps its value across an upgrade and would
+	 * reach the executor here.
+	 */
+	return Min(fmstate->batch_size, REDIS_MAX_BATCH_SIZE);
 }
 
 /*

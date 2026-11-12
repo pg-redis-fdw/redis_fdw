@@ -291,6 +291,87 @@ delete from db15_bytea_scalar_ns;
 
 select * from db15_bytea_scalar_ns;
 
+-- Bytes that are not valid in the database encoding must not reach a text
+-- column. Array elements were always checked, but the scalar key and value
+-- became text through CStringGetTextDatum() or BuildTupleFromCStrings(),
+-- neither of which checks, so the bytes landed in a text column -- and
+-- anything that copied them into a table stored them, leaving a table no
+-- pg_dump of it can restore. Issue #66.
+--
+-- One key, read three ways. Through a prefixed table, where the value fills
+-- column 1 of the scan that serves tables of many keys; through a singleton
+-- table, where it fills column 0 of the other scan function altogether; and
+-- through a bytea column, which is where bytes that are not text belong and
+-- which must still hand them back untouched.
+--
+-- Whether the first two are an error depends on the database encoding, and
+-- there is one expected file for every encoding this suite may run under.
+-- pg_verifymbstr() rejects these bytes under UTF8 and accepts every byte
+-- under SQL_ASCII, which has no invalid ones; both are right. So each read is
+-- compared against what its own encoding demands and only the verdict is
+-- printed, the same verdict either way. The message cannot be printed: it
+-- names UTF8, and a SQL_ASCII run has no message at all. It is asserted
+-- inside the procedure instead, where a changed one still fails. The bytea
+-- read needs none of this and is asserted directly, in hex, which reads the
+-- same under every encoding.
+
+\! printf '\206\244name' | redis-cli -n 15 -x set enc_1 > /dev/null
+
+create foreign table db15_enc(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'enc_');
+
+create foreign table db15_enc_single(value text)
+       server localredis
+       options (database '15', singleton_key 'enc_1');
+
+create foreign table db15_enc_bytea(key text, value bytea)
+       server localredis
+       options (database '15', tablekeyprefix 'enc_');
+
+-- Only character_not_in_repertoire is caught: any other error is this
+-- procedure failing to test what it claims, and is better seen than
+-- swallowed.
+create procedure enc_case(q text) language plpgsql as $$
+declare
+  must_reject boolean := current_setting('server_encoding') = 'UTF8';
+  msg         text := null;
+begin
+  begin
+    execute q;
+  exception when character_not_in_repertoire then
+    msg := sqlerrm;
+  end;
+
+  if (msg is not null) <> must_reject then
+    raise notice 'FAILED: % under server_encoding %',
+      case when msg is null then 'accepted' else 'rejected' end,
+      current_setting('server_encoding');
+  elsif must_reject and
+        msg <> 'invalid byte sequence for encoding "UTF8": 0x86' then
+    raise notice 'FAILED: rejected with an unexpected message: %', msg;
+  else
+    raise notice 'as the database encoding requires';
+  end if;
+end $$;
+
+-- key = <value>, so neither read enumerates the keyspace
+call enc_case($q$select value from db15_enc where key = 'enc_1'$q$);
+
+call enc_case($q$select value from db15_enc_single$q$);
+
+select key, encode(value, 'hex') from db15_enc_bytea where key = 'enc_1';
+
+drop procedure enc_case(text);
+
+drop foreign table db15_enc;
+drop foreign table db15_enc_single;
+drop foreign table db15_enc_bytea;
+
+-- seeded with redis-cli because of the bytes it holds, and only ever read, so
+-- it goes the way it was made
+\! redis-cli -n 15 del enc_1 > /dev/null
+
 
 \i test/common/epilogue.sql
 

@@ -311,6 +311,40 @@ delete from db15_scskip;
 -- goes the way it was made
 \! redis-cli -n 15 del scskip_h > /dev/null
 drop foreign table db15_scskip;
+-- the other reply a scan has to skip: the nil it gets for a key it was handed
+-- that is not there. A tablekeyset makes that deterministic, which the race it
+-- stands for -- a key deleted between the SCAN and the GET -- is not: the
+-- keyset names the table's keys, so a member with no key behind it answers
+-- exactly the same nil, with no timing to arrange. The scan must skip it and
+-- read the rest; raising here would make an ordinary deletion fatal to any
+-- scan running at the time.
+\! redis-cli -n 15 sadd scnil_kset scnil_a scnil_b scnil_gone > /dev/null
+\! redis-cli -n 15 set scnil_a one > /dev/null
+\! redis-cli -n 15 set scnil_b two > /dev/null
+create foreign table db15_scnil(key text, val text)
+       server localredis
+       options (database '15', tablekeyset 'scnil_kset');
+-- distinct, because this dumps every row of a keyset scan: SSCAN promises only
+-- that a member is mentioned at least once. See test/README.md.
+select distinct key, val from db15_scnil order by key;
+   key   | val 
+---------+-----
+ scnil_a | one
+ scnil_b | two
+(2 rows)
+
+-- and a pushed-down key with nothing behind it is no rows, not an error: that
+-- reply does not go round the skip loop at all, so it is classified separately
+select val from db15_scnil where key = 'scnil_gone';
+ val 
+-----
+(0 rows)
+
+delete from db15_scnil;
+-- the scan skipped the member with no key, so the DELETE could not take it,
+-- and it is all that is left of the keyset: it goes the way it was made
+\! redis-cli -n 15 del scnil_kset > /dev/null
+drop foreign table db15_scnil;
 -- a name-typed key column round-trips correctly
 create foreign table db15_nametest(key name, val text)
        server localredis

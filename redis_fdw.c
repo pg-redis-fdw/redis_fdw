@@ -390,6 +390,8 @@ static bool redis_key_restricted(RelOptInfo *baserel, Oid foreigntableid);
 static int	redis_append_value_command(RedisFdwExecutionState *festate,
 									   const char *key, size_t key_len);
 static void redis_prefetch_values(RedisFdwExecutionState *festate);
+static bool redis_value_reply_skippable(redisReply *reply);
+static void redis_check_value_reply(redisReply *reply, const char *key);
 static void redis_free_prefetch(RedisFdwExecutionState *festate);
 static void redis_scan_reset_callback(void *arg);
 
@@ -2031,6 +2033,102 @@ redis_append_value_command(RedisFdwExecutionState *festate,
 }
 
 /*
+ * redis_value_reply_skippable
+ *		True if a reply to one of the value commands means "no row here" rather
+ *		than a failure, so the scan should move on to the next key.
+ *
+ *		Exactly two replies qualify:
+ *
+ *		nil - the key is not there. It was listed by a SCAN, an SSCAN or a
+ *		keyset and has been deleted since, or the keyset names a key that was
+ *		never created. An ordinary deletion must not be fatal to a scan that
+ *		happens to be running.
+ *
+ *		WRONGTYPE - the key holds a value of another Redis type. A
+ *		tablekeyprefix is a prefix, not a type filter, so a database with a
+ *		hash and a string under one prefix is normal and this FDW deliberately
+ *		tolerates it: scalar.sql and joins_and_cursors.sql both depend on it.
+ *
+ *		Everything else is a failure and belongs to redis_check_value_reply:
+ *		NOPERM, LOADING, MASTERDOWN, BUSY, CLUSTERDOWN and whatever Redis adds
+ *		next. Skipping those reported the whole table as empty - no error, no
+ *		warning - which was issue #84.
+ *
+ *		MATCHING THE MESSAGE IS DELIBERATE AND IS NOT A MISTAKE TO BE TIDIED
+ *		AWAY. RESP2 offers no numeric error code: the first word of the message
+ *		is the code, and it is the only thing that distinguishes one error reply
+ *		from another. That first word *is* part of the protocol contract; the
+ *		human-readable remainder is not, so only the word is compared, and it
+ *		is required to end at a space or at the end of the string so that a
+ *		future WRONGTYPESOMETHING is not mistaken for it.
+ *
+ *		A status reply used to be skipped here too, and is not any more. None
+ *		of the value commands - GET, HGETALL, LRANGE, SMEMBERS, ZRANGE - can
+ *		answer with one: under RESP2 a status reply to any of them could only
+ *		arrive on a connection whose replies had got out of step with its
+ *		commands, as a stray +OK from AUTH or SELECT, or a +QUEUED from a MULTI
+ *		this FDW never sends. That is a desynchronised connection, not an
+ *		absent row, and silently returning no row for it is the same bug in a
+ *		different costume - so it now raises as an unexpected reply type. It
+ *		was never a case anyone had met: it arrived with the error case in
+ *		0167fb9 (2011), under "avoid barfing on other datatypes".
+ */
+static bool
+redis_value_reply_skippable(redisReply *reply)
+{
+	static const char wrongtype[] = "WRONGTYPE";
+	const size_t codelen = sizeof(wrongtype) - 1;
+
+	if (reply->type == REDIS_REPLY_NIL)
+		return true;
+
+	if (reply->type == REDIS_REPLY_ERROR && reply->str != NULL &&
+		strncmp(reply->str, wrongtype, codelen) == 0 &&
+		(reply->str[codelen] == '\0' || reply->str[codelen] == ' '))
+		return true;
+
+	return false;
+}
+
+/*
+ * redis_check_value_reply
+ *		Raise for a reply to a value command that is neither a value nor one of
+ *		the two skippable replies above. Returns normally for a usable value.
+ *
+ *		Callers hold the reply after taking it out of the prefetch window, so
+ *		it is freed here before raising: nothing else points to it - the window
+ *		slot was cleared - so the scan's memory-context reset callback will not
+ *		free it again, and the rest of the window, which that callback does
+ *		own, is left for it.
+ *
+ *		The connection is deliberately not discarded, for the reason
+ *		check_reply() does not discard it either: Redis refused or mishandled
+ *		one command, the socket is still good, every reply of the window has
+ *		already been read off it, and the connection cache owns it.
+ */
+static void
+redis_check_value_reply(redisReply *reply, const char *key)
+{
+	char	   *err;
+
+	if (reply->type == REDIS_REPLY_INTEGER ||
+		reply->type == REDIS_REPLY_STRING ||
+		reply->type == REDIS_REPLY_ARRAY)
+		return;
+
+	if (reply->type == REDIS_REPLY_ERROR)
+		err = pstrdup(reply->str != NULL ? reply->str : "(no message)");
+	else
+		err = psprintf("unexpected reply type %d", reply->type);
+
+	freeReplyObject(reply);
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+			 errmsg("failed to get the value for key \"%s\": %s", key, err)));
+}
+
+/*
  * redis_free_prefetch
  *		Release whatever value replies of the current batch are still held.
  */
@@ -2612,11 +2710,25 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 
 				festate->row++;
 
-			} while ((reply->type == REDIS_REPLY_NIL ||
-					  reply->type == REDIS_REPLY_STATUS ||
-					  reply->type == REDIS_REPLY_ERROR) &&
+			} while (redis_value_reply_skippable(reply) &&
 					 festate->qual_value == NULL &&
 					 festate->row < festate->reply->elements);
+
+			/*
+			 * The loop above stops on the first reply it cannot skip, which is
+			 * either a value or a failure; it also stops at the end of the
+			 * batch, still holding a skippable reply, and that one is not a
+			 * failure and must not be reported as one. Anything else has to be
+			 * raised here rather than left to fall through the switch below as
+			 * a row that was never found: that is how a refused value command
+			 * came to end a scan silently (issue #84).
+			 *
+			 * This is the only classification point for a pushed-down key as
+			 * well. Its single reply makes the loop's second test false, so it
+			 * goes round once whatever came back - the skip loop never sees it.
+			 */
+			if (!redis_value_reply_skippable(reply))
+				redis_check_value_reply(reply, key);
 
 			if (festate->qual_value != NULL || festate->row <= festate->reply->elements)
 			{

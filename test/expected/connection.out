@@ -250,6 +250,32 @@ exception when others then
 end
 $$;
 NOTICE:  authentication refused as expected
+-- A value command the server refuses must raise, not read as an empty table.
+-- This is issue #84, and the ACL user above is what makes it testable: the
+-- same user, re-provisioned with SCAN permitted and GET denied, finds every
+-- key and can read no value. Each refused reply used to be skipped like the
+-- nil of a key deleted under the scan, so the table read as empty -- no error,
+-- no warning, a wrong answer indistinguishable from an empty database.
+--
+-- Both shapes have to raise, because they reach the reply by different routes:
+-- a full scan, which skips a reply and moves to the next key, and a
+-- pushed-down key, whose one value reply never goes round the skip loop at
+-- all. The second query also proves the first left the cached connection
+-- usable: the error does not discard it, so a desynchronised connection would
+-- show up here rather than in whatever ran next.
+--
+-- SQLSTATE only: the text is Redis's own NOPERM wording, which is not a
+-- contract and not ours to pin. That an error is raised at all is the
+-- assertion. "reset" for the same reason as above -- a plain SETUSER would
+-- merge "-get" into the existing rules, which happens to be what we want here,
+-- but only because +@all was granted by the line this one mirrors.
+\! redis-cli ACL SETUSER fdwtest reset on '>secret' '~*' '+@all' '-get' > /dev/null
+\set VERBOSITY sqlstate
+select key, value from db15_acl;
+ERROR:  HV00L
+select value from db15_acl where key = 'acltest_k';
+ERROR:  HV00L
+\set VERBOSITY default
 drop foreign table db15_acl;
 drop foreign table db15_aclbad;
 drop server aclsrv cascade;

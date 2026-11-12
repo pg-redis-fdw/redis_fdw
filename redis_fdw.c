@@ -2718,6 +2718,24 @@ redisReScanForeignScan(ForeignScanState *node)
  *		any row: it refers to a column, to a parameter that can change between
  *		rescans (PARAM_EXEC, as a nested loop supplies), or to a subquery.
  *		Walker for expression_tree_walker.
+ *
+ *		This list is allow-by-default: a node type named below is refused, and
+ *		anything else is accepted if nothing in its subtree is refused. That is
+ *		only tolerable because expression_tree_walker() ends in an elog() for a
+ *		node type it does not recognize, so a new one fails closed rather than
+ *		being waved through -- and because the whole right-hand side is
+ *		initialized and evaluated as one unit, so a node that is meaningful
+ *		only relative to its parent (CaseTestExpr, say) always has its parent.
+ *
+ *		Aggref, GroupingFunc and WindowFunc are refused outright rather than
+ *		left to the walk over their arguments, which would accept a
+ *		row-independent count(*). Reaching here with one looks impossible --
+ *		the parser bars aggregates and window functions from WHERE, a HAVING
+ *		qual belongs to the Agg node, and an outer-level Aggref in a sublink
+ *		becomes a PARAM_EXEC -- but this function is the entire safety
+ *		argument for the pushdown, and it should read as a closed list rather
+ *		than as one that happens to be complete because of facts proved
+ *		elsewhere in the backend.
  */
 static bool
 redis_depends_on_row(Node *node, void *context)
@@ -2729,6 +2747,8 @@ redis_depends_on_row(Node *node, void *context)
 	if (IsA(node, Param))
 		return ((Param *) node)->paramkind != PARAM_EXTERN;
 	if (IsA(node, SubPlan) || IsA(node, AlternativeSubPlan) || IsA(node, SubLink))
+		return true;
+	if (IsA(node, Aggref) || IsA(node, GroupingFunc) || IsA(node, WindowFunc))
 		return true;
 	return expression_tree_walker(node, redis_depends_on_row, context);
 }
@@ -2742,9 +2762,22 @@ redis_depends_on_row(Node *node, void *context)
  *		expression that redis_depends_on_row() accepts and that is not
  *		volatile - an external parameter, as a prepared statement's generic
  *		plan or a PL/pgSQL variable supplies, or an expression over
- *		parameters and constants. Such a value is fixed for the whole scan,
- *		so it is computed here, once. The qual also stays in the plan as a
- *		filter, so pushing it down only narrows what is fetched.
+ *		parameters and constants.
+ *
+ *		What makes that safe is that such a value is provably the same for
+ *		every row the scan could return, so the one lookup made with it
+ *		fetches exactly the rows the qual would have accepted. It is computed
+ *		here, once, for that reason and no other.
+ *
+ *		The qual does also stay in the plan as a filter, but do not mistake
+ *		that for the safety argument: a filter can only discard rows that
+ *		were fetched, so it removes false positives and can do nothing
+ *		whatever about a row the narrowed lookup never asked Redis for.
+ *		Pushing a key down is exactly the direction in which rows go missing,
+ *		and the filter would simply agree that the rows it never saw are
+ *		absent. redis_depends_on_row() is therefore load-bearing for
+ *		correctness on its own, and anything that widens what it accepts has
+ *		to be judged on that basis.
  */
 static void
 redisGetQual(Node *node, TupleDesc tupdesc, PlanState *planstate,

@@ -209,6 +209,30 @@ Three consequences that are easy to miss when editing one of these scripts:
   support, so nothing here depends on it, but do not copy the idiom somewhere
   that does.
 
+## Do not assert `count(*)` over a scanned table
+
+Use `count(distinct key)`. A non-singleton table — `tablekeyprefix`,
+`tablekeyset`, or neither — enumerates its keys with `SCAN` or `SSCAN`, and
+those promise only that a key present throughout the iteration is returned *at
+least* once. When the keyspace or the keyset is resized part-way through, some
+keys come back twice, and the FDW does not deduplicate, so each mention becomes
+a row.
+
+This is not hypothetical and it is not rare enough to ignore. A bulk insert or
+delete makes a resize likely, and `joins_and_cursors` does both: measured on
+Valkey 8.1.1, a 2,500-key prefix scan immediately after a 60,000-key delete
+returned 2,505 rows on 2 runs out of 8. The duplicates vary with the server's
+randomly seeded hash table, so the same test passes on one server instance and
+fails on the next — and the diff gives no hint of the cause.
+
+`count(distinct key)` asserts the thing the FDW actually owes you. How many
+times `SCAN` mentioned a key is Redis's business.
+
+The same applies to any assertion that dumps all the rows of a scanned table and
+compares them: an extra duplicate row will fail it. Prefer a `singleton_key`
+table or a `key = <value>` qual where the test allows, since neither enumerates
+keys at all.
+
 ## Generating expected output
 
 Create the expected file **empty** before the first run:

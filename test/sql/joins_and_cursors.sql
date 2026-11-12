@@ -58,11 +58,18 @@ insert into db15bigkeysetscalar
 select 'key_' || x::text, 'val ' || x::text
 from generate_series (10001, 20000) as x;
 
-select count(*) from   db15;
+-- count(distinct key), not count(*), on every one of these: SCAN and SSCAN
+-- promise only that a key present throughout the iteration is returned at
+-- *least* once, and they do return some of them twice when the keyspace or the
+-- keyset is resized mid-iteration -- which a bulk insert or delete makes likely,
+-- and this module does both. The FDW does not deduplicate (see the dedup issue),
+-- so count(*) counts how many times SCAN mentioned a key, which is not an
+-- invariant this suite owns. The number of distinct keys is.
+select count(distinct key) from   db15;
 
-select count(*) from db15bigprefixscalar;
+select count(distinct key) from db15bigprefixscalar;
 
-select count(*) from db15bigkeysetscalar;
+select count(distinct key) from db15bigkeysetscalar;
 
 -- UPDATE ... FROM / DELETE ... USING against a foreign table, including
 -- via a forced merge join on the key column. Regression test for:
@@ -129,8 +136,10 @@ create foreign table db15_scan_skip(key text, val text)
        options (database '15', tablekeyprefix 'rscs_');
 
 -- the 500 strings; the 500 hashes are correctly skipped, but skipping them
--- must not stop the scan
-select count(*) from db15_scan_skip;
+-- must not stop the scan. count(distinct key) for the reason given above the
+-- first count in this file: this is a prefix scan, so SCAN may mention a key
+-- more than once and count(*) would assert something it does not promise.
+select count(distinct key) from db15_scan_skip;
 
 drop foreign table db15_scan_skip;
 

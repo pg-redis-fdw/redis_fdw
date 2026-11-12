@@ -278,4 +278,41 @@ drop function rins_note();
 
 drop foreign table db15_rins;
 
+-- A cached connection is checked out without a round trip. The check that a
+-- cached connection is still usable polls its socket, with no wait; it was a
+-- PING, which cost a round trip on the first checkout in every transaction --
+-- in autocommit, before every statement. So no PING is sent at all.
+--
+-- The connection the two lookups below check out is the one the INSERT above
+-- them opened, and it is already in the cache by the time the counters are
+-- reset, so both lookups validate it. A PING from either is counted.
+--
+-- Absence again, in the same spirit as the SCAN assertion at the top of this
+-- module: the grep drops the call counts, so another client moving the
+-- counters cannot break this, and a cmdstat_ping line appearing at all means
+-- the round trip is back.
+
+create foreign table db15_ping(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'ping_');
+
+insert into db15_ping values ('ping_1', 'one');
+
+\! redis-cli config resetstat > /dev/null
+
+select value from db15_ping where key = 'ping_1';
+
+select value from db15_ping where key = 'ping_1';
+
+\! printf 'cmdstat_ping entries: '; redis-cli info commandstats | grep -c '^cmdstat_ping:'
+
+-- the fail-closed companion, exactly as for the SCAN assertion above, and the
+-- second INFO of this reset window for the same reason: a command is counted
+-- only once it has finished, so the first INFO cannot see itself.
+\! printf 'cmdstat_info entries: '; redis-cli info commandstats | grep -c '^cmdstat_info:'
+
+delete from db15_ping;
+
+drop foreign table db15_ping;
+
 \i test/common/epilogue.sql

@@ -400,6 +400,91 @@ cmdstat_ping entries: 0
 cmdstat_info entries: 1
 delete from db15_ping;
 drop foreign table db15_ping;
+-- A key lookup under a NONDETERMINISTIC collation must not be pushed down.
+-- Issue #82.
+--
+-- The pushdown sends the comparison value to Redis as a byte-exact key, but
+-- text equality under a nondeterministic collation is not byte-exact: two
+-- strings PostgreSQL calls equal can differ in bytes. So the one lookup asks
+-- for a key that does not exist and the row is never fetched -- and the qual
+-- retained as a filter cannot rescue it, because a filter discards rows that
+-- were fetched and cannot produce one that was never asked for. The fix is to
+-- refuse the pushdown and walk the keyspace instead, letting PostgreSQL's own
+-- equality decide.
+--
+-- This lives in the command-statistics module because it is a pushdown
+-- decision: what the fix changes is which commands the FDW sends, and the
+-- assertion that matters -- that an ordinary deterministic lookup still sends
+-- no SCAN -- needs this module's CONFIG RESETSTAT window and can live nowhere
+-- else. Keeping both halves here also keeps the ICU guard in one place.
+\! redis-cli -n 15 set nd_1 one > /dev/null
+-- A nondeterministic collation needs the ICU provider, which not every
+-- PostgreSQL build has. Guarded the way scalar.sql guards on server_encoding:
+-- a procedure printing one verdict line, because psql's \if echoes the lines
+-- of the branch it skips and they would diff anyway.
+--
+-- Only the CREATE COLLATION is allowed to fail quietly. Everything after it
+-- runs unguarded, so a real failure is seen rather than swallowed.
+create procedure nd_case() language plpgsql as $$
+declare
+  n int;
+begin
+  begin
+    execute $c$create collation nd_ci
+               (provider = icu, locale = 'und-u-ks-level2',
+                deterministic = false)$c$;
+  exception when others then
+    raise notice 'skipped: no ICU provider in this build (%)', sqlerrm;
+    return;
+  end;
+
+  execute $c$create foreign table db15_nd(key text collate nd_ci, value text)
+             server localredis
+             options (database '15', tablekeyprefix 'nd_')$c$;
+
+  -- 'ND_1' = 'nd_1' is true at this collation's strength, and md5() of the
+  -- two differs, so a byte-exact lookup for 'ND_1' finds nothing.
+  -- count(distinct key) rather than count(*): the refused pushdown means
+  -- this enumerates the keyspace. See test/README.md.
+  execute $c$select count(distinct key) from db15_nd where key = 'ND_1'$c$
+    into n;
+
+  if n = 1 then
+    raise notice 'nondeterministic collation: the row is returned';
+  else
+    raise notice 'FAILED: nondeterministic collation: % rows, not 1', n;
+  end if;
+
+  execute 'drop foreign table db15_nd';
+  execute 'drop collation nd_ci';
+end $$;
+call nd_case();
+NOTICE:  nondeterministic collation: the row is returned
+drop procedure nd_case();
+-- The other half, and the one that stops a regression: the check must refuse
+-- only an explicitly nondeterministic collation. The database default and
+-- InvalidOid are deterministic, so an ordinary key = <constant> lookup on an
+-- ordinary text column must still be pushed down and must still issue no
+-- SCAN. Absence assertion, for the reasons given at the top of this module.
+create foreign table db15_nd_det(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'nd_');
+\! redis-cli config resetstat > /dev/null
+select value from db15_nd_det where key = 'nd_1';
+ value 
+-------
+ one
+(1 row)
+
+\! printf 'cmdstat_scan entries: '; redis-cli info commandstats | grep -c '^cmdstat_scan:'
+cmdstat_scan entries: 0
+-- the fail-closed companion, and the second INFO of this reset window, for
+-- the reasons given at the top of this module
+\! printf 'cmdstat_info entries: '; redis-cli info commandstats | grep -c '^cmdstat_info:'
+cmdstat_info entries: 1
+drop foreign table db15_nd_det;
+-- seeded with redis-cli and only ever read, so it goes the way it was made
+\! redis-cli -n 15 del nd_1 > /dev/null
 \i test/common/epilogue.sql
 -- Shared epilogue for every redis_fdw test module: assert that the module left
 -- db 15 empty, so the next module starts from nothing and any module can run on

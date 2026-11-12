@@ -416,6 +416,7 @@ static void redisReScanForeignScan(ForeignScanState *node);
 static void redisEndForeignScan(ForeignScanState *node);
 static void redis_start_scan(RedisFdwExecutionState *festate);
 static bool redis_key_restricted(RelOptInfo *baserel, Oid foreigntableid);
+static bool redis_pushdown_collation_ok(Oid collid);
 static int	redis_append_value_command(RedisFdwExecutionState *festate,
 									   const char *key, size_t key_len);
 static void redis_prefetch_values(RedisFdwExecutionState *festate);
@@ -1694,9 +1695,52 @@ redisGetForeignRelSize(PlannerInfo *root,
 
 
 /*
+ * redis_pushdown_collation_ok
+ *		True if a key = <text value> comparison carrying this collation may be
+ *		pushed down to Redis as a single-key lookup.
+ *
+ *		Redis matches keys byte for byte, but PostgreSQL's text equality does
+ *		not: under a nondeterministic collation two strings that differ in
+ *		bytes can still be equal, and a case-insensitive ICU collation makes
+ *		'pd_1' = 'PD_1' true while md5() of the two differs. Pushing such a
+ *		comparison down asks Redis for whichever spelling the query happened
+ *		to use, so a row stored under the other one is never fetched at all.
+ *
+ *		The qual does stay in the plan as a filter, but that is no help here,
+ *		for the reason set out at length in redisGetQual(): a filter can only
+ *		discard rows that were fetched. Refusing the pushdown instead falls
+ *		back to walking the keyspace, which fetches every key and lets
+ *		PostgreSQL's own equality decide - slower, but the right answer.
+ *
+ *		Only an explicitly nondeterministic collation is refused.
+ *		InvalidOid means there is no collation to apply, and the database
+ *		default is deterministic (PostgreSQL does not allow a database to be
+ *		created with a nondeterministic default), so refusing either of those
+ *		would disable the pushdown for everybody. The catalog lookup is paid
+ *		once per planned lookup and once per scan start, never per row.
+ *
+ *		get_collation_isdeterministic() has existed since nondeterministic
+ *		collations arrived in PostgreSQL 12, so this compiles on every version
+ *		this FDW supports.
+ */
+static bool
+redis_pushdown_collation_ok(Oid collid)
+{
+	if (!OidIsValid(collid))
+		return true;
+
+	return get_collation_isdeterministic(collid);
+}
+
+/*
  * redis_key_restricted
  *		True if the relation has a key = <text constant> restriction, the
  *		shape redisGetQual() pushes down to Redis as a single-key lookup.
+ *
+ *		This has to agree with redisGetQual() about what gets pushed down,
+ *		including its refusal of a nondeterministic collation: a lookup that
+ *		will in fact walk the whole keyspace must not be costed as finding one
+ *		row, and must not skip the DBSIZE that sizes such a scan.
  */
 static bool
 redis_key_restricted(RelOptInfo *baserel, Oid foreigntableid)
@@ -1724,7 +1768,8 @@ redis_key_restricted(RelOptInfo *baserel, Oid foreigntableid)
 		set_opfuncid(op);
 		if (op->opfuncid != PROCID_TEXTEQ ||
 			value->consttype != TEXTOID || value->constisnull ||
-			var->varno != baserel->relid)
+			var->varno != baserel->relid ||
+			!redis_pushdown_collation_ok(op->inputcollid))
 			continue;
 
 		attname = get_attname(foreigntableid, var->varattno, false);
@@ -3336,7 +3381,8 @@ redis_depends_on_row(Node *node, void *context)
 /*
  * redisGetQual
  *		Decide whether a scan qual can be pushed down to Redis, and with what
- *		key: it must be key = <text value>, using TEXTEQ.
+ *		key: it must be key = <text value>, using TEXTEQ at a deterministic
+ *		collation - see redis_pushdown_collation_ok().
  *
  *		The value can be a constant, or, when planstate is given, any
  *		expression that redis_depends_on_row() accepts and that is not
@@ -3388,6 +3434,17 @@ redisGetQual(Node *node, TupleDesc tupdesc, PlanState *planstate,
 		varattno = ((Var *) left)->varattno;
 
 		right = list_nth(op->args, 1);
+
+		/*
+		 * Both of the paths below end in a byte-exact key lookup, the Const
+		 * one and the evaluated-expression one, so the collation check has to
+		 * sit ahead of both rather than inside either. inputcollid is the
+		 * collation the equality operator itself will use, which is the one
+		 * that decides whether equal values are necessarily equal bytes.
+		 * See redis_pushdown_collation_ok() for why that matters.
+		 */
+		if (!redis_pushdown_collation_ok(op->inputcollid))
+			return;
 
 		if (IsA(right, Const))
 		{

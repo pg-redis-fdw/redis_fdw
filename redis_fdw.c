@@ -43,6 +43,7 @@
 #include "catalog/pg_user_mapping.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "executor/executor.h"
 #if PG_VERSION_NUM >= 180000
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
@@ -55,6 +56,7 @@
 #include "mb/pg_wchar.h"
 #include "nodes/pathnodes.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
 #include "optimizer/appendinfo.h"
@@ -371,8 +373,9 @@ static TupleTableSlot *redisExecForeignUpdate(EState *estate,
  */
 static bool redisIsValidOption(const char *option, Oid context);
 static void redisGetOptions(Oid foreigntableid, redisTableOptions *options);
-static void redisGetQual(Node *node, TupleDesc tupdesc, char **key,
-						 char **value, bool *pushdown);
+static void redisGetQual(Node *node, TupleDesc tupdesc, PlanState *planstate,
+						 char **key, char **value, bool *pushdown);
+static bool redis_depends_on_row(Node *node, void *context);
 static char *redis_escape_glob(const char *str);
 
 /*
@@ -1699,6 +1702,14 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	{
 		ListCell   *lc;
 
+		/*
+		 * A comparison value that is not a constant can be computed now, at
+		 * the start of the scan, unless this is EXPLAIN without ANALYZE:
+		 * parameters may have no values then.
+		 */
+		PlanState  *evalstate = (eflags & EXEC_FLAG_EXPLAIN_ONLY) ?
+			NULL : &node->ss.ps;
+
 		foreach(lc, node->ss.ps.plan->qual)
 		{
 			/* Only the first qual can be pushed down to Redis */
@@ -1706,6 +1717,7 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 
 			redisGetQual((Node *) state,
 						 node->ss.ss_currentRelation->rd_att,
+						 evalstate,
 						 &qual_key, &qual_value, &pushdown);
 			if (pushdown)
 				break;
@@ -2700,8 +2712,76 @@ redisReScanForeignScan(ForeignScanState *node)
 	redis_start_scan(festate);
 }
 
+/*
+ * redis_depends_on_row
+ *		True if an expression cannot be computed once, before the scan reads
+ *		any row: it refers to a column, to a parameter that can change between
+ *		rescans (PARAM_EXEC, as a nested loop supplies), or to a subquery.
+ *		Walker for expression_tree_walker.
+ *
+ *		This list is allow-by-default: a node type named below is refused, and
+ *		anything else is accepted if nothing in its subtree is refused. That is
+ *		only tolerable because expression_tree_walker() ends in an elog() for a
+ *		node type it does not recognize, so a new one fails closed rather than
+ *		being waved through -- and because the whole right-hand side is
+ *		initialized and evaluated as one unit, so a node that is meaningful
+ *		only relative to its parent (CaseTestExpr, say) always has its parent.
+ *
+ *		Aggref, GroupingFunc and WindowFunc are refused outright rather than
+ *		left to the walk over their arguments, which would accept a
+ *		row-independent count(*). Reaching here with one looks impossible --
+ *		the parser bars aggregates and window functions from WHERE, a HAVING
+ *		qual belongs to the Agg node, and an outer-level Aggref in a sublink
+ *		becomes a PARAM_EXEC -- but this function is the entire safety
+ *		argument for the pushdown, and it should read as a closed list rather
+ *		than as one that happens to be complete because of facts proved
+ *		elsewhere in the backend.
+ */
+static bool
+redis_depends_on_row(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+		return true;
+	if (IsA(node, Param))
+		return ((Param *) node)->paramkind != PARAM_EXTERN;
+	if (IsA(node, SubPlan) || IsA(node, AlternativeSubPlan) || IsA(node, SubLink))
+		return true;
+	if (IsA(node, Aggref) || IsA(node, GroupingFunc) || IsA(node, WindowFunc))
+		return true;
+	return expression_tree_walker(node, redis_depends_on_row, context);
+}
+
+/*
+ * redisGetQual
+ *		Decide whether a scan qual can be pushed down to Redis, and with what
+ *		key: it must be key = <text value>, using TEXTEQ.
+ *
+ *		The value can be a constant, or, when planstate is given, any
+ *		expression that redis_depends_on_row() accepts and that is not
+ *		volatile - an external parameter, as a prepared statement's generic
+ *		plan or a PL/pgSQL variable supplies, or an expression over
+ *		parameters and constants.
+ *
+ *		What makes that safe is that such a value is provably the same for
+ *		every row the scan could return, so the one lookup made with it
+ *		fetches exactly the rows the qual would have accepted. It is computed
+ *		here, once, for that reason and no other.
+ *
+ *		The qual does also stay in the plan as a filter, but do not mistake
+ *		that for the safety argument: a filter can only discard rows that
+ *		were fetched, so it removes false positives and can do nothing
+ *		whatever about a row the narrowed lookup never asked Redis for.
+ *		Pushing a key down is exactly the direction in which rows go missing,
+ *		and the filter would simply agree that the rows it never saw are
+ *		absent. redis_depends_on_row() is therefore load-bearing for
+ *		correctness on its own, and anything that widens what it accepts has
+ *		to be judged on that basis.
+ */
 static void
-redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *pushdown)
+redisGetQual(Node *node, TupleDesc tupdesc, PlanState *planstate,
+			 char **key, char **value, bool *pushdown)
 {
 	*key = NULL;
 	*value = NULL;
@@ -2745,6 +2825,31 @@ redisGetQual(Node *node, TupleDesc tupdesc, char **key, char **value, bool *push
 
 				return;
 			}
+		}
+		else if (planstate != NULL &&
+				 op->opfuncid == PROCID_TEXTEQ &&
+				 exprType(right) == TEXTOID &&
+				 !redis_depends_on_row(right, NULL) &&
+				 !contain_volatile_functions(right))
+		{
+			ExprState  *exprstate;
+			Datum		datum;
+			bool		isnull;
+
+			*key = NameStr(TupleDescAttr(tupdesc, varattno - 1)->attname);
+			if (strcmp(*key, "key") != 0)
+				return;
+
+			exprstate = ExecInitExpr((Expr *) right, planstate);
+			datum = ExecEvalExpr(exprstate, planstate->ps_ExprContext, &isnull);
+
+			/* key = NULL matches nothing; leave it to the filter */
+			if (isnull)
+				return;
+
+			*value = TextDatumGetCString(datum);
+			*pushdown = true;
+			return;
 		}
 	}
 	return;

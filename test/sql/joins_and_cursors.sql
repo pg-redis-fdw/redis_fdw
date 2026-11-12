@@ -224,5 +224,83 @@ drop foreign table db15_rsc;
 -- cleanup took exactly what was seeded and nothing else.
 \! redis-cli -n 15 eval "local n=0 for _,k in ipairs(redis.call('keys','rsc_*')) do redis.call('del',k) n=n+1 end return n" 0
 
+-- A pushed-down key that is not a Const has to survive a rescan too, and that
+-- combination is what neither of the two changes it needs was tested against.
+-- The rescan tests above push down a Const; the pushdown of an expression
+-- (issue #67) is evaluated once, when the scan starts, and its own tests
+-- execute such a scan only once per executor run. Put together, the scan has to
+-- re-issue that same single-key lookup on every rescan -- which is exactly what
+-- redis_start_scan() above makes it do, and the reason this test can only be
+-- written once both are in.
+--
+-- Two keys of its own rather than the 2,500 above: the positive case has to
+-- find exactly one row, and the negative control below enumerates every matched
+-- key once per outer row.
+\! redis-cli -n 15 eval "redis.call('set','pd_1','one') redis.call('set','pd_2','two') return redis.call('dbsize')" 0
+
+create foreign table db15_pd(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'pd_');
+
+set plan_cache_mode = force_generic_plan;
+
+-- The key comes from a prepared statement's $1 on its generic plan, so it is a
+-- PARAM_EXTERN: fixed for the whole scan, and pushed down. The foreign scan is
+-- the inner side of a correlated SubPlan, so it is rescanned once per outer
+-- row -- four times here, and again on the second EXECUTE. Every pass must
+-- return the same row, not the first pass's row and not NULL.
+--
+-- The EXPLAIN is part of the test twice over: $1 rather than 'pd_1'::text is
+-- what makes this a pushdown of an expression, and the qual has to appear as a
+-- Filter on the Foreign Scan rather than as a Join Filter above it, or
+-- redisGetQual never sees it at all.
+prepare pd_rescan(text) as
+  select o.y, (select value from db15_pd where key = $1 and value >= o.y) as v
+  from (values('a'),('b'),('c'),('d')) o(y);
+
+explain (costs off) execute pd_rescan('pd_1');
+
+execute pd_rescan('pd_1');
+
+execute pd_rescan('pd_1');
+
+deallocate pd_rescan;
+
+-- The negative control. Here the key comes from the OUTER relation, so it
+-- reaches the foreign scan's qual as a PARAM_EXEC, which a nested loop or a
+-- correlated SubPlan changes between rescans. redis_depends_on_row() must
+-- refuse it, and the retained filter must do the selection instead. A
+-- correlated subquery is the only way an outer value reaches the foreign
+-- scan's own qual: the planner never builds a parameterized path for this FDW,
+-- so a plain nested loop leaves the clause as a Join Filter above the scan,
+-- where redisGetQual cannot see it.
+--
+-- The outer values alternate on purpose, and that is what makes this a control
+-- rather than a second way of asking the same question. If the key were pushed
+-- down anyway it would be frozen at the first outer row's pd_1 for the whole
+-- scan; the retained key = o.k filter would then reject that row whenever o.k
+-- is pd_2, and rows 2 and 4 would come back NULL. Four rows carrying their own
+-- *distinct* values is positive evidence that no pushdown happened -- not
+-- merely that the answer is right.
+create table pd_outer(k text);
+
+insert into pd_outer values ('pd_1'), ('pd_2'), ('pd_1'), ('pd_2');
+
+analyze pd_outer;
+
+explain (costs off) select o.k, (select value from db15_pd where key = o.k) as v
+       from pd_outer o order by 1;
+
+select o.k, (select value from db15_pd where key = o.k) as v
+       from pd_outer o order by 1;
+
+reset plan_cache_mode;
+
+drop table pd_outer;
+
+drop foreign table db15_pd;
+
+\! redis-cli -n 15 eval "local n=0 for _,k in ipairs(redis.call('keys','pd_*')) do redis.call('del',k) n=n+1 end return n" 0
+
 \i test/common/epilogue.sql
 

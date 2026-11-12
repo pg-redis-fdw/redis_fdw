@@ -246,6 +246,31 @@ create foreign table db15_bytea_hash_bad(key bytea, val text)
 
 insert into db15_bytea_hash_bad values (E'key'::bytea, 'val');
 
+-- A hash row is written with one variadic HSET rather than one HSET per
+-- field, so every field/value pair of the row has to arrive, paired as it was
+-- given. A small hash is a listpack, which HGETALL returns in insertion
+-- order, so the array comes back in the order it went in -- the same
+-- assumption the non-singleton hash tests above already make.
+
+create foreign table db15_ins_hash(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'hash', tablekeyprefix 'insh_');
+
+insert into db15_ins_hash values ('insh_1', '{f1,v1,f2,v2,f3,v3}');
+
+select key, val from db15_ins_hash where key = 'insh_1';
+
+-- a key that is already there is refused, and its fields are untouched
+insert into db15_ins_hash values ('insh_1', '{f4,v4}');
+
+select key, val from db15_ins_hash where key = 'insh_1';
+
+delete from db15_ins_hash;
+
+select * from db15_ins_hash;
+
+drop foreign table db15_ins_hash;
+
 
 \i test/common/epilogue.sql
 

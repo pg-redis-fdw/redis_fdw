@@ -46,10 +46,13 @@ Features
   - `INSERT` and `UPDATE` only work for singleton key `ZSET` tables if they have the
   priority column
   - non-singleton non-scalar tables must have an array type for the second column
-  - `UPDATE` of a non-singleton collection table sends the whole new value in a
-  single Redis command, so it is bounded by Redis's 1024*1024-argument protocol
-  limit, which an `INSERT` of the same array is not.
+  - `INSERT` and `UPDATE` of a non-singleton collection table each send the
+  whole value in a single Redis command, so both are bounded by Redis's
+  1024*1024-argument protocol limit.
   - `GEO` tables are only supported with `singleton_key`
+- An `INSERT` into a scalar table can send several rows per round trip; see
+  [Batched inserts](#batched-inserts) for the `batch_size` option and for what
+  a batch does when it meets a key that already exists.
 
 ### Binary data (bytea) support
 
@@ -135,6 +138,13 @@ Usage
 
   The port number on which the Redis server is listening.
 
+- **batch_size** as *integer*, optional, default `1`
+
+  How many rows an `INSERT` may send to Redis in one round trip. Supplies the
+  default for every foreign table on this server that does not set its own.
+  See [Batched inserts](#batched-inserts) — in particular for what happens
+  when a batch meets a key that already exists.
+
 ## CREATE USER MAPPING options
 
 `redis_fdw` accepts the following options via the `CREATE USER MAPPING`
@@ -183,6 +193,13 @@ Only the keys in the `tablekeyset` will be mapped in the foreign table.
   Get all the values in the table from a single named object. If not provided
 don't use a single object.
 
+- **batch_size** as *integer*, optional, default `1`
+
+  How many rows an `INSERT` may send to Redis in one round trip. Overrides the
+  server's `batch_size` if both are set, as in `postgres_fdw`. See
+  [Batched inserts](#batched-inserts) — in particular for what happens when a
+  batch meets a key that already exists.
+
 You can only have one of `tablekeyset` and `tablekeyprefix`, and if you use
 `singleton_key` you can't have either.
 
@@ -224,6 +241,45 @@ Singleton key tables are returned as rows with a single column of text
 in the case of lists sets and scalars, rows with key and value text columns
 for hashes, and rows with a value text columns and an optional numeric score
 column for zsets.
+
+### Batched inserts
+
+`batch_size` is accepted on the server and on the foreign table. Both default
+to `1`, which is no batching and is what you get if you set neither. The
+table's value wins where both are set, the same precedence `postgres_fdw`
+uses. The accepted range is 1 to 10000; a larger value is rejected by
+`CREATE`/`ALTER`, because the executor preallocates two arrays of `batch_size`
+tuple-slot pointers for every `INSERT` statement against a batching table,
+however few rows the statement turns out to have.
+
+Only a plain scalar (Redis string) table batches, since a batch is one
+`SET key value NX` per row and they can be pipelined into a single round trip.
+Everything else goes on inserting one row at a time regardless of
+`batch_size`, which is accepted and ignored on such a table rather than being
+an error:
+
+- any `hash`, `list`, `set`, `zset` or `geo` table — each row is a single
+  variadic `HSET`/`RPUSH`/`SADD`/`ZADD`/`GEOADD` already, and those cannot be
+  combined across rows;
+- any table with `singleton_key` or `tablekeyset`, which have their own
+  bookkeeping per row;
+- an `INSERT` with a `BEFORE`/`AFTER ... FOR EACH ROW` trigger, or through a
+  view declared `WITH CHECK OPTION`, both of which need each row as it is
+  inserted;
+- an `INSERT ... RETURNING`, which this FDW does not support at all.
+
+**A batch that meets an existing key fails after the rest of the batch has
+been written.** Every row of the batch is sent, Redis runs all of them, and
+the first `SET ... NX` that finds its key already there raises
+`key already exists`; the other rows of that batch, and every batch before it,
+have been written by then, and nothing — not the failed statement, not a
+surrounding `ROLLBACK` — takes them back. Redis writes are not transactional
+(see [Limitations](#other)). The same was already true row at a time, where
+the rows before the duplicate stay written; a batch makes the set of rows left
+behind larger and less obviously ordered. If you insert into a table where a
+key may already exist and you need to know what landed, either leave
+`batch_size` at `1` or re-read the keys after a failure rather than assuming
+the statement was atomic.
 
 ### Geo tables
 
@@ -587,7 +643,9 @@ Limitations
   through may already have applied some of its writes, and neither the failed
   statement nor a surrounding `ROLLBACK` undoes them. If a statement against a
   Redis foreign table errors, treat the affected keys as being in an unknown
-  state and repair them explicitly.
+  state and repair them explicitly. A `batch_size` above 1 widens the set of
+  keys that can be in that state when one row of a statement fails — see
+  [Batched inserts](#batched-inserts).
 
 - We can only push down a single qual to Redis, which must use the
   `TEXTEQ` operator, and must be on the `key` column.

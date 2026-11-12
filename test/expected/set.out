@@ -416,6 +416,81 @@ select length(member), member from db15_bytea_set_dup order by member;
 delete from db15_bytea_set_dup;
 drop foreign table db15_bytea_set_dup;
 -- clean up bytea tests
+-- A set row is written with one variadic SADD rather than one SADD per
+-- member, so every member of the row has to arrive -- and a member repeated
+-- within the row collapses, as it does in any Redis set.
+create foreign table db15_ins_set(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'set', tablekeyprefix 'inss_');
+insert into db15_ins_set values ('inss_1', '{x,y,z,x}');
+select key, atsort(val) as val from db15_ins_set where key = 'inss_1';
+  key   |   val   
+--------+---------
+ inss_1 | {x,y,z}
+(1 row)
+
+-- and a key that is already there is refused outright
+insert into db15_ins_set values ('inss_1', '{q}');
+ERROR:  key already exists: inss_1
+select key, atsort(val) as val from db15_ins_set where key = 'inss_1';
+  key   |   val   
+--------+---------
+ inss_1 | {x,y,z}
+(1 row)
+
+delete from db15_ins_set;
+select * from db15_ins_set;
+ key | val 
+-----+-----
+(0 rows)
+
+drop foreign table db15_ins_set;
+-- batch_size is accepted on any table, but only a plain scalar table batches:
+-- a set row is a variadic SADD, which the batch path does not send, so a set
+-- table has to go on writing one row at a time and ignore the option. Nothing
+-- else here would notice if it did not, so assert the members: every row's
+-- own members, and no row's members mixed into another's.
+create foreign table db15_ins_set_b(key text, val text[])
+       server localredis
+       options (database '15', tabletype 'set', tablekeyprefix 'insb_',
+                batch_size '100');
+insert into db15_ins_set_b values
+    ('insb_a', '{a1,a2,a3}'),
+    ('insb_b', '{b1,b2}'),
+    ('insb_c', '{c1,c2,c3,c4}');
+-- read back by key: a key = <value> qual fetches one key and never enumerates,
+-- so no SCAN duplicate can reach these rows. See test/README.md.
+select key, atsort(val) as val from db15_ins_set_b where key = 'insb_a';
+  key   |    val     
+--------+------------
+ insb_a | {a1,a2,a3}
+(1 row)
+
+select key, atsort(val) as val from db15_ins_set_b where key = 'insb_b';
+  key   |   val   
+--------+---------
+ insb_b | {b1,b2}
+(1 row)
+
+select key, atsort(val) as val from db15_ins_set_b where key = 'insb_c';
+  key   |      val      
+--------+---------------
+ insb_c | {c1,c2,c3,c4}
+(1 row)
+
+select count(distinct key) from db15_ins_set_b;
+ count 
+-------
+     3
+(1 row)
+
+delete from db15_ins_set_b;
+select * from db15_ins_set_b;
+ key | val 
+-----+-----
+(0 rows)
+
+drop foreign table db15_ins_set_b;
 \i test/common/epilogue.sql
 -- Shared epilogue for every redis_fdw test module: assert that the module left
 -- db 15 empty, so the next module starts from nothing and any module can run on

@@ -1,6 +1,7 @@
 -- Rejections that are not specific to one table type: the declared column
--- count for every type, dropped columns, NULL keys and values, and a scalar
--- bytea column on a collection table.
+-- count for every type, dropped columns, NULL keys and values, a scalar
+-- bytea column on a collection table, and the bounds of the batch_size
+-- option.
 --
 -- Rejections that ARE specific to one type live with that type instead; see
 -- geo.sql for the geo column-shape and dropped-column cases.
@@ -203,6 +204,46 @@ drop foreign table db15_bcol_scalar;
 -- these keys were seeded from outside, and every table that could reach them
 -- is a rejection case, so drop them the same way they were made
 \! redis-cli -n 15 del bcol_list bcol_set bcol_hash bcol_zset bcol_scalar_k > /dev/null
+
+-- batch_size takes an integer from 1 to 10000, and both ends are checked when
+-- the option is set rather than when a row is inserted.
+--
+-- The upper bound is not cosmetic. For every INSERT statement against a table
+-- that batches, the executor preallocates two arrays of batch_size tuple-slot
+-- pointers as soon as the first row arrives, however few rows the statement
+-- turns out to have. So batch_size '100000000' spends 1.6GB of address space
+-- on a one-row insert, and anything from 134217728 up asks palloc for more
+-- than it will give and fails with "invalid memory alloc request size
+-- 1073741824" -- an error naming neither the option nor the statement that
+-- set it. Rejecting the value at CREATE/ALTER time puts the complaint where
+-- the mistake was made.
+
+create foreign table db15_batch_opt(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'batch_opt_');
+
+alter foreign table db15_batch_opt options (add batch_size '0');
+
+alter foreign table db15_batch_opt options (add batch_size 'many');
+
+alter foreign table db15_batch_opt options (add batch_size '10001');
+
+alter foreign table db15_batch_opt options (add batch_size '100000000');
+
+-- and the option is validated the same way on the server, where it supplies
+-- the default for every table that does not set its own
+alter server localredis options (add batch_size '100000000');
+
+drop foreign table db15_batch_opt;
+
+-- the bound itself is accepted. A separate table, so that every ALTER above
+-- is a rejection and none of them can leave the option set for the next one.
+
+create foreign table db15_batch_max(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'batch_max_', batch_size '10000');
+
+drop foreign table db15_batch_max;
 
 \i test/common/epilogue.sql
 

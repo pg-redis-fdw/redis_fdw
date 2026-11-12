@@ -281,6 +281,36 @@ select * from db15_w_scalar_pfx order by key;
 -----+-----
 (0 rows)
 
+-- a scan that meets a key of another type among its strings still skips it.
+-- GET against a hash answers WRONGTYPE, which the scan treats as it treats
+-- the nil it gets for a key deleted under it: skip the reply and move on.
+-- Worth having here now that the values of a whole window of keys are fetched
+-- in one pipelined round trip, because the reply that has to be recognised and
+-- freed is one of a batch rather than one fetched on its own.
+--
+-- The harder case -- skipping the last matched key of a SCAN batch, which used
+-- to end the scan -- needs many batch boundaries and lives in
+-- joins_and_cursors.sql, with that module's large keyspace.
+\! redis-cli -n 15 hset scskip_h f v > /dev/null
+create foreign table db15_scskip(key text, val text)
+       server localredis
+       options (database '15', tablekeyprefix 'scskip_');
+insert into db15_scskip values ('scskip_1', 'one'), ('scskip_2', 'two');
+-- distinct, because this dumps every row of a prefix scan: SCAN promises only
+-- that a key is mentioned at least once, and a repeated mention would be a
+-- repeated row. See test/README.md.
+select distinct key, val from db15_scskip order by key;
+   key    | val 
+----------+-----
+ scskip_1 | one
+ scskip_2 | two
+(2 rows)
+
+delete from db15_scskip;
+-- the scan skips the hash, so the DELETE above could not have taken it: it
+-- goes the way it was made
+\! redis-cli -n 15 del scskip_h > /dev/null
+drop foreign table db15_scskip;
 -- a name-typed key column round-trips correctly
 create foreign table db15_nametest(key name, val text)
        server localredis

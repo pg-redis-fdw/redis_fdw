@@ -209,6 +209,8 @@ typedef struct RedisFdwExecutionState
 	long long	prefetch_n;		/* number of entries in prefetch */
 	long long	prefetch_base;	/* index of the window's first key */
 	long long	prefetch_window;	/* keys to fetch in the next window */
+	MemoryContextCallback reset_cb; /* frees the replies above if the scan
+									 * never reaches redisEndForeignScan */
 	redis_val_type *val_types;	/* column value type categories */
 	int			natts;			/* number of attributes */
 	TupleDesc	tupdesc;		/* cached tuple descriptor */
@@ -353,6 +355,7 @@ static int	redis_append_value_command(RedisFdwExecutionState *festate,
 									   const char *key, size_t key_len);
 static void redis_prefetch_values(RedisFdwExecutionState *festate);
 static void redis_free_prefetch(RedisFdwExecutionState *festate);
+static void redis_scan_reset_callback(void *arg);
 
 
 static List *redisPlanForeignModify(PlannerInfo *root,
@@ -1897,6 +1900,17 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	 */
 	festate->mctxt = CurrentMemoryContext;
 
+	/*
+	 * Hang the release of the scan's Redis replies off that context, so that
+	 * a query which never reaches redisEndForeignScan - any error, cancel or
+	 * timeout - does not leak them. festate itself lives in this context, so
+	 * the callback struct embedded in it is valid for as long as the callback
+	 * can fire. Registered before the scan starts, to cover redis_start_scan.
+	 */
+	festate->reset_cb.func = redis_scan_reset_callback;
+	festate->reset_cb.arg = festate;
+	MemoryContextRegisterResetCallback(festate->mctxt, &festate->reset_cb);
+
 	redis_start_scan(festate);
 }
 
@@ -1948,6 +1962,41 @@ redis_free_prefetch(RedisFdwExecutionState *festate)
 	festate->prefetch = NULL;
 	festate->prefetch_n = 0;
 	festate->prefetch_base = 0;
+}
+
+/*
+ * redis_scan_reset_callback
+ *		Release the replies the scan still holds when its memory context goes
+ *		away.
+ *
+ *		hiredis replies are malloc'd, so no memory context frees them, and
+ *		redisEndForeignScan does not run when a query is aborted: an error, a
+ *		cancel or a statement timeout goes straight to abort cleanup. The
+ *		prefetch window makes that expensive, since it can be holding up to
+ *		PREFETCH_WINDOW_MAX whole values rather than one, so without this the
+ *		replies of every aborted scan stay allocated for the life of the
+ *		backend. Deleting the scan's context is the one event that happens on
+ *		both the normal and the aborted path, so hang the release off that.
+ *
+ *		Idempotent, because the normal path gets here too: redis_free_prefetch
+ *		clears what it frees, and owned_reply is cleared below, so a second
+ *		call after redisEndForeignScan has done the same work frees nothing
+ *		twice. pfree() inside redis_free_prefetch is safe here: reset
+ *		callbacks run before the context's memory is released.
+ */
+static void
+redis_scan_reset_callback(void *arg)
+{
+	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) arg;
+
+	redis_free_prefetch(festate);
+
+	if (festate->owned_reply)
+	{
+		freeReplyObject(festate->owned_reply);
+		festate->owned_reply = NULL;
+		festate->reply = NULL;
+	}
 }
 
 /*
@@ -2132,8 +2181,17 @@ redis_start_scan(RedisFdwExecutionState *festate)
 
 			if (sreply)
 			{
+				/*
+				 * check_reply() raises for every non-INTEGER reply, so the
+				 * value fetched alongside it is released first rather than
+				 * leaked. Clear it as well: nothing below must read it on
+				 * the strength of check_reply() being fatal here today.
+				 */
 				if (sreply->type != REDIS_REPLY_INTEGER)
+				{
 					freeReplyObject(vreply);
+					vreply = NULL;
+				}
 				check_reply(sreply, festate->context, RTYPE(REDIS_REPLY_INTEGER),
 							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
 							"failed to list keys", NULL);
@@ -2142,7 +2200,7 @@ redis_start_scan(RedisFdwExecutionState *festate)
 				freeReplyObject(sreply);
 			}
 
-			if (festate->row > -1 &&
+			if (festate->row > -1 && vreply != NULL &&
 				vreply->type != REDIS_REPLY_NIL &&
 				!(vreply->type == REDIS_REPLY_ARRAY && vreply->elements == 0))
 			{
@@ -2153,7 +2211,8 @@ redis_start_scan(RedisFdwExecutionState *festate)
 			else
 			{
 				festate->row = -1;
-				freeReplyObject(vreply);
+				if (vreply)
+					freeReplyObject(vreply);
 			}
 		}
 	}
@@ -2888,8 +2947,16 @@ redisEndForeignScan(ForeignScanState *node)
 	/* if festate is NULL, we are in EXPLAIN; nothing to do */
 	if (festate)
 	{
+		/*
+		 * Clear what we free: redis_scan_reset_callback runs later, when the
+		 * scan's context is deleted, and must not free any of this twice.
+		 */
 		if (festate->owned_reply)
+		{
 			freeReplyObject(festate->owned_reply);
+			festate->owned_reply = NULL;
+			festate->reply = NULL;
+		}
 		redis_free_prefetch(festate);
 	}
 }

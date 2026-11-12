@@ -287,8 +287,37 @@ typedef struct RedisFdwModifyState
 
 /* initial cursor */
 #define ZERO "0"
-/* redis default is 10 - let's fetch 1000 at a time */
-#define COUNT " COUNT 1000"
+
+/*
+ * How much of the keyspace each SCAN/SSCAN call covers. COUNT bounds the
+ * buckets Redis visits per call, not the keys it returns, so a sparse MATCH
+ * over a large database pays a whole round trip to look at COUNT buckets and
+ * often comes back with almost nothing. The cost of a scan is therefore the
+ * number of calls, and COUNT is what divides it.
+ *
+ * Measured on Valkey 8.1.1 over a 200,000-key database, walking the cursor to
+ * completion with a MATCH that one key satisfies:
+ *
+ *		COUNT     calls   total     worst single call
+ *		  1000      200    398ms                 2ms
+ *		  5000       40     88ms                   -
+ *		 10000       20     47ms                   -
+ *		 20000       10     24ms                 2ms
+ *		 50000        4     11ms                 2ms
+ *		100000        2      7ms                 3ms
+ *
+ * A dense MATCH over the same database went from 658ms at 1000 to 101ms at
+ * 20000. The curve does not flatten, because what is being saved is round
+ * trips - but the reply does grow with COUNT, and in the dense case it holds
+ * every matched key of the batch: about 20,000 key names here, against
+ * 100,000 at COUNT 100000. 20000 buys most of the improvement while keeping
+ * that reply around a megabyte and the per-call stall where it already was.
+ *
+ * Raising this reduces the number of SCAN batch boundaries, which is what the
+ * truncation test in joins_and_cursors needs in order to trigger at all - see
+ * the comment there before changing it again.
+ */
+#define COUNT " COUNT 20000"
 
 /*
  * A scan fetches values a window of keys at a time. The window starts at one

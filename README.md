@@ -162,6 +162,24 @@ command:
 
   The password to authenticate to the Redis server with.
 
+A connection is cached for the session and authenticated only when it is
+opened. Before reusing a cached one, `redis_fdw` checks that its socket is
+still there — it polls it, with no wait. It used to send a `PING`, which also
+proved the connection could still *run commands*; that cost a network round
+trip before every statement, so it is gone. A connection whose socket is fine
+but which Redis will no longer accept commands on — an ACL rule changed or a
+permission revoked under it, a server answering `-READONLY`/`-MASTERDOWN`
+after a failover — is therefore reported healthy and reused, and the Redis
+error reaches your own statement rather than being hidden behind a reconnect.
+Expect it to keep reaching it: a command Redis refuses leaves the connection
+in the cache, so every later statement in the session finds the same one,
+and re-opening it would not have restored a revoked permission anyway. In one
+shape the refusal is not even visible — a `key = <value>` lookup whose value
+command is refused returns no rows, because an error reply for a value is
+skipped exactly as a key of the wrong type is. Fix the Redis side, then force
+a fresh connection by ending the session or by altering the server or the user
+mapping, either of which drops every cached connection at end of transaction.
+
 ## CREATE FOREIGN TABLE options
 
 `redis_fdw` accepts the following table-level options via the

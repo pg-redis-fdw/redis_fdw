@@ -108,6 +108,18 @@ select value::int from db15_conntest;
 -- must reconnect rather than reuse the dead socket
 select value from db15_conntest;
 
+-- And again from a connection in good standing, which is the plain case the
+-- connection check owes: the statement above reconnected and succeeded, so
+-- the cache entry now holds a socket nothing has aborted. The statement
+-- before the first kill had aborted partway through a scan, which can leave a
+-- reply nobody read on the connection, so noticing that one does not on its
+-- own say that a connection the server quietly closed is noticed too. A
+-- pushed-down single-key lookup, so the check is reached from that path as
+-- well as from a scan.
+\! redis-cli CLIENT KILL TYPE normal > /dev/null
+
+select value from db15_conntest where key = 'conntest_a';
+
 -- A connection lost mid-transaction is re-established without ending the
 -- transaction, and a subtransaction abort needs no special handling.
 begin;

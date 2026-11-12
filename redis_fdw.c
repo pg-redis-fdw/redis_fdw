@@ -201,6 +201,16 @@ typedef struct RedisFdwExecutionState
 	char	   *cursor_search_string;
 	char	   *cursor_id;
 	MemoryContext mctxt;
+	redisReply **prefetch;		/* value replies for a window of the current
+								 * batch of keys, fetched in one pipelined
+								 * round trip; entry i belongs to
+								 * reply->element[prefetch_base + i], or
+								 * entry 0 to a pushed-down key */
+	long long	prefetch_n;		/* number of entries in prefetch */
+	long long	prefetch_base;	/* index of the window's first key */
+	long long	prefetch_window;	/* keys to fetch in the next window */
+	MemoryContextCallback reset_cb; /* frees the replies above if the scan
+									 * never reaches redisEndForeignScan */
 	redis_val_type *val_types;	/* column value type categories */
 	int			natts;			/* number of attributes */
 	TupleDesc	tupdesc;		/* cached tuple descriptor */
@@ -243,6 +253,14 @@ typedef struct RedisFdwModifyState
 #define ZERO "0"
 /* redis default is 10 - let's fetch 1000 at a time */
 #define COUNT " COUNT 1000"
+
+/*
+ * A scan fetches values a window of keys at a time. The window starts at one
+ * key, so that a query which stops at its first row (LIMIT 1, EXISTS) sends
+ * what it always did, and quadruples up to the size of a SCAN batch.
+ */
+#define PREFETCH_WINDOW_MIN 1
+#define PREFETCH_WINDOW_MAX 1024
 
 /*
  * Prefix for the staging key an UPDATE of a set, list, hash or zset row
@@ -332,6 +350,12 @@ static inline TupleTableSlot *redisIterateForeignScanSingleton(ForeignScanState 
 static void redisReScanForeignScan(ForeignScanState *node);
 static void redisEndForeignScan(ForeignScanState *node);
 static void redis_start_scan(RedisFdwExecutionState *festate);
+static bool redis_key_restricted(RelOptInfo *baserel, Oid foreigntableid);
+static int	redis_append_value_command(RedisFdwExecutionState *festate,
+									   const char *key, size_t key_len);
+static void redis_prefetch_values(RedisFdwExecutionState *festate);
+static void redis_free_prefetch(RedisFdwExecutionState *festate);
+static void redis_scan_reset_callback(void *arg);
 
 
 static List *redisPlanForeignModify(PlannerInfo *root,
@@ -1470,6 +1494,18 @@ redisGetForeignRelSize(PlannerInfo *root,
 	fdw_private->svr_port = table_options.port;
 	fdw_private->svr_database = table_options.database;
 
+	/*
+	 * A key = <text> restriction is pushed down to Redis and finds at most
+	 * one row, so there is no need to ask Redis how big the table is: that
+	 * would cost a round trip every time such a lookup is planned.
+	 */
+	if (!table_options.singleton_key &&
+		redis_key_restricted(baserel, foreigntableid))
+	{
+		baserel->rows = 1;
+		return;
+	}
+
 	/* Connect to the database (via connection cache) */
 	context = redis_get_connection(&table_options);
 
@@ -1536,6 +1572,48 @@ redisGetForeignRelSize(PlannerInfo *root,
 		baserel->rows = reply->integer;
 
 	freeReplyObject(reply);
+}
+
+
+/*
+ * redis_key_restricted
+ *		True if the relation has a key = <text constant> restriction, the
+ *		shape redisGetQual() pushes down to Redis as a single-key lookup.
+ */
+static bool
+redis_key_restricted(RelOptInfo *baserel, Oid foreigntableid)
+{
+	ListCell   *lc;
+
+	foreach(lc, baserel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		OpExpr	   *op;
+		Var		   *var;
+		Const	   *value;
+		char	   *attname;
+
+		if (!IsA(rinfo->clause, OpExpr))
+			continue;
+		op = (OpExpr *) rinfo->clause;
+		if (list_length(op->args) != 2 ||
+			!IsA(linitial(op->args), Var) ||
+			!IsA(lsecond(op->args), Const))
+			continue;
+
+		var = (Var *) linitial(op->args);
+		value = (Const *) lsecond(op->args);
+		set_opfuncid(op);
+		if (op->opfuncid != PROCID_TEXTEQ ||
+			value->consttype != TEXTOID || value->constisnull ||
+			var->varno != baserel->relid)
+			continue;
+
+		attname = get_attname(foreigntableid, var->varattno, false);
+		if (strcmp(attname, "key") == 0)
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -1741,6 +1819,10 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	festate->geo_ewkt = table_options.geo_ewkt;
 	festate->cursor_id = NULL;
 	festate->cursor_search_string = NULL;
+	festate->prefetch = NULL;
+	festate->prefetch_n = 0;
+	festate->prefetch_base = 0;
+	festate->prefetch_window = PREFETCH_WINDOW_MIN;
 
 	/*
 	 * A non-singleton zset table may optionally have a 3rd column holding
@@ -1818,7 +1900,169 @@ redisBeginForeignScan(ForeignScanState *node, int eflags)
 	 */
 	festate->mctxt = CurrentMemoryContext;
 
+	/*
+	 * Hang the release of the scan's Redis replies off that context, so that
+	 * a query which never reaches redisEndForeignScan - any error, cancel or
+	 * timeout - does not leak them. festate itself lives in this context, so
+	 * the callback struct embedded in it is valid for as long as the callback
+	 * can fire. Registered before the scan starts, to cover redis_start_scan.
+	 */
+	festate->reset_cb.func = redis_scan_reset_callback;
+	festate->reset_cb.arg = festate;
+	MemoryContextRegisterResetCallback(festate->mctxt, &festate->reset_cb);
+
 	redis_start_scan(festate);
+}
+
+
+/*
+ * redis_append_value_command
+ *		Queue, without sending, the command that reads one key's value for
+ *		this table type. Binary-safe: the key goes by length.
+ */
+static int
+redis_append_value_command(RedisFdwExecutionState *festate,
+						   const char *key, size_t key_len)
+{
+	switch (festate->table_type)
+	{
+		case PG_REDIS_HASH_TABLE:
+			return redisAppendCommand(festate->context, "HGETALL %b", key, key_len);
+		case PG_REDIS_LIST_TABLE:
+			return redisAppendCommand(festate->context, "LRANGE %b 0 -1", key, key_len);
+		case PG_REDIS_SET_TABLE:
+			return redisAppendCommand(festate->context, "SMEMBERS %b", key, key_len);
+		case PG_REDIS_ZSET_TABLE:
+			if (festate->with_scores)
+				return redisAppendCommand(festate->context,
+										  "ZRANGE %b 0 -1 WITHSCORES", key, key_len);
+			return redisAppendCommand(festate->context, "ZRANGE %b 0 -1", key, key_len);
+		case PG_REDIS_SCALAR_TABLE:
+		default:
+			return redisAppendCommand(festate->context, "GET %b", key, key_len);
+	}
+}
+
+/*
+ * redis_free_prefetch
+ *		Release whatever value replies of the current batch are still held.
+ */
+static void
+redis_free_prefetch(RedisFdwExecutionState *festate)
+{
+	if (festate->prefetch)
+	{
+		for (long long i = 0; i < festate->prefetch_n; i++)
+		{
+			if (festate->prefetch[i])
+				freeReplyObject(festate->prefetch[i]);
+		}
+		pfree(festate->prefetch);
+	}
+	festate->prefetch = NULL;
+	festate->prefetch_n = 0;
+	festate->prefetch_base = 0;
+}
+
+/*
+ * redis_scan_reset_callback
+ *		Release the replies the scan still holds when its memory context goes
+ *		away.
+ *
+ *		hiredis replies are malloc'd, so no memory context frees them, and
+ *		redisEndForeignScan does not run when a query is aborted: an error, a
+ *		cancel or a statement timeout goes straight to abort cleanup. The
+ *		prefetch window makes that expensive, since it can be holding up to
+ *		PREFETCH_WINDOW_MAX whole values rather than one, so without this the
+ *		replies of every aborted scan stay allocated for the life of the
+ *		backend. Deleting the scan's context is the one event that happens on
+ *		both the normal and the aborted path, so hang the release off that.
+ *
+ *		Idempotent, because the normal path gets here too: redis_free_prefetch
+ *		clears what it frees, and owned_reply is cleared below, so a second
+ *		call after redisEndForeignScan has done the same work frees nothing
+ *		twice. pfree() inside redis_free_prefetch is safe here: reset
+ *		callbacks run before the context's memory is released.
+ */
+static void
+redis_scan_reset_callback(void *arg)
+{
+	RedisFdwExecutionState *festate = (RedisFdwExecutionState *) arg;
+
+	redis_free_prefetch(festate);
+
+	if (festate->owned_reply)
+	{
+		freeReplyObject(festate->owned_reply);
+		festate->owned_reply = NULL;
+		festate->reply = NULL;
+	}
+}
+
+/*
+ * redis_prefetch_values
+ *		Read the values of the next window of keys in the current SCAN batch,
+ *		starting at festate->row, with one pipelined round trip: queue one
+ *		command per key, send them together, then collect the replies in
+ *		order. Fetching key by key, as the scan used to, costs one network
+ *		round trip per row.
+ *
+ *		All replies are read before anything can raise an error, so none is
+ *		left in the cached connection; if reading fails the connection is
+ *		discarded instead.
+ */
+static void
+redis_prefetch_values(RedisFdwExecutionState *festate)
+{
+	redisReply *keys = festate->reply;
+	long long	start = festate->row;
+	long long	n = keys->elements - start;
+	redisReply **values;
+	long long	i;
+
+	redis_free_prefetch(festate);
+
+	if (n <= 0)
+		return;
+	if (n > festate->prefetch_window)
+		n = festate->prefetch_window;
+	if (festate->prefetch_window < PREFETCH_WINDOW_MAX)
+		festate->prefetch_window *= 4;
+
+	values = (redisReply **) MemoryContextAllocZero(festate->mctxt,
+													 sizeof(redisReply *) * n);
+
+	for (i = 0; i < n; i++)
+	{
+		redisReply *k = keys->element[start + i];
+
+		if (redis_append_value_command(festate, k->str, k->len) != REDIS_OK)
+			break;
+	}
+
+	if (i == n)
+	{
+		for (i = 0; i < n; i++)
+		{
+			if (redisGetReply(festate->context, (void **) &values[i]) != REDIS_OK)
+				break;
+		}
+	}
+
+	festate->prefetch = values;
+	festate->prefetch_n = n;
+	festate->prefetch_base = start;
+
+	if (i < n)
+	{
+		char	   *err = pstrdup(festate->context->errstr);
+
+		redis_free_prefetch(festate);
+		redis_discard_connection(festate->context);
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
+				 errmsg("failed to get the values of the scanned keys: %s", err)));
+	}
 }
 
 /*
@@ -1836,6 +2080,7 @@ redis_start_scan(RedisFdwExecutionState *festate)
 	MemoryContext oldcontext = MemoryContextSwitchTo(festate->mctxt);
 
 	festate->row = 0;
+	festate->prefetch_window = PREFETCH_WINDOW_MIN;
 
 	if (festate->singleton_key)
 	{
@@ -1888,47 +2133,88 @@ redis_start_scan(RedisFdwExecutionState *festate)
 	else if (festate->qual_value)
 	{
 		/*
-		 * if we have a qual, make sure it's a member of the keyset or has the
-		 * right prefix if either of these options is specified.
+		 * A pushed-down key: fetch its value straight away, pipelined with
+		 * the keyset membership test when there is one, rather than checking
+		 * with EXISTS first and fetching the value in a later round trip.
+		 * Redis deletes a collection with its last member, so a missing key
+		 * reads as nil or as an empty array, which is what EXISTS = 0 meant.
+		 * A key outside tablekeyprefix is not looked up at all.
 		 *
-		 * If not set row to -1 to indicate failure
+		 * Every reply is read before any of them is examined: an error raised
+		 * with a reply still unread would leave it in the cached connection,
+		 * for the next command to take as its own.
 		 */
-		if (festate->keyset)
-		{
-			redisReply *sreply;
+		size_t		qual_len = strlen(festate->qual_value);
+		redisReply *sreply = NULL;
+		redisReply *vreply = NULL;
+		bool		ok = true;
 
-			sreply = redis_command2(festate->context, "SISMEMBER",
-									festate->keyset, strlen(festate->keyset),
-									festate->qual_value, strlen(festate->qual_value));
-			check_reply(sreply, festate->context, RTYPE(REDIS_REPLY_INTEGER),
-						ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-						"failed to list keys", NULL);
-
-			if (sreply->integer != 1)
-				festate->row = -1;
-
-			freeReplyObject(sreply);
-		}
-		else if (festate->keyprefix)
-		{
-			if (strncmp(festate->qual_value, festate->keyprefix,
-						festate->keyprefix_len) != 0)
-				festate->row = -1;
-		}
-
-		/*
-		 * For a qual we don't want to scan at all, just check that the key
-		 * exists. We do this check in adddition to the keyset/keyprefix
-		 * checks, is any, so we know the item is really there.
-		 */
-
-		reply = redis_command1(festate->context, "EXISTS", festate->qual_value, strlen(festate->qual_value));
-		check_reply(reply, festate->context, RTYPE(REDIS_REPLY_INTEGER),
-					ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
-					"failed to check key existence for %s", festate->qual_value);
-		if (reply->integer == 0)
+		if (festate->keyprefix &&
+			strncmp(festate->qual_value, festate->keyprefix,
+					festate->keyprefix_len) != 0)
 			festate->row = -1;
+		else
+		{
+			if (festate->keyset)
+				ok = redisAppendCommand(festate->context, "SISMEMBER %b %b",
+										festate->keyset, strlen(festate->keyset),
+										festate->qual_value, qual_len) == REDIS_OK;
+			if (ok)
+				ok = redis_append_value_command(festate, festate->qual_value,
+												qual_len) == REDIS_OK;
+			if (ok && festate->keyset)
+				ok = redisGetReply(festate->context, (void **) &sreply) == REDIS_OK;
+			if (ok)
+				ok = redisGetReply(festate->context, (void **) &vreply) == REDIS_OK;
+			if (!ok)
+			{
+				char	   *err = pstrdup(festate->context->errstr);
 
+				if (sreply)
+					freeReplyObject(sreply);
+				redis_discard_connection(festate->context);
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+						 errmsg("failed to get the value for key \"%s\": %s",
+								festate->qual_value, err)));
+			}
+
+			if (sreply)
+			{
+				/*
+				 * check_reply() raises for every non-INTEGER reply, so the
+				 * value fetched alongside it is released first rather than
+				 * leaked. Clear it as well: nothing below must read it on
+				 * the strength of check_reply() being fatal here today.
+				 */
+				if (sreply->type != REDIS_REPLY_INTEGER)
+				{
+					freeReplyObject(vreply);
+					vreply = NULL;
+				}
+				check_reply(sreply, festate->context, RTYPE(REDIS_REPLY_INTEGER),
+							ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION,
+							"failed to list keys", NULL);
+				if (sreply->integer != 1)
+					festate->row = -1;
+				freeReplyObject(sreply);
+			}
+
+			if (festate->row > -1 && vreply != NULL &&
+				vreply->type != REDIS_REPLY_NIL &&
+				!(vreply->type == REDIS_REPLY_ARRAY && vreply->elements == 0))
+			{
+				festate->prefetch = (redisReply **) palloc0(sizeof(redisReply *));
+				festate->prefetch[0] = vreply;
+				festate->prefetch_n = 1;
+			}
+			else
+			{
+				festate->row = -1;
+				if (vreply)
+					freeReplyObject(vreply);
+			}
+		}
 	}
 	else
 	{
@@ -1950,6 +2236,13 @@ redis_start_scan(RedisFdwExecutionState *festate)
 			festate->cursor_search_string = "SCAN %s" COUNT;
 			reply = redisCommand(festate->context, festate->cursor_search_string, ZERO);
 		}
+	}
+
+	/* a pushed-down key has been dealt with in full above */
+	if (festate->qual_value && !festate->singleton_key)
+	{
+		MemoryContextSwitchTo(oldcontext);
+		return;
 	}
 
 	if (!reply)
@@ -1976,7 +2269,7 @@ redis_start_scan(RedisFdwExecutionState *festate)
 		festate->owned_reply = reply;
 		festate->reply = reply;
 	}
-	else if (festate->row > -1 && festate->qual_value == NULL)
+	else
 	{
 		redisReply *cursor;
 
@@ -2019,15 +2312,6 @@ redis_start_scan(RedisFdwExecutionState *festate)
 		/* for cursors, this is the list of elements */
 		festate->owned_reply = reply;
 		festate->reply = reply->element[1];
-	}
-	else
-	{
-		/*
-		 * A qual we checked with EXISTS, or a qual that failed the keyset or
-		 * keyprefix test. Either way nothing iterates this reply, so it has
-		 * to be released here rather than at the end of the scan.
-		 */
-		freeReplyObject(reply);
 	}
 
 	MemoryContextSwitchTo(oldcontext);
@@ -2191,6 +2475,7 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 			festate->owned_reply = creply;
 			festate->reply = creply->element[1];
 			festate->row = 0;
+			redis_free_prefetch(festate);
 		}
 
 		/*
@@ -2208,47 +2493,35 @@ redisIterateForeignScanMulti(ForeignScanState *node)
 			 */
 			do
 			{
+				long long	idx;
+
+				/* a key skipped on the previous pass: its reply is done with */
+				if (reply)
+					freeReplyObject(reply);
+
+				/* past the fetched window: fetch the next one */
+				if (festate->qual_value == NULL &&
+					(festate->prefetch == NULL ||
+					 festate->row >= festate->prefetch_base + festate->prefetch_n))
+					redis_prefetch_values(festate);
+
+				idx = festate->qual_value != NULL ?
+					0 : festate->row - festate->prefetch_base;
 
 				key = festate->qual_value != NULL ?
 					festate->qual_value :
 					festate->reply->element[festate->row]->str;
-				switch (festate->table_type)
-				{
-					case PG_REDIS_HASH_TABLE:
-						reply = redisCommand(festate->context,
-											 "HGETALL %s", key);
-						break;
-					case PG_REDIS_LIST_TABLE:
-						reply = redisCommand(festate->context,
-											 "LRANGE %s 0 -1", key);
-						break;
-					case PG_REDIS_SET_TABLE:
-						reply = redisCommand(festate->context,
-											 "SMEMBERS %s", key);
-						break;
-					case PG_REDIS_ZSET_TABLE:
-						if (festate->with_scores)
-							reply = redisCommand(festate->context,
-												 "ZRANGE %s 0 -1 WITHSCORES", key);
-						else
-							reply = redisCommand(festate->context,
-												 "ZRANGE %s 0 -1", key);
-						break;
-					case PG_REDIS_SCALAR_TABLE:
-					default:
-						reply = redisCommand(festate->context,
-											 "GET %s", key);
-				}
 
-				if (!reply)
-				{
-					freeReplyObject(festate->owned_reply);
-					redis_discard_connection(festate->context);
+				/*
+				 * The value was fetched with the rest of its batch, or with the
+				 * pushed-down key, when the scan started; take it over.
+				 */
+				if (festate->prefetch == NULL || idx < 0 ||
+					idx >= festate->prefetch_n || festate->prefetch[idx] == NULL)
 					ereport(ERROR, (errcode(ERRCODE_FDW_UNABLE_TO_CREATE_REPLY),
-							 errmsg("failed to get the value for key \"%s\": %s",
-									key, festate->context->errstr)
-									));
-				}
+									errmsg("no value fetched for key \"%s\"", key)));
+				reply = festate->prefetch[idx];
+				festate->prefetch[idx] = NULL;
 
 				festate->row++;
 
@@ -2674,8 +2947,17 @@ redisEndForeignScan(ForeignScanState *node)
 	/* if festate is NULL, we are in EXPLAIN; nothing to do */
 	if (festate)
 	{
+		/*
+		 * Clear what we free: redis_scan_reset_callback runs later, when the
+		 * scan's context is deleted, and must not free any of this twice.
+		 */
 		if (festate->owned_reply)
+		{
 			freeReplyObject(festate->owned_reply);
+			festate->owned_reply = NULL;
+			festate->reply = NULL;
+		}
+		redis_free_prefetch(festate);
 	}
 }
 
@@ -2708,6 +2990,7 @@ redisReScanForeignScan(ForeignScanState *node)
 		pfree(festate->cursor_id);
 		festate->cursor_id = NULL;
 	}
+	redis_free_prefetch(festate);
 
 	redis_start_scan(festate);
 }

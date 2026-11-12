@@ -10,8 +10,9 @@
 -- key = <expression> has to be pushed down as a single-key lookup, not
 -- answered by walking the keyspace. Nothing in the result of such a query says
 -- which happened -- both give the same rows -- so the only witness available
--- from SQL is Redis's own command counters: a pushed-down lookup issues EXISTS
--- and GET for one key, while a fall-through issues SCAN. Issue #67.
+-- from SQL is Redis's own command counters: a pushed-down lookup issues the
+-- command that reads one key's value, while a fall-through issues SCAN.
+-- Issue #67.
 --
 -- Assert the ABSENCE of SCAN, and never a count of anything else. INFO
 -- commandstats is server-wide, not per-backend, so any other client talking to
@@ -80,5 +81,93 @@ reset plan_cache_mode;
 
 delete from db15_cmd;
 drop foreign table db15_cmd;
+
+-- A pushed-down key is read in one round trip. The command that fetches the
+-- value goes out straight away: no EXISTS ahead of it to find out whether the
+-- key is there -- a missing key is recognised from the value reply itself --
+-- and no DBSIZE while the lookup is planned, since a key = <text constant>
+-- restriction finds at most one row and needs no table size. A tablekeyset
+-- table still has its membership to check, and the SISMEMBER for it is
+-- pipelined with the value command rather than paying for a round trip of its
+-- own.
+--
+-- Absence assertions again, in the same spirit as the SCAN one above: the grep
+-- drops the call counts, so another client moving the counters cannot break
+-- this, and what is asserted is that EXISTS and DBSIZE are gone while the
+-- value command and SISMEMBER are still issued.
+
+\! redis-cli -n 15 set fk_1 one > /dev/null
+\! redis-cli -n 15 set fk_2 two > /dev/null
+\! redis-cli -n 15 hset fk_h f v > /dev/null
+\! redis-cli -n 15 sadd fkeys fk_1 fk_2 > /dev/null
+
+create foreign table db15_fk(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'fk_');
+
+create foreign table db15_fk_set(key text, value text)
+       server localredis
+       options (database '15', tablekeyset 'fkeys');
+
+\! redis-cli config resetstat > /dev/null
+
+-- a key that is there, a key that is not, a keyset member, and a key outside
+-- the keyset: one round trip each, and the two misses must not cost an extra
+-- one to discover
+select value from db15_fk where key = 'fk_1';
+
+select value from db15_fk where key = 'fk_3';
+
+select value from db15_fk_set where key = 'fk_2';
+
+select value from db15_fk_set where key = 'fk_h';
+
+\! redis-cli info commandstats | grep -o -E '^cmdstat_(get|sismember|exists|dbsize)' | sort
+
+-- all four keys were made with redis-cli, since two of them have to be a hash
+-- and a set, so they all go the same way
+\! redis-cli -n 15 del fk_1 fk_2 fk_h fkeys > /dev/null
+
+drop foreign table db15_fk;
+drop foreign table db15_fk_set;
+
+-- A scan fetches the values of a window of keys in one pipelined round trip,
+-- and the window starts at one key and quadruples. So a query that stops early
+-- does not pay for the values of a whole SCAN batch: one value command for
+-- LIMIT 1 -- what the scan cost before this was pipelined at all -- and
+-- 1 + 4 + 16 = 21 for LIMIT 6.
+--
+-- UNLIKE EVERY OTHER ASSERTION IN THIS MODULE, this one asserts exact call
+-- counts rather than the presence or absence of a command. INFO commandstats
+-- is server-wide, so anything else talking to this Redis while this runs --
+-- another client, a second copy of this suite -- moves the counter and fails
+-- it. See the warning about concurrent runs in test/README.md.
+
+create foreign table db15_fl(key text, value text)
+       server localredis
+       options (database '15', tablekeyprefix 'fl_');
+
+-- enough keys that one SCAN batch holds far more than the 21 the widest window
+-- below reaches, so the counts measure the window and not the batch
+insert into db15_fl select 'fl_' || x, 'v' from generate_series(1, 200) x;
+
+\! redis-cli config resetstat > /dev/null
+
+-- count(distinct key), as everywhere this suite counts a scan. Under a LIMIT
+-- it answers what count(*) would: the rows come from a single SCAN call, which
+-- cannot mention a key twice.
+select count(distinct key) from (select key from db15_fl limit 1) s;
+
+\! redis-cli info commandstats | grep -o '^cmdstat_get:calls=[0-9]*'
+
+\! redis-cli config resetstat > /dev/null
+
+select count(distinct key) from (select key from db15_fl limit 6) s;
+
+\! redis-cli info commandstats | grep -o '^cmdstat_get:calls=[0-9]*'
+
+delete from db15_fl;
+
+drop foreign table db15_fl;
 
 \i test/common/epilogue.sql

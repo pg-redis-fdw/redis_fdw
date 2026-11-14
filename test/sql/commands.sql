@@ -384,10 +384,22 @@ drop foreign table db15_ping;
 
 \! redis-cli -n 15 set nd_1 one > /dev/null
 
--- A nondeterministic collation needs the ICU provider, which not every
--- PostgreSQL build has. Guarded the way scalar.sql guards on server_encoding:
--- a procedure printing one verdict line, because psql's \if echoes the lines
--- of the branch it skips and they would diff anyway.
+-- A nondeterministic collation needs a usable ICU provider, which not every
+-- PostgreSQL build and database has. Guarded the way scalar.sql guards on
+-- server_encoding: a procedure printing one verdict line, because psql's \if
+-- echoes the lines of the branch it skips and they would diff anyway.
+--
+-- One verdict line means exactly that: the same text whether the collation
+-- could be created or not. It must not name which build this is, because
+-- there is more than one way to lack a usable provider and each says so
+-- differently -- a build configured without ICU reports "ICU is not supported
+-- in this build", while an ICU build running a database in an encoding ICU
+-- cannot use reports "current database's encoding is not supported with this
+-- provider". Interpolating sqlerrm here put three possible outputs behind one
+-- expected file, and the buildfarm produces all three: it broke every branch
+-- on crake, which runs installcheck in the C locale. Like enc_case, this
+-- trades knowing that the case was skipped for an expected file that holds
+-- everywhere; a real failure still prints FAILED and still diffs.
 --
 -- Only the CREATE COLLATION is allowed to fail quietly. Everything after it
 -- runs unguarded, so a real failure is seen rather than swallowed.
@@ -400,7 +412,7 @@ begin
                (provider = icu, locale = 'und-u-ks-level2',
                 deterministic = false)$c$;
   exception when others then
-    raise notice 'skipped: no ICU provider in this build (%)', sqlerrm;
+    raise notice 'nondeterministic collation: as the build allows';
     return;
   end;
 
@@ -416,7 +428,7 @@ begin
     into n;
 
   if n = 1 then
-    raise notice 'nondeterministic collation: the row is returned';
+    raise notice 'nondeterministic collation: as the build allows';
   else
     raise notice 'FAILED: nondeterministic collation: % rows, not 1', n;
   end if;

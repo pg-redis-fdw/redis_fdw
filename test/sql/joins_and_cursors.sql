@@ -259,6 +259,31 @@ create foreign table db15_pd(key text, value text)
 
 set plan_cache_mode = force_generic_plan;
 
+-- Both EXPLAINs below carry a correlated SubPlan, and the label PostgreSQL
+-- prints for it is the one thing in either plan that moves between versions:
+-- core commit 8c49a484e8e assigns every subquery a unique name before planning
+-- it, so what reads "SubPlan 1" through 18 reads "SubPlan expr_1" from 19 on.
+--
+-- The label is not what these EXPLAINs assert -- that is the Filter and its
+-- outer reference, spelled out at each site -- and nothing here refers back to
+-- it, so normalize it to the older spelling and keep one expected file. The
+-- alternative, a second expected file, would duplicate this whole module to
+-- vary two tokens that carry no meaning.
+--
+-- Not a general version bridge, and should not be adopted as one: the pre-19
+-- numbers are assigned during planning and the new names before it, so with
+-- more than one subplan in a plan the two would not correspond. Each plan here
+-- has exactly one.
+create function explain_subplan(q text) returns setof text
+  language plpgsql as $$
+declare
+  line text;
+begin
+  for line in execute 'explain (costs off) ' || q loop
+    return next regexp_replace(line, '^(\s*SubPlan )expr_(\d+)$', '\1\2');
+  end loop;
+end $$;
+
 -- The key comes from a prepared statement's $1 on its generic plan, so it is a
 -- PARAM_EXTERN: fixed for the whole scan, and pushed down. The foreign scan is
 -- the inner side of a correlated SubPlan, so it is rescanned once per outer
@@ -273,7 +298,7 @@ prepare pd_rescan(text) as
   select o.y, (select value from db15_pd where key = $1 and value >= o.y) as v
   from (values('a'),('b'),('c'),('d')) o(y);
 
-explain (costs off) execute pd_rescan('pd_1');
+select * from explain_subplan($$execute pd_rescan('pd_1')$$);
 
 execute pd_rescan('pd_1');
 
@@ -303,13 +328,15 @@ insert into pd_outer values ('pd_1'), ('pd_2'), ('pd_1'), ('pd_2');
 
 analyze pd_outer;
 
-explain (costs off) select o.k, (select value from db15_pd where key = o.k) as v
-       from pd_outer o order by 1;
+select * from explain_subplan($$select o.k, (select value from db15_pd where key = o.k) as v
+       from pd_outer o order by 1$$);
 
 select o.k, (select value from db15_pd where key = o.k) as v
        from pd_outer o order by 1;
 
 reset plan_cache_mode;
+
+drop function explain_subplan(text);
 
 drop table pd_outer;
 
